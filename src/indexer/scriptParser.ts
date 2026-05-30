@@ -6,6 +6,8 @@ interface PropertyValue {
   nameSpan: TextSpan
   valueStart: number
   valueEnd: number
+  async: boolean
+  documentation?: string
 }
 
 function skipWhitespace(content: string, index: number): number {
@@ -35,6 +37,43 @@ function skipTrivia(content: string, index: number): number {
   }
 
   return cursor
+}
+
+function normalizeJSDoc(comment: string): string {
+  return comment
+    .replace(/^\/\*\*/, '')
+    .replace(/\*\/$/, '')
+    .split('\n')
+    .map((line) => line.replace(/^\s*\* ?/, '').trimEnd())
+    .join('\n')
+    .trim()
+}
+
+function readLeadingMemberTrivia(content: string, index: number): { cursor: number, documentation?: string } {
+  let cursor = skipWhitespace(content, index)
+  let documentation: string | undefined
+
+  while (cursor < content.length) {
+    if (content.startsWith('//', cursor)) {
+      const lineEnd = content.indexOf('\n', cursor + 2)
+      cursor = skipWhitespace(content, lineEnd === -1 ? content.length : lineEnd + 1)
+      documentation = undefined
+      continue
+    }
+
+    if (content.startsWith('/*', cursor)) {
+      const commentEnd = content.indexOf('*/', cursor + 2)
+      const end = commentEnd === -1 ? content.length : commentEnd + 2
+      const comment = content.slice(cursor, end)
+      documentation = comment.startsWith('/**') ? normalizeJSDoc(comment) : undefined
+      cursor = skipWhitespace(content, end)
+      continue
+    }
+
+    break
+  }
+
+  return { cursor, documentation }
 }
 
 function readIdentifier(content: string, index: number): { value: string, start: number, end: number } | undefined {
@@ -185,6 +224,7 @@ function findTopLevelProperty(content: string, open: number, close: number, name
       nameSpan: { start: propertyName.start, end: propertyName.end },
       valueStart: cursor,
       valueEnd,
+      async: false,
     }
   }
 
@@ -239,14 +279,16 @@ function eachObjectMember(content: string, objectStart: number, objectEnd: numbe
   let index = objectStart + 1
 
   while (index < objectEnd) {
-    index = skipTrivia(content, index)
+    const trivia = readLeadingMemberTrivia(content, index)
+    index = trivia.cursor
     if (content[index] === ',') {
       index += 1
       continue
     }
 
     const asyncKeyword = readIdentifier(content, index)
-    const propertyName = asyncKeyword?.value === 'async'
+    const isAsync = asyncKeyword?.value === 'async'
+    const propertyName = isAsync
       ? readPropertyName(content, skipTrivia(content, asyncKeyword.end)) ?? asyncKeyword
       : readPropertyName(content, index)
 
@@ -267,6 +309,8 @@ function eachObjectMember(content: string, objectStart: number, objectEnd: numbe
       nameSpan: { start: propertyName.start, end: propertyName.end },
       valueStart: cursor,
       valueEnd,
+      async: isAsync,
+      documentation: trivia.documentation,
     })
 
     index = valueEnd
@@ -294,7 +338,7 @@ function parseStringLiteral(content: string, start: number, end: number): string
   return text.slice(1, -1)
 }
 
-function parseComponents(content: string, components: PropertyValue | undefined, imports: ImportInfo[], uri: string, scriptStart: number): ComponentRegistration[] {
+function parseComponents(content: string, components: PropertyValue | undefined, imports: ImportInfo[], uri: string, scriptStart: number, workspaceRoots: string[]): ComponentRegistration[] {
   if (!components || content[components.valueStart] !== '{') {
     return []
   }
@@ -308,7 +352,7 @@ function parseComponents(content: string, components: PropertyValue | undefined,
       tag: member.name,
       localName,
       source,
-      targetUri: source ? resolveImportPath(uri, source) : undefined,
+      targetUri: source ? resolveImportPath(uri, source, workspaceRoots) : undefined,
       nameSpan: { start: scriptStart + member.nameSpan.start, end: scriptStart + member.nameSpan.end },
     })
   })
@@ -343,10 +387,39 @@ function parseProps(content: string, props: PropertyValue | undefined, scriptSta
     results.push({
       name: member.name,
       span: { start: scriptStart + member.nameSpan.start, end: scriptStart + member.nameSpan.end },
-      detail: content.slice(member.nameSpan.start, Math.min(member.valueEnd, member.nameSpan.start + 120)).split('\n')[0],
+      detail: content.slice(member.nameSpan.start, member.valueEnd).trim(),
+      documentation: member.documentation,
     })
   })
   return results
+}
+
+function formatMethodSignature(content: string, member: PropertyValue): string {
+  let cursor = member.valueStart
+  let asyncPrefix = member.async
+
+  const firstWord = readIdentifier(content, cursor)
+  if (firstWord?.value === 'async') {
+    asyncPrefix = true
+    cursor = skipWhitespace(content, firstWord.end)
+  }
+
+  const functionWord = readIdentifier(content, cursor)
+  if (functionWord?.value === 'function') {
+    cursor = skipWhitespace(content, functionWord.end)
+    const functionName = readIdentifier(content, cursor)
+    if (functionName) {
+      cursor = skipWhitespace(content, functionName.end)
+    }
+  }
+
+  if (content[cursor] !== '(') {
+    return member.name
+  }
+
+  const paramsEnd = findMatchingBracket(content, cursor)
+  const params = content.slice(cursor, paramsEnd + 1).replace(/\s+/g, ' ')
+  return `${asyncPrefix ? 'async ' : ''}${member.name}${params}`
 }
 
 function parseMethods(content: string, methods: PropertyValue | undefined, scriptStart: number): ScriptIndex['methods'] {
@@ -356,10 +429,13 @@ function parseMethods(content: string, methods: PropertyValue | undefined, scrip
 
   const results: ScriptIndex['methods'] = []
   eachObjectMember(content, methods.valueStart, methods.valueEnd - 1, (member) => {
+    const signature = formatMethodSignature(content, member)
     results.push({
       name: member.name,
       span: { start: scriptStart + member.nameSpan.start, end: scriptStart + member.nameSpan.end },
-      detail: content.slice(member.nameSpan.start, Math.min(member.valueEnd, member.nameSpan.start + 120)).split('\n')[0],
+      detail: signature,
+      signature,
+      documentation: member.documentation,
     })
   })
   return results
@@ -382,7 +458,7 @@ function parseEmits(content: string, scriptStart: number): ScriptIndex['emits'] 
   return emits
 }
 
-export function parseScript(uri: string, content: string, scriptStart: number): ScriptIndex {
+export function parseScript(uri: string, content: string, scriptStart: number, workspaceRoots: string[] = []): ScriptIndex {
   const imports = parseImports(content)
   const exportObject = findExportObject(content)
   if (!exportObject) {
@@ -397,7 +473,7 @@ export function parseScript(uri: string, content: string, scriptStart: number): 
   return {
     componentName: nameProperty ? parseStringLiteral(content, nameProperty.valueStart, nameProperty.valueEnd) : undefined,
     imports,
-    components: parseComponents(content, componentsProperty, imports, uri, scriptStart),
+    components: parseComponents(content, componentsProperty, imports, uri, scriptStart, workspaceRoots),
     props: parseProps(content, propsProperty, scriptStart),
     methods: parseMethods(content, methodsProperty, scriptStart),
     emits: parseEmits(content, scriptStart),

@@ -9,6 +9,7 @@ import { toKebabCase } from '../utils/casing'
 
 export class WorkspaceIndex {
   private readonly files = new Map<string, VueFileIndex>()
+  private readonly workspaceRoots: string[] = []
 
   getFileCount(): number {
     return this.files.size
@@ -29,7 +30,7 @@ export class WorkspaceIndex {
   indexContent(uri: string, content: string): VueFileIndex {
     const sfc = parseSfc(uri, content)
     const scriptIndex = sfc.script
-      ? parseScript(uri, sfc.script.content, sfc.script.start)
+      ? parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots)
       : { imports: [], components: [], props: [], methods: [], emits: [] }
     const registeredTags = scriptIndex.components.flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)])
     const templateIndex = sfc.template
@@ -67,6 +68,9 @@ export class WorkspaceIndex {
   }
 
   async indexWorkspace(root: string): Promise<void> {
+    if (!this.workspaceRoots.includes(root)) {
+      this.workspaceRoots.push(root)
+    }
     const vueFiles = await findVueFiles(root)
     for (const file of vueFiles) {
       await this.indexFile(file)
@@ -107,7 +111,7 @@ async function findVueFiles(root: string): Promise<string[]> {
 }
 
 export function findRefMethodAccess(content: string, offset: number): RefMethodAccess | undefined {
-  const pattern = /this\.\$refs\.([A-Za-z_$][\w$]*)(?:\.|\?\.)([A-Za-z_$][\w$]*)/g
+  const pattern = /this\.\$refs(?:\.|\?\.)([A-Za-z_$][\w$]*)(?:\.|\?\.)([A-Za-z_$][\w$]*)/g
   let match: RegExpExecArray | null
 
   while ((match = pattern.exec(content))) {
@@ -125,15 +129,20 @@ export function findRefMethodAccess(content: string, offset: number): RefMethodA
 export interface RefCompletionContext {
   refName: string
   accessToken: '.' | '?.'
+  partialMethodName: string
 }
 
 export function findRefCompletionContext(content: string, offset: number): RefCompletionContext | undefined {
   const prefix = content.slice(Math.max(0, offset - 160), offset)
-  const match = /this\.\$refs\.([A-Za-z_$][\w$]*)(\.|\?\.)?$/.exec(prefix)
+  const match = /this\.\$refs(?:\.|\?\.)([A-Za-z_$][\w$]*)(\.|\?\.)([A-Za-z_$][\w$]*)?$/.exec(prefix)
   if (!match) {
     return undefined
   }
-  return { refName: match[1], accessToken: match[2] === '?.' ? '?.' : '.' }
+  return {
+    refName: match[1],
+    accessToken: match[2] === '?.' ? '?.' : '.',
+    partialMethodName: match[3] ?? '',
+  }
 }
 
 export function findSpanAtOffset(spans: Array<{ span: TextSpan }>, offset: number): TextSpan | undefined {

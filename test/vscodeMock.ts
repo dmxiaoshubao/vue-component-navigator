@@ -7,9 +7,15 @@ export class Range {
 }
 
 export class Uri {
-  constructor(public fsPath: string) {}
+  constructor(public fsPath: string, public fragment = '') {}
   static file(fsPath: string): Uri {
     return new Uri(fsPath)
+  }
+  with(change: { fragment?: string }): Uri {
+    return new Uri(this.fsPath, change.fragment ?? this.fragment)
+  }
+  toString(): string {
+    return `file://${this.fsPath}${this.fragment ? `#${this.fragment}` : ''}`
   }
 }
 
@@ -26,11 +32,19 @@ export class CompletionItem {
   documentation?: string
   sortText?: string
   preselect?: boolean
+  range?: Range
+  insertText?: string
+  filterText?: string
   constructor(public label: string, public kind?: CompletionItemKind) {}
 }
 
+export class MarkdownString {
+  isTrusted?: boolean
+  constructor(public value = '') {}
+}
+
 export class Hover {
-  constructor(public contents: string) {}
+  constructor(public contents: string | MarkdownString) {}
 }
 
 export const languages = {

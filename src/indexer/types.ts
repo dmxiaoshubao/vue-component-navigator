@@ -45,12 +45,15 @@ export interface PropInfo {
   name: string
   span: TextSpan
   detail: string
+  documentation?: string
 }
 
 export interface MethodInfo {
   name: string
   span: TextSpan
   detail: string
+  signature: string
+  documentation?: string
 }
 
 export interface EmitInfo {

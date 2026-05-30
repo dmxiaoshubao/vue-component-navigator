@@ -15,6 +15,10 @@ function isVueDirective(name: string): boolean {
   return name.startsWith('v-') || name.startsWith('#')
 }
 
+function stripModifier(name: string): string {
+  return name.split('.')[0]
+}
+
 function normalizeAttr(attrName: string): TemplateAttrUsage | undefined {
   if (attrName === 'ref') {
     return undefined
@@ -31,12 +35,12 @@ function normalizeAttr(attrName: string): TemplateAttrUsage | undefined {
   }
 
   if (attrName.startsWith(':')) {
-    const name = attrName.slice(1)
+    const name = stripModifier(attrName.slice(1))
     return { kind: 'prop', name, normalizedName: toCamelCase(name), span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } }
   }
 
   if (attrName.startsWith('v-bind:')) {
-    const name = attrName.slice('v-bind:'.length)
+    const name = stripModifier(attrName.slice('v-bind:'.length))
     return { kind: 'prop', name, normalizedName: toCamelCase(name), span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } }
   }
 

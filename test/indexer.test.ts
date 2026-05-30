@@ -67,8 +67,13 @@ describe('Vue2 relation resolver', () => {
     const childUsage = parent.templateIndex.components.find((component) => component.tag === 'Child')!
     const titleText = childUsage.attrs.find((attr) => attr.kind === 'prop' && attr.name === 'title-text')!
 
+    const alias = index.getFile(path.join(fixtureRoot, 'src/components/AliasChild.vue'))!
+
     expect(findRegisteredComponent(parent, 'Child')).toBe(child.uri)
     expect(findProp(child, titleText.normalizedName)?.name).toBe('titleText')
+    expect(findRegisteredComponent(parent, 'AliasChild')).toBe(alias.uri)
+    expect(findProp(alias, 'originUrl')?.detail).toContain('default')
+    expect(findEmit(alias, 'onLoadSuccess')).toHaveLength(1)
   })
 
   it('只返回真实 props、emit、ref 方法引用', async () => {

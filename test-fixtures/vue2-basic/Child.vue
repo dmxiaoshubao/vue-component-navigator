@@ -14,7 +14,11 @@ export default {
     userId: Number,
   },
   methods: {
-    open() {
+    /**
+     * @description Open child dialog.
+     * @param {string} source trigger source
+     */
+    open(source) {
       this.$emit('save')
     },
     close: function () {

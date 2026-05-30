@@ -2,7 +2,17 @@ import path from 'node:path'
 import type { VueFileIndex } from './types'
 import { matchesName, toCamelCase, toKebabCase } from '../utils/casing'
 
-export function resolveImportPath(fromUri: string, source: string): string | undefined {
+export function resolveImportPath(fromUri: string, source: string, workspaceRoots: string[] = []): string | undefined {
+  if (source.startsWith('@/')) {
+    const suffix = source.slice(2)
+    const root = workspaceRoots.find((item) => fromUri.startsWith(item))
+    if (!root) {
+      return undefined
+    }
+    const resolved = path.resolve(root, 'src', suffix)
+    return path.extname(resolved) ? resolved : `${resolved}.vue`
+  }
+
   if (!source.startsWith('.')) {
     return undefined
   }
@@ -87,7 +97,7 @@ export function findRefMethodUsages(files: VueFileIndex[], childUri: string, met
   const results: Array<{ file: VueFileIndex, span: { start: number, end: number } }> = []
 
   for (const file of files) {
-    const pattern = /this\.\$refs\.([A-Za-z_$][\w$]*)(?:\.|\?\.)([A-Za-z_$][\w$]*)/g
+    const pattern = /this\.\$refs(?:\.|\?\.)([A-Za-z_$][\w$]*)(?:\.|\?\.)([A-Za-z_$][\w$]*)/g
     let match: RegExpExecArray | null
     while ((match = pattern.exec(file.content))) {
       const [, refName, calledMethod] = match
