@@ -1,0 +1,72 @@
+{
+  "name": "vue-component-navigator",
+  "displayName": "Vue Component Navigator",
+  "description": "Vue 2 component navigation for refs, emits, and props in local .vue Options API components.",
+  "version": "0.0.2",
+  "publisher": "dmxiaoshubao",
+  "author": "dmxiaoshubao",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dmxiaoshubao/vue-component-navigator.git"
+  },
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "vue",
+    "vue2",
+    "navigation",
+    "refs",
+    "emit",
+    "props"
+  ],
+  "activationEvents": [
+    "onLanguage:vue",
+    "workspaceContains:**/*.vue",
+    "onCommand:vueComponentNavigator.showStatus"
+  ],
+  "main": "./dist/src/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vueComponentNavigator.showStatus",
+        "title": "Vue Component Navigator: Show Status"
+      }
+    ],
+    "languages": [
+      {
+        "id": "vue",
+        "aliases": [
+          "Vue",
+          "vue"
+        ],
+        "extensions": [
+          ".vue"
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc -p . --noEmit",
+    "compile": "node esbuild.config.mjs",
+    "watch": "tsc -watch -p .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "vscode:prepublish": "npm run typecheck && npm run compile",
+    "package:vsix": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/vscode": "^1.74.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.9.1",
+    "esbuild": "^0.28.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7"
+  }
+}
