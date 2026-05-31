@@ -1,12 +1,27 @@
+type Disposable = { dispose(): void }
+
 export class Position {
   constructor(public line: number, public character: number) {}
 }
 
 export class Range {
-  constructor(public start: Position | number, public startCharacter?: number, public endLine?: number, public endCharacter?: number) {}
+  start: Position
+  end: Position
+
+  constructor(start: Position | number, startCharacter?: number, endLine?: number, endCharacter?: number) {
+    if (start instanceof Position) {
+      this.start = start
+      this.end = startCharacter instanceof Position ? startCharacter : start
+      return
+    }
+
+    this.start = new Position(start, startCharacter ?? 0)
+    this.end = new Position(endLine ?? start, endCharacter ?? startCharacter ?? 0)
+  }
 }
 
 export class Uri {
+  scheme = 'file'
   constructor(public fsPath: string, public fragment = '') {}
   static file(fsPath: string): Uri {
     return new Uri(fsPath)
@@ -29,7 +44,7 @@ export enum CompletionItemKind {
 
 export class CompletionItem {
   detail?: string
-  documentation?: string
+  documentation?: string | MarkdownString
   sortText?: string
   preselect?: boolean
   range?: Range
@@ -39,7 +54,7 @@ export class CompletionItem {
 }
 
 export class MarkdownString {
-  isTrusted?: boolean
+  isTrusted?: boolean | { enabledCommands: string[] }
   constructor(public value = '') {}
 }
 
@@ -47,16 +62,91 @@ export class Hover {
   constructor(public contents: string | MarkdownString) {}
 }
 
+export enum ProgressLocation {
+  Window = 10,
+}
+
+export const registeredCommands = new Map<string, (...args: any[]) => any>()
+export const saveListeners: Array<(document: any) => any> = []
+export const changeTextListeners: Array<(event: any) => any> = []
+export const deleteListeners: Array<(event: any) => any> = []
+export const createListeners: Array<(event: any) => any> = []
+export const renameListeners: Array<(event: any) => any> = []
+export const workspaceFolderListeners: Array<(event: any) => any> = []
+export const informationMessages: string[] = []
+export const warningMessages: string[] = []
+
+function disposable(): Disposable {
+  return { dispose() {} }
+}
+
+export function resetMockState(): void {
+  registeredCommands.clear()
+  saveListeners.length = 0
+  changeTextListeners.length = 0
+  deleteListeners.length = 0
+  createListeners.length = 0
+  renameListeners.length = 0
+  workspaceFolderListeners.length = 0
+  informationMessages.length = 0
+  warningMessages.length = 0
+  workspace.workspaceFolders = []
+  window.activeTextEditor = undefined
+}
+
 export const languages = {
-  registerDefinitionProvider: () => ({ dispose() {} }),
-  registerCompletionItemProvider: () => ({ dispose() {} }),
-  registerHoverProvider: () => ({ dispose() {} }),
-  registerReferenceProvider: () => ({ dispose() {} }),
+  registerDefinitionProvider: () => disposable(),
+  registerCompletionItemProvider: () => disposable(),
+  registerHoverProvider: () => disposable(),
+  registerReferenceProvider: () => disposable(),
+}
+
+export const commands = {
+  registerCommand: (name: string, handler: (...args: any[]) => any) => {
+    registeredCommands.set(name, handler)
+    return disposable()
+  },
+}
+
+export const window = {
+  activeTextEditor: undefined as { document: any } | undefined,
+  showInformationMessage: (message: string) => {
+    informationMessages.push(message)
+    return Promise.resolve(message)
+  },
+  showWarningMessage: (message: string) => {
+    warningMessages.push(message)
+    return Promise.resolve(message)
+  },
+  showQuickPick: async (items: any[]) => items[0],
+  showTextDocument: async () => undefined,
+  withProgress: async (_options: any, task: (progress: any, token: { isCancellationRequested: boolean }) => any) => task({}, { isCancellationRequested: false }),
 }
 
 export const workspace = {
-  workspaceFolders: [],
-  onDidSaveTextDocument: () => ({ dispose() {} }),
-  onDidDeleteFiles: () => ({ dispose() {} }),
-  onDidCreateFiles: () => ({ dispose() {} }),
+  workspaceFolders: [] as Array<{ uri: Uri }>,
+  onDidSaveTextDocument: (listener: (document: any) => any) => {
+    saveListeners.push(listener)
+    return disposable()
+  },
+  onDidChangeTextDocument: (listener: (event: any) => any) => {
+    changeTextListeners.push(listener)
+    return disposable()
+  },
+  onDidDeleteFiles: (listener: (event: any) => any) => {
+    deleteListeners.push(listener)
+    return disposable()
+  },
+  onDidCreateFiles: (listener: (event: any) => any) => {
+    createListeners.push(listener)
+    return disposable()
+  },
+  onDidRenameFiles: (listener: (event: any) => any) => {
+    renameListeners.push(listener)
+    return disposable()
+  },
+  onDidChangeWorkspaceFolders: (listener: (event: any) => any) => {
+    workspaceFolderListeners.push(listener)
+    return disposable()
+  },
 }

@@ -1,5 +1,6 @@
 import type { ComponentRegistration, ImportInfo, PropInfo, ScriptIndex, TextSpan } from './types'
 import { resolveImportPath } from './relationResolver'
+import { findCodeToken, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
 interface PropertyValue {
   name: string
@@ -90,39 +91,26 @@ function readPropertyName(content: string, index: number): { value: string, star
     return identifier
   }
 
-  const quote = content[index]
-  if (quote !== '\'' && quote !== '"') {
+  const literal = readStringLiteral(content, index)
+  if (!literal) {
     return undefined
   }
-
-  const end = content.indexOf(quote, index + 1)
-  if (end === -1) {
-    return undefined
-  }
-  return { value: content.slice(index + 1, end), start: index + 1, end }
+  return { value: literal.value, start: literal.start, end: literal.end }
 }
 
 function findMatchingBracket(content: string, openIndex: number): number {
   const open = content[openIndex]
   const close = open === '{' ? '}' : open === '[' ? ']' : ')'
   let depth = 0
-  let quote: string | undefined
 
   for (let index = openIndex; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
     const char = content[index]
-    const previous = content[index - 1]
-
-    if (quote) {
-      if (char === quote && previous !== '\\') {
-        quote = undefined
-      }
-      continue
-    }
-
-    if (char === '\'' || char === '"' || char === '`') {
-      quote = char
-      continue
-    }
 
     if (char === open) {
       depth += 1
@@ -138,41 +126,40 @@ function findMatchingBracket(content: string, openIndex: number): number {
 }
 
 function findExportObject(content: string): { open: number, close: number } | undefined {
-  const exportIndex = content.indexOf('export default')
+  const exportIndex = findCodeToken(content, 'export default')
   if (exportIndex === -1) {
     return undefined
   }
 
-  const open = content.indexOf('{', exportIndex)
-  if (open === -1) {
-    return undefined
+  for (let index = exportIndex + 'export default'.length; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    if (content[index] !== '{') {
+      continue
+    }
+
+    return { open: index, close: findMatchingBracket(content, index) }
   }
 
-  return { open, close: findMatchingBracket(content, open) }
+  return undefined
 }
 
 function findTopLevelProperty(content: string, open: number, close: number, name: string): PropertyValue | undefined {
   let index = open + 1
   let depth = 0
-  let quote: string | undefined
 
   while (index < close) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped
+      continue
+    }
+
     const char = content[index]
-    const previous = content[index - 1]
-
-    if (quote) {
-      if (char === quote && previous !== '\\') {
-        quote = undefined
-      }
-      index += 1
-      continue
-    }
-
-    if (char === '\'' || char === '"' || char === '`') {
-      quote = char
-      index += 1
-      continue
-    }
 
     if (char === '{' || char === '[' || char === '(') {
       depth += 1
@@ -233,7 +220,16 @@ function findTopLevelProperty(content: string, open: number, close: number, name
 
 function findValueEnd(content: string, start: number, close: number): number {
   let index = start
-  while (index < close && content[index] !== ',' && content[index] !== '\n') {
+  while (index < close) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped
+      continue
+    }
+
+    if (content[index] === ',' || content[index] === '\n') {
+      break
+    }
     index += 1
   }
   return index
@@ -319,11 +315,34 @@ function eachObjectMember(content: string, objectStart: number, objectEnd: numbe
 
 function parseImports(content: string): ImportInfo[] {
   const imports: ImportInfo[] = []
-  const pattern = /import\s+([A-Za-z_$][\w$]*)\s+from\s+['"]([^'"]+)['"]/g
-  let match: RegExpExecArray | null
+  let index = 0
 
-  while ((match = pattern.exec(content))) {
-    imports.push({ localName: match[1], source: match[2] })
+  while (index < content.length) {
+    const importIndex = findCodeToken(content, 'import', index)
+    if (importIndex === -1) {
+      break
+    }
+
+    const localName = readIdentifier(content, skipTrivia(content, importIndex + 'import'.length))
+    if (!localName) {
+      index = importIndex + 'import'.length
+      continue
+    }
+
+    const fromIndex = findCodeToken(content, 'from', localName.end)
+    if (fromIndex === -1) {
+      index = localName.end
+      continue
+    }
+
+    const source = readStringLiteral(content, skipTrivia(content, fromIndex + 'from'.length))
+    if (source) {
+      imports.push({ localName: localName.value, source: source.value })
+      index = source.end + 1
+      continue
+    }
+
+    index = fromIndex + 'from'.length
   }
 
   return imports
@@ -443,15 +462,34 @@ function parseMethods(content: string, methods: PropertyValue | undefined, scrip
 
 function parseEmits(content: string, scriptStart: number): ScriptIndex['emits'] {
   const emits: ScriptIndex['emits'] = []
-  const pattern = /this\.\$emit\(\s*(['"])([^'"]+)\1/g
-  let match: RegExpExecArray | null
+  const emitToken = 'this.$emit'
 
-  while ((match = pattern.exec(content))) {
-    const eventStart = match.index + match[0].lastIndexOf(match[2])
+  for (let index = 0; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    if (!content.startsWith(emitToken, index)) {
+      continue
+    }
+
+    let cursor = skipTrivia(content, index + emitToken.length)
+    if (content[cursor] !== '(') {
+      continue
+    }
+
+    cursor = skipTrivia(content, cursor + 1)
+    const literal = readStringLiteral(content, cursor)
+    if (!literal) {
+      continue
+    }
+
     emits.push({
-      eventName: match[2],
-      eventSpan: { start: scriptStart + eventStart, end: scriptStart + eventStart + match[2].length },
-      callSpan: { start: scriptStart + match.index, end: scriptStart + match.index + match[0].length },
+      eventName: literal.value,
+      eventSpan: { start: scriptStart + literal.start, end: scriptStart + literal.end },
+      callSpan: { start: scriptStart + index, end: scriptStart + literal.end + 1 },
     })
   }
 

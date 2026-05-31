@@ -1,6 +1,18 @@
 import path from 'node:path'
-import type { VueFileIndex } from './types'
+import type { UsageInfo, VueFileIndex } from './types'
+import type { WorkspaceIndex } from './workspaceIndex'
 import { matchesName, toCamelCase, toKebabCase } from '../utils/casing'
+
+const registeredComponentCache = new WeakMap<VueFileIndex, Map<string, string | undefined>>()
+
+function getRegisteredComponentCache(parent: VueFileIndex): Map<string, string | undefined> {
+  let cache = registeredComponentCache.get(parent)
+  if (!cache) {
+    cache = new Map()
+    registeredComponentCache.set(parent, cache)
+  }
+  return cache
+}
 
 export function resolveImportPath(fromUri: string, source: string, workspaceRoots: string[] = []): string | undefined {
   if (source.startsWith('@/')) {
@@ -23,9 +35,16 @@ export function resolveImportPath(fromUri: string, source: string, workspaceRoot
 }
 
 export function findRegisteredComponent(parent: VueFileIndex, tag: string): string | undefined {
+  const normalizedTag = toKebabCase(tag)
+  const cache = getRegisteredComponentCache(parent)
+  if (cache.has(normalizedTag)) {
+    return cache.get(normalizedTag)
+  }
+
   const registration = parent.scriptIndex.components.find((component) => {
-    return component.tag === tag || toKebabCase(component.tag) === toKebabCase(tag)
+    return component.tag === tag || toKebabCase(component.tag) === normalizedTag
   })
+  cache.set(normalizedTag, registration?.targetUri)
   return registration?.targetUri
 }
 
@@ -73,6 +92,10 @@ export function findTemplatePropUsages(files: VueFileIndex[], childUri: string, 
   return results
 }
 
+export function findIndexedTemplatePropUsages(index: WorkspaceIndex, childUri: string, propName: string): UsageInfo[] {
+  return index.findTemplatePropUsages(childUri, propName)
+}
+
 export function findTemplateEventUsages(files: VueFileIndex[], childUri: string, eventName: string) {
   const results: Array<{ file: VueFileIndex, span: { start: number, end: number } }> = []
 
@@ -93,21 +116,25 @@ export function findTemplateEventUsages(files: VueFileIndex[], childUri: string,
   return results
 }
 
+export function findIndexedTemplateEventUsages(index: WorkspaceIndex, childUri: string, eventName: string): UsageInfo[] {
+  return index.findTemplateEventUsages(childUri, eventName)
+}
+
 export function findRefMethodUsages(files: VueFileIndex[], childUri: string, methodName: string) {
-  const results: Array<{ file: VueFileIndex, span: { start: number, end: number } }> = []
+  const results: UsageInfo[] = []
 
   for (const file of files) {
-    const pattern = /this\.\$refs(?:\.|\?\.)([A-Za-z_$][\w$]*)(?:\.|\?\.)([A-Za-z_$][\w$]*)/g
-    let match: RegExpExecArray | null
-    while ((match = pattern.exec(file.content))) {
-      const [, refName, calledMethod] = match
-      if (calledMethod !== methodName || findRefComponent(file, refName) !== childUri) {
+    for (const call of file.refMethodCalls) {
+      if (call.methodName !== methodName || findRefComponent(file, call.refName) !== childUri) {
         continue
       }
-      const methodStart = match.index + match[0].lastIndexOf(calledMethod)
-      results.push({ file, span: { start: methodStart, end: methodStart + calledMethod.length } })
+      results.push({ file, span: call.methodSpan })
     }
   }
 
   return results
+}
+
+export function findIndexedRefMethodUsages(index: WorkspaceIndex, childUri: string, methodName: string): UsageInfo[] {
+  return index.findRefMethodUsages(childUri, methodName)
 }

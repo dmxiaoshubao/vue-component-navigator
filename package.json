@@ -28,7 +28,8 @@
   "activationEvents": [
     "onLanguage:vue",
     "workspaceContains:**/*.vue",
-    "onCommand:vueComponentNavigator.showStatus"
+    "onCommand:vueComponentNavigator.showStatus",
+    "onCommand:vueComponentNavigator.reindexWorkspace"
   ],
   "main": "./dist/src/extension.js",
   "contributes": {
@@ -36,6 +37,10 @@
       {
         "command": "vueComponentNavigator.showStatus",
         "title": "Vue Component Navigator: Show Status"
+      },
+      {
+        "command": "vueComponentNavigator.reindexWorkspace",
+        "title": "Vue Component Navigator: Reindex Workspace"
       }
     ],
     "languages": [

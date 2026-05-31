@@ -1,10 +1,10 @@
 import * as path from 'node:path'
 import * as vscode from 'vscode'
 import type { MethodInfo, PropInfo, TextSpan, VueFileIndex } from '../indexer/types'
-import { WorkspaceIndex, findRefMethodAccess } from '../indexer/workspaceIndex'
-import { findEmit, findMethod, findProp, findRefComponent, findRegisteredComponent, findTemplateEventUsages } from '../indexer/relationResolver'
+import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
+import { findEmit, findIndexedTemplateEventUsages, findMethod, findProp, findRefComponent, findRegisteredComponent } from '../indexer/relationResolver'
 import { containsOffsetStrict, offsetToPosition } from '../utils/position'
-import { formatJSDocMarkdown } from '../utils/jsdoc'
+import { escapeMarkdownText, formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 
 export const SHOW_EMIT_USAGES_COMMAND = 'vueComponentNavigator.showEmitUsages'
 
@@ -12,19 +12,19 @@ function definitionLink(file: VueFileIndex, span: TextSpan, baseDirectory: strin
   const position = offsetToPosition(file.lineStarts, span.start)
   const relativePath = baseDirectory ? path.relative(baseDirectory, file.uri) : file.uri
   const target = vscode.Uri.file(file.uri).with({ fragment: `L${position.line + 1},${position.character + 1}` })
-  return `[${relativePath}](${target.toString()})`
+  return `[${escapeMarkdownText(relativePath)}](${target.toString()})`
 }
 
-function markdownHover(value: string): vscode.Hover {
+function markdownHover(value: string, trusted = false): vscode.Hover {
   const markdown = new vscode.MarkdownString(value)
-  markdown.isTrusted = true
+  markdown.isTrusted = trusted ? { enabledCommands: [SHOW_EMIT_USAGES_COMMAND] } : false
   return new vscode.Hover(markdown)
 }
 
 function methodHover(child: VueFileIndex, method: MethodInfo, baseDirectory: string): vscode.Hover {
   const docs = formatJSDocMarkdown(method.documentation)
   const docText = docs ? `${docs}\n\n` : ''
-  return markdownHover(`${docText}\`\`\`js\n${method.signature}\n\`\`\`\n\nDefinition: ${definitionLink(child, method.span, baseDirectory)}`)
+  return markdownHover(`${docText}${markdownCodeBlock(method.signature)}\n\nDefinition: ${definitionLink(child, method.span, baseDirectory)}`)
 }
 
 function formatCodeBlock(code: string): string {
@@ -44,7 +44,7 @@ function formatCodeBlock(code: string): string {
 function propHover(child: VueFileIndex, prop: PropInfo, baseDirectory: string): vscode.Hover {
   const docs = formatJSDocMarkdown(prop.documentation)
   const docText = docs ? `${docs}\n\n` : ''
-  return markdownHover(`${docText}\`\`\`js\n${formatCodeBlock(prop.detail)}\n\`\`\`\n\nDefinition: ${definitionLink(child, prop.span, baseDirectory)}`)
+  return markdownHover(`${docText}${markdownCodeBlock(formatCodeBlock(prop.detail))}\n\nDefinition: ${definitionLink(child, prop.span, baseDirectory)}`)
 }
 
 function findCommonDirectory(files: VueFileIndex[]): string {
@@ -66,7 +66,7 @@ function formatUsage(file: VueFileIndex, offset: number, baseDirectory: string):
   const position = offsetToPosition(file.lineStarts, offset)
   const relativePath = baseDirectory ? path.relative(baseDirectory, file.uri) : file.uri
   const target = vscode.Uri.file(file.uri).with({ fragment: `L${position.line + 1},${position.character + 1}` })
-  return `- [${relativePath}](${target.toString()})`
+  return `- [${escapeMarkdownText(relativePath)}](${target.toString()})`
 }
 
 function commandLink(childUri: string, eventName: string, usageCount: number): string {
@@ -88,19 +88,6 @@ function eventHover(child: VueFileIndex, eventName: string, baseDirectory: strin
   return markdownHover(`Definitions:\n\n${definitions}`)
 }
 
-function emitHover(child: VueFileIndex, eventName: string, files: VueFileIndex[], baseDirectory: string): vscode.Hover {
-  const usages = findTemplateEventUsages(files, child.uri, eventName)
-  const visibleUsages = usages.slice(0, 5)
-  const usageLines = visibleUsages.map((usage) => formatUsage(usage.file, usage.span.start, baseDirectory))
-  const usageText = usages.length > 0
-    ? `Used by ${usages.length} listener${usages.length === 1 ? '' : 's'}:\n\n${usageLines.join('\n')}`
-    : 'No template listeners found.'
-  const more = usages.length > visibleUsages.length
-    ? `\n\n${commandLink(child.uri, eventName, usages.length)}`
-    : ''
-  return markdownHover(`${usageText}${more}`)
-}
-
 export class VueHoverProvider implements vscode.HoverProvider {
   constructor(private readonly index: WorkspaceIndex) {}
 
@@ -111,14 +98,12 @@ export class VueHoverProvider implements vscode.HoverProvider {
       return undefined
     }
 
-    const files = this.index.getAllFiles()
-    const baseDirectory = findCommonDirectory(files)
-    const refAccess = findRefMethodAccess(file.content, offset)
+    const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
       const childUri = findRefComponent(file, refAccess.refName)
       const child = childUri ? this.index.getFile(childUri) : undefined
       const method = child ? findMethod(child, refAccess.methodName) : undefined
-      return child && method ? methodHover(child, method, baseDirectory) : undefined
+      return child && method ? methodHover(child, method, this.baseDirectory()) : undefined
     }
 
     for (const component of file.templateIndex.components) {
@@ -134,20 +119,38 @@ export class VueHoverProvider implements vscode.HoverProvider {
         }
         if (attr.kind === 'prop') {
           const prop = findProp(child, attr.normalizedName)
-          return prop ? propHover(child, prop, baseDirectory) : undefined
+          return prop ? propHover(child, prop, this.baseDirectory()) : undefined
         }
         if (attr.kind === 'event') {
-          return eventHover(child, attr.normalizedName, baseDirectory)
+          return eventHover(child, attr.normalizedName, this.baseDirectory())
         }
       }
     }
 
     for (const emit of file.scriptIndex.emits) {
       if (containsOffsetStrict(emit.eventSpan, offset)) {
-        return emitHover(file, emit.eventName, files, baseDirectory)
+        return this.emitHover(file, emit.eventName)
       }
     }
 
     return undefined
+  }
+
+  private baseDirectory(): string {
+    return findCommonDirectory(this.index.getAllFiles())
+  }
+
+  private emitHover(child: VueFileIndex, eventName: string): vscode.Hover {
+    const baseDirectory = this.baseDirectory()
+    const usages = findIndexedTemplateEventUsages(this.index, child.uri, eventName)
+    const visibleUsages = usages.slice(0, 5)
+    const usageLines = visibleUsages.map((usage) => formatUsage(usage.file, usage.span.start, baseDirectory))
+    const usageText = usages.length > 0
+      ? `Used by ${usages.length} listener${usages.length === 1 ? '' : 's'}:\n\n${usageLines.join('\n')}`
+      : 'No template listeners found.'
+    const more = usages.length > visibleUsages.length
+      ? `\n\n${commandLink(child.uri, eventName, usages.length)}`
+      : ''
+    return markdownHover(`${usageText}${more}`, usages.length > visibleUsages.length)
   }
 }

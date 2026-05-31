@@ -1,7 +1,7 @@
 import * as vscode from 'vscode'
 import type { TextSpan, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex } from '../indexer/workspaceIndex'
-import { findRefMethodUsages, findTemplateEventUsages, findTemplatePropUsages } from '../indexer/relationResolver'
+import { findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findIndexedTemplatePropUsages } from '../indexer/relationResolver'
 import { containsOffsetStrict, spanToRange } from '../utils/position'
 
 function toRange(file: VueFileIndex, span: TextSpan): vscode.Range {
@@ -25,19 +25,19 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
 
     for (const method of file.scriptIndex.methods) {
       if (containsOffsetStrict(method.span, offset)) {
-        return findRefMethodUsages(this.index.getAllFiles(), file.uri, method.name).map((usage) => toLocation(usage.file, usage.span))
+        return findIndexedRefMethodUsages(this.index, file.uri, method.name).map((usage) => toLocation(usage.file, usage.span))
       }
     }
 
     for (const prop of file.scriptIndex.props) {
       if (containsOffsetStrict(prop.span, offset)) {
-        return findTemplatePropUsages(this.index.getAllFiles(), file.uri, prop.name).map((usage) => toLocation(usage.file, usage.span))
+        return findIndexedTemplatePropUsages(this.index, file.uri, prop.name).map((usage) => toLocation(usage.file, usage.span))
       }
     }
 
     for (const emit of file.scriptIndex.emits) {
       if (containsOffsetStrict(emit.eventSpan, offset)) {
-        return findTemplateEventUsages(this.index.getAllFiles(), file.uri, emit.eventName).map((usage) => toLocation(usage.file, usage.span))
+        return findIndexedTemplateEventUsages(this.index, file.uri, emit.eventName).map((usage) => toLocation(usage.file, usage.span))
       }
     }
 

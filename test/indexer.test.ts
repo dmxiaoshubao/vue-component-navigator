@@ -34,6 +34,16 @@ describe('Vue2 indexer', () => {
     expect(child.scriptIndex.emits.filter((emit) => emit.eventName === 'save')).toHaveLength(2)
   })
 
+  it('支持清空索引用于手动重建', async () => {
+    const index = await buildIndex()
+
+    expect(index.getFileCount()).toBeGreaterThan(0)
+    index.clear()
+
+    expect(index.getFileCount()).toBe(0)
+    expect(index.getIndexedUris()).toEqual([])
+  })
+
   it('解析 template 中组件 ref、props、event 并过滤内置属性', async () => {
     const index = await buildIndex()
     const parent = index.getFile(path.join(fixtureRoot, 'Parent.vue'))!
@@ -44,6 +54,98 @@ describe('Vue2 indexer', () => {
     expect(childUsage.attrs.some((attr) => attr.kind === 'prop' && attr.name === 'title-text' && attr.normalizedName === 'titleText')).toBe(true)
     expect(childUsage.attrs.some((attr) => attr.kind === 'event' && attr.name === 'save')).toBe(true)
     expect(childUsage.attrs.some((attr) => ['class', 'style', 'key', 'v-if'].includes(attr.name))).toBe(false)
+  })
+
+  it('支持带修饰符的 template 事件监听', () => {
+    const index = new WorkspaceIndex()
+    const content = `
+<template>
+  <Child @save.once="onSave" v-on:submit.stop="onSubmit" />
+</template>
+<script>
+import Child from './Child.vue'
+export default { components: { Child } }
+</script>
+`
+
+    const file = index.indexContent(path.join(fixtureRoot, 'ModifierEvent.vue'), content)
+    const childUsage = file.templateIndex.components.find((component) => component.tag === 'Child')!
+
+    expect(childUsage.attrs.some((attr) => attr.kind === 'event' && attr.name === 'save')).toBe(true)
+    expect(childUsage.attrs.some((attr) => attr.kind === 'event' && attr.name === 'submit')).toBe(true)
+  })
+
+  it('属性值包含 > 时仍能解析同一组件后续属性', () => {
+    const index = new WorkspaceIndex()
+    const content = `
+<template>
+  <Child title="a > b" :user-id="userId" @save="onSave" />
+</template>
+<script>
+import Child from './Child.vue'
+export default { components: { Child } }
+</script>
+`
+
+    const file = index.indexContent(path.join(fixtureRoot, 'GreaterThanAttr.vue'), content)
+    const childUsage = file.templateIndex.components.find((component) => component.tag === 'Child')!
+
+    expect(childUsage.attrs.some((attr) => attr.kind === 'prop' && attr.name === 'title')).toBe(true)
+    expect(childUsage.attrs.some((attr) => attr.kind === 'prop' && attr.name === 'user-id')).toBe(true)
+    expect(childUsage.attrs.some((attr) => attr.kind === 'event' && attr.name === 'save')).toBe(true)
+  })
+
+  it('脚本中的注释不会破坏对象结构解析或伪引用扫描', () => {
+    const content = `
+<script>
+const ignored = "export default { props: { fake: String } }"
+export default {
+  methods: {
+    foo() {
+      // this.$refs.child.open()
+      /* } */
+      const matcher = /}/
+      return 1
+    },
+    bar() {
+      return this.$emit('save')
+    },
+  },
+  props: {
+    'foo-bar': String,
+  },
+}
+</script>
+`
+
+    const file = new WorkspaceIndex().indexContent(path.join(fixtureRoot, 'CommentSafe.vue'), content)
+
+    expect(file.scriptIndex.methods.map((method) => method.name)).toEqual(['foo', 'bar'])
+    expect(file.scriptIndex.props.map((prop) => prop.name)).toEqual(['foo-bar'])
+    expect(file.scriptIndex.emits).toHaveLength(1)
+  })
+
+  it('忽略注释中的 import 与 template 组件', () => {
+    const index = new WorkspaceIndex()
+    const content = `
+<template>
+  <!-- <FakeChild ref="fake" @save="onSave" /> -->
+  <RealChild ref="real" />
+</template>
+<script>
+// import FakeChild from './FakeChild.vue'
+import RealChild from './RealChild.vue'
+export default {
+  components: { FakeChild, RealChild },
+}
+</script>
+`
+
+    const file = index.indexContent(path.join(fixtureRoot, 'IgnoredComment.vue'), content)
+
+    expect(file.scriptIndex.imports).toEqual([{ localName: 'RealChild', source: './RealChild.vue' }])
+    expect(file.scriptIndex.components.find((component) => component.localName === 'FakeChild')?.targetUri).toBeUndefined()
+    expect(file.templateIndex.components.map((component) => component.tag)).toEqual(['RealChild'])
   })
 })
 
@@ -85,6 +187,99 @@ describe('Vue2 relation resolver', () => {
     expect(findTemplateEventUsages(files, childUri, 'save')).toHaveLength(2)
     expect(findRefMethodUsages(files, childUri, 'open')).toHaveLength(2)
     expect(findRefMethodUsages(files, childUri, 'missing')).toHaveLength(0)
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(2)
+    expect(index.findRefMethodUsages(childUri, 'open')).toHaveLength(2)
+  })
+
+  it('更新和删除文件时同步清理反向索引', () => {
+    const index = new WorkspaceIndex()
+    const childUri = path.join(fixtureRoot, 'IndexedChild.vue')
+    const parentUri = path.join(fixtureRoot, 'IndexedParent.vue')
+
+    index.indexContent(childUri, `
+<template><div /></template>
+<script>
+export default {
+  props: { title: String },
+  methods: { open() {} },
+}
+</script>
+`)
+    index.indexContent(parentUri, `
+<template>
+  <IndexedChild ref="child" :title="title" @save="onSave" />
+</template>
+<script>
+import IndexedChild from './IndexedChild.vue'
+export default {
+  components: { IndexedChild },
+  methods: {
+    callChild() {
+      this.$refs.child.open()
+    },
+  },
+}
+</script>
+`)
+
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(1)
+    expect(index.findRefMethodUsages(childUri, 'open')).toHaveLength(1)
+
+    index.syncContent(parentUri, `
+<template>
+  <IndexedChild ref="child" />
+</template>
+<script>
+import IndexedChild from './IndexedChild.vue'
+export default { components: { IndexedChild } }
+</script>
+`)
+
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(0)
+    expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(0)
+    expect(index.findRefMethodUsages(childUri, 'open')).toHaveLength(0)
+
+    index.remove(parentUri)
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(0)
+  })
+
+  it('忽略注释中的 $refs 调用', () => {
+    const index = new WorkspaceIndex()
+    const childUri = path.join(fixtureRoot, 'CommentChild.vue')
+    const parentUri = path.join(fixtureRoot, 'CommentParent.vue')
+
+    index.indexContent(childUri, `
+<template><div /></template>
+<script>
+export default {
+  methods: {
+    open() {},
+  },
+}
+</script>
+`)
+    index.indexContent(parentUri, `
+<template>
+  <CommentChild ref="child" />
+</template>
+<script>
+import CommentChild from './CommentChild.vue'
+export default {
+  components: { CommentChild },
+  methods: {
+    callChild() {
+      // this.$refs.child.open()
+      const matcher = /this\\.\$refs\\.child\\.open/
+      return this.$refs.child.open()
+    },
+  },
+}
+</script>
+`)
+
+    expect(findRefMethodUsages(index.getAllFiles(), childUri, 'open')).toHaveLength(1)
   })
 
   it('同名事件或 prop 但组件不同不算引用', async () => {

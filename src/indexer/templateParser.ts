@@ -25,12 +25,12 @@ function normalizeAttr(attrName: string): TemplateAttrUsage | undefined {
   }
 
   if (attrName.startsWith('@')) {
-    const name = attrName.slice(1)
+    const name = stripModifier(attrName.slice(1))
     return { kind: 'event', name, normalizedName: name, span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } }
   }
 
   if (attrName.startsWith('v-on:')) {
-    const name = attrName.slice('v-on:'.length)
+    const name = stripModifier(attrName.slice('v-on:'.length))
     return { kind: 'event', name, normalizedName: name, span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } }
   }
 
@@ -105,39 +105,72 @@ function extractAttrs(openTag: string, openStart: number): TemplateAttrUsage[] {
   return attrs
 }
 
-function createTagPattern(tag: string): RegExp {
-  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`<${escaped}(?=\\s|>|/)`, 'g')
-}
-
 function findOpenTagEnd(template: string, openStart: number): number {
-  const end = template.indexOf('>', openStart)
-  return end === -1 ? template.length : end + 1
+  let quote: '"' | "'" | undefined
+
+  for (let index = openStart; index < template.length; index += 1) {
+    const char = template[index]
+    if (quote) {
+      if (char === quote) {
+        quote = undefined
+      }
+      continue
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
+
+    if (char === '>') {
+      return index + 1
+    }
+  }
+
+  return template.length
 }
 
 export function parseTemplate(content: string, templateStart: number, registeredTags: string[]): TemplateIndex {
-  const uniqueTags = [...new Set(registeredTags.flatMap((tag) => [tag, toKebabCase(tag)]))]
+  const uniqueTags = new Set(registeredTags.map((tag) => toKebabCase(tag)))
   const components: TemplateComponentUsage[] = []
 
-  for (const tag of uniqueTags) {
-    const pattern = createTagPattern(tag)
-    let match: RegExpExecArray | null
+  const pattern = /<([A-Za-z][\w-]*)(?=\s|>|\/)/g
+  let match: RegExpExecArray | null
+  let nextCommentStart = content.indexOf('<!--')
+  let commentEnd = -1
 
-    while ((match = pattern.exec(content))) {
-      const openEnd = findOpenTagEnd(content, match.index)
-      const openTag = content.slice(match.index, openEnd)
-      const attrs = extractAttrs(openTag, templateStart + match.index)
-      components.push({
-        tag,
-        span: {
-          start: templateStart + match.index + 1,
-          end: templateStart + match.index + 1 + tag.length,
-        },
-        attrs,
-      })
+  while ((match = pattern.exec(content))) {
+    while (nextCommentStart !== -1 && nextCommentStart < match.index && match.index >= commentEnd) {
+      commentEnd = findHtmlCommentEnd(content, nextCommentStart)
+      nextCommentStart = content.indexOf('<!--', commentEnd)
     }
+    if (match.index < commentEnd) {
+      continue
+    }
+
+    const rawTag = match[1]
+    if (!uniqueTags.has(toKebabCase(rawTag))) {
+      continue
+    }
+
+    const openEnd = findOpenTagEnd(content, match.index)
+    const openTag = content.slice(match.index, openEnd)
+    const attrs = extractAttrs(openTag, templateStart + match.index)
+    components.push({
+      tag: rawTag,
+      span: {
+        start: templateStart + match.index + 1,
+        end: templateStart + match.index + 1 + rawTag.length,
+      },
+      attrs,
+    })
   }
 
   components.sort((a, b) => a.span.start - b.span.start)
   return { components }
+}
+
+function findHtmlCommentEnd(content: string, start: number): number {
+  const end = content.indexOf('-->', start + '<!--'.length)
+  return end === -1 ? content.length : end + '-->'.length
 }

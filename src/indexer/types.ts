@@ -93,15 +93,22 @@ export interface VueFileIndex {
   uri: string
   fileName: string
   content: string
+  searchableContent: string
   lineStarts: number[]
   script?: SfcBlock
   template?: SfcBlock
   scriptIndex: ScriptIndex
   templateIndex: TemplateIndex
+  refMethodCalls: RefMethodAccess[]
 }
 
 export interface RefMethodAccess {
   refName: string
   methodName: string
   methodSpan: TextSpan
+}
+
+export interface UsageInfo {
+  file: VueFileIndex
+  span: TextSpan
 }
