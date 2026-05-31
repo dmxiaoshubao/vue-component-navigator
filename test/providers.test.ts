@@ -315,19 +315,75 @@ Vue.component('LateGlobalChild', LateGlobalChild)
     expect(hoverText(propHover).startsWith('*@description* — Source image URL.')).toBe(true)
     expect(hoverText(propHover)).toContain("originUrl: {\n  type: String,")
     expect(hoverText(propHover)).toContain('default')
-    expect(hoverText(propHover)).toContain('Definition: [src/components/AliasChild.vue]')
-    expect(hoverText(propHover)).not.toContain('Definition: [src/components/AliasChild.vue:')
+    expect(hoverText(propHover)).toContain('Definition: [AliasChild.vue]')
+    expect(hoverText(propHover)).not.toContain('Definition: [src/components/AliasChild.vue]')
     expect(propHover.contents.isTrusted).toBe(false)
     expect(parentEventHover).toBeDefined()
-    expect(hoverText(parentEventHover)).toContain('Definition: [src/components/AliasChild.vue]')
+    expect(hoverText(parentEventHover)).toContain('Definition: [AliasChild.vue]')
+    expect(hoverText(parentEventHover)).not.toContain('Definition: [src/components/AliasChild.vue]')
     expect(hoverText(parentEventHover)).not.toContain('Used by 1 listener')
     expect(parentEventHover.contents.isTrusted).toBe(false)
-    expect(hoverText(eventHover)).not.toContain('Definition: [src/components/AliasChild.vue]')
+    expect(hoverText(eventHover)).not.toContain('Definition: [AliasChild.vue]')
     expect(hoverText(eventHover)).toContain('Used by 1 listener')
     expect(hoverText(eventHover)).not.toContain('AliasChild emits onLoadSuccess')
     expect(hoverText(eventHover)).toContain('[Parent.vue')
     expect(hoverText(eventHover)).toContain('file://')
     expect(eventHover.contents.isTrusted).toBe(false)
+  })
+
+  it('Definition 链接展示最短可区分路径，target 仍保留完整 file URI', () => {
+    const parentContent = readFixture('Parent.vue')
+    const document = new TestDocument(path.join(fixtureRoot, 'Parent.vue'), parentContent) as any
+    const hoverProvider = new VueHoverProvider(index)
+    const originOffset = parentContent.indexOf(':origin-url') + 2
+
+    const hover = hoverProvider.provideHover(document, positionAt(parentContent, originOffset)) as any
+
+    expect(hoverText(hover)).toContain('Definition: [AliasChild.vue]')
+    expect(hoverText(hover)).not.toContain('Definition: [src/components/AliasChild.vue]')
+    expect(hoverText(hover)).toContain('file://')
+  })
+
+  it('emit 引用列表使用当前引用集合的最短差异路径', () => {
+    const childUri = path.join(fixtureRoot, 'NestedEmitChild.vue')
+    const childContent = `
+<template><div /></template>
+<script>
+export default {
+  methods: {
+    submit() {
+      this.$emit('submit')
+    },
+  },
+}
+</script>
+`
+    const parents = [
+      ['pages/admin/marketing/red-packet/index.vue', 'onRedPacketSubmit'],
+      ['pages/admin/marketing/activity/index.vue', 'onActivitySubmit'],
+      ['pages/admin/marketing/coupon/index.vue', 'onCouponSubmit'],
+    ] as const
+    index.indexContent(childUri, childContent)
+    for (const [relativePath, handler] of parents) {
+      index.indexContent(path.join(fixtureRoot, relativePath), `
+<template>
+  <NestedEmitChild @submit="${handler}" />
+</template>
+<script>
+import NestedEmitChild from '../../../../NestedEmitChild.vue'
+export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
+</script>
+`)
+    }
+
+    const document = new TestDocument(childUri, childContent) as any
+    const hoverProvider = new VueHoverProvider(index)
+    const hover = hoverProvider.provideHover(document, positionAt(childContent, childContent.indexOf("'submit'") + 2)) as any
+
+    expect(hoverText(hover)).toContain('[red-packet/index.vue:')
+    expect(hoverText(hover)).toContain('[activity/index.vue:')
+    expect(hoverText(hover)).toContain('[coupon/index.vue:')
+    expect(hoverText(hover)).not.toContain('- [pages/admin/marketing/red-packet/index.vue:')
   })
 
   it('$emit 使用位置超过 5 个时才启用 command trusted hover', () => {

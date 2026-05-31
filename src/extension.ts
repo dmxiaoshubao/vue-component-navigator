@@ -7,26 +7,11 @@ import { VueDefinitionProvider } from './providers/definitionProvider'
 import { SHOW_EMIT_USAGES_COMMAND, VueHoverProvider } from './providers/hoverProvider'
 import { VueReferenceProvider } from './providers/referenceProvider'
 import { offsetToPosition, spanToRange } from './utils/position'
+import { commonDirectory, relativePath, usagePathLabels } from './utils/pathDisplay'
 
-function commonDirectory(files: VueFileIndex[]): string {
-  if (files.length === 0) {
-    return ''
-  }
-
-  const parts = path.dirname(files[0].uri).split(path.sep)
-  for (const file of files.slice(1)) {
-    const current = path.dirname(file.uri).split(path.sep)
-    while (parts.length > 0 && current.slice(0, parts.length).join(path.sep) !== parts.join(path.sep)) {
-      parts.pop()
-    }
-  }
-  return parts.join(path.sep)
-}
-
-function usageLabel(file: VueFileIndex, span: TextSpan, baseDirectory: string): string {
+function usageLabel(file: VueFileIndex, span: TextSpan, label: string): string {
   const position = offsetToPosition(file.lineStarts, span.start)
-  const relativePath = baseDirectory ? path.relative(baseDirectory, file.uri) : file.uri
-  return `${relativePath}:${position.line + 1}:${position.character + 1}`
+  return `${label}:${position.line + 1}:${position.character + 1}`
 }
 
 function toVsCodeRange(file: VueFileIndex, span: TextSpan): vscode.Range {
@@ -157,9 +142,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
       const files = index.getAllFiles()
       const usages = index.findTemplateEventUsages(child.uri, eventName)
-      const baseDirectory = commonDirectory(files)
+      const baseDirectory = commonDirectory(files.map((file) => file.uri))
+      const labels = usagePathLabels(usages.map((usage) => usage.file.uri), baseDirectory)
       const selected = await vscode.window.showQuickPick(usages.map((usage) => ({
-        label: usageLabel(usage.file, usage.span, baseDirectory),
+        label: usageLabel(usage.file, usage.span, labels.get(usage.file.uri) ?? path.basename(usage.file.uri)),
+        description: relativePath(usage.file.uri, baseDirectory),
         file: usage.file,
         span: usage.span,
       })), {
