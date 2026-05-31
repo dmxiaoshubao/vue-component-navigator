@@ -41,6 +41,25 @@ export interface ComponentRegistration {
   nameSpan: TextSpan
 }
 
+export interface GlobalComponentRegistration {
+  tag: string
+  localName: string
+  source?: string
+  targetUri?: string
+  usesImportedName?: boolean
+  nameSpan: TextSpan
+  registerSpan: TextSpan
+  fileUri: string
+}
+
+export interface GlobalComponentContext {
+  source: string
+  targetUri: string
+  nameSpan: TextSpan
+  registerSpan: TextSpan
+  fileUri: string
+}
+
 export interface PropInfo {
   name: string
   span: TextSpan

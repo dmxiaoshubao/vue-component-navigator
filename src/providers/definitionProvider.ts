@@ -1,7 +1,7 @@
 import * as vscode from 'vscode'
 import type { TextSpan, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedTemplateEventUsages, findMethod, findProp, findRefComponent, findRegisteredComponent } from '../indexer/relationResolver'
+import { findEmit, findIndexedTemplateEventUsages, findMethod, findProp, findResolvedComponent, findResolvedRefComponent, hasRegisteredComponent } from '../indexer/relationResolver'
 import { containsOffsetStrict, spanToRange } from '../utils/position'
 
 function toRange(file: VueFileIndex, span: TextSpan): vscode.Range {
@@ -25,17 +25,21 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
 
     const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
-      const childUri = findRefComponent(file, refAccess.refName)
+      const childUri = findResolvedRefComponent(this.index, file, refAccess.refName)
       const child = childUri ? this.index.getFile(childUri) : undefined
       const method = child ? findMethod(child, refAccess.methodName) : undefined
       return child && method ? toLocation(child, method.span) : undefined
     }
 
     for (const component of file.templateIndex.components) {
-      const childUri = findRegisteredComponent(file, component.tag)
+      const childUri = findResolvedComponent(this.index, file, component.tag)
       const child = childUri ? this.index.getFile(childUri) : undefined
       if (!child) {
         continue
+      }
+
+      if (containsOffsetStrict(component.span, offset) && !hasRegisteredComponent(file, component.tag)) {
+        return toLocation(child, { start: 0, end: 0 })
       }
 
       for (const attr of component.attrs) {

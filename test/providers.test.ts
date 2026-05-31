@@ -168,6 +168,94 @@ export default {
     expect(definitions[0].uri.fsPath.endsWith('Child.vue')).toBe(true)
   })
 
+  it('全局注册组件的 prop、event 和 $refs provider 可用', () => {
+    const parentContent = readFixture('GlobalParent.vue')
+    const document = new TestDocument(path.join(fixtureRoot, 'GlobalParent.vue'), parentContent) as any
+    const definitionProvider = new VueDefinitionProvider(index)
+    const referenceProvider = new VueReferenceProvider(index)
+    const hoverProvider = new VueHoverProvider(index)
+    const completionProvider = new VueCompletionProvider(index)
+    const labelOffset = parentContent.indexOf(':label') + 2
+    const readyOffset = parentContent.indexOf('@ready') + 2
+    const focusOffset = parentContent.indexOf('focus()') + 1
+    const completionOffset = parentContent.indexOf('this.$refs.globalChild.') + 'this.$refs.globalChild.'.length
+    const childContent = fs.readFileSync(path.join(fixtureRoot, 'global-components/GlobalChild.vue'), 'utf8')
+    const childDocument = new TestDocument(path.join(fixtureRoot, 'global-components/GlobalChild.vue'), childContent) as any
+    const childPropOffset = childContent.indexOf('label: String') + 1
+
+    const propDefinition = definitionProvider.provideDefinition(document, positionAt(parentContent, labelOffset)) as any
+    const eventDefinition = definitionProvider.provideDefinition(document, positionAt(parentContent, readyOffset)) as any[]
+    const methodDefinition = definitionProvider.provideDefinition(document, positionAt(parentContent, focusOffset)) as any
+    const propReferences = referenceProvider.provideReferences(childDocument, positionAt(childContent, childPropOffset)) as any[]
+    const hover = hoverProvider.provideHover(document, positionAt(parentContent, labelOffset)) as any
+    const completions = completionProvider.provideCompletionItems(document, positionAt(parentContent, completionOffset)) as any[]
+
+    expect(propDefinition.uri.fsPath.endsWith('GlobalChild.vue')).toBe(true)
+    expect(eventDefinition[0].uri.fsPath.endsWith('GlobalChild.vue')).toBe(true)
+    expect(methodDefinition.uri.fsPath.endsWith('GlobalChild.vue')).toBe(true)
+    expect(propReferences).toHaveLength(1)
+    expect(hoverText(hover)).toContain('label: String')
+    expect(completions.map((item) => item.label)).toContain('focus')
+  })
+
+  it('全局组件晚于父组件索引时仍能从 prop 跳转', async () => {
+    const localIndex = new WorkspaceIndex()
+    const parentUri = path.join(fixtureRoot, 'LateGlobalParent.vue')
+    const childUri = path.join(fixtureRoot, 'LateGlobalChild.vue')
+    const globalUri = path.join(fixtureRoot, 'late-global.js')
+    const parentContent = `
+<template>
+  <LateGlobalChild :value.sync="value" />
+</template>
+<script>
+export default {}
+</script>
+`
+    const childContent = `
+<template><div /></template>
+<script>
+export default {
+  props: {
+    value: String,
+  },
+}
+</script>
+`
+    const document = new TestDocument(parentUri, parentContent) as any
+    const provider = new VueDefinitionProvider(localIndex)
+
+    localIndex.indexContent(parentUri, parentContent)
+    localIndex.indexContent(childUri, childContent)
+    await localIndex.indexGlobalComponentContent(globalUri, `
+import LateGlobalChild from './LateGlobalChild.vue'
+Vue.component('LateGlobalChild', LateGlobalChild)
+`)
+
+    const definition = provider.provideDefinition(document, positionAt(parentContent, parentContent.indexOf(':value.sync') + 2)) as any
+
+    expect(definition.uri.fsPath).toBe(childUri)
+  })
+
+  it('全局组件标签名可跳转到组件文件', () => {
+    const parentContent = readFixture('GlobalParent.vue')
+    const document = new TestDocument(path.join(fixtureRoot, 'GlobalParent.vue'), parentContent) as any
+    const definitionProvider = new VueDefinitionProvider(index)
+
+    const definition = definitionProvider.provideDefinition(document, positionAt(parentContent, parentContent.indexOf('GlobalChild') + 1)) as any
+
+    expect(definition.uri.fsPath.endsWith('GlobalChild.vue')).toBe(true)
+  })
+
+  it('局部注册组件标签名不由本扩展跳转，避免和 Vue 官方扩展重复', () => {
+    const parentContent = readFixture('Parent.vue')
+    const document = new TestDocument(path.join(fixtureRoot, 'Parent.vue'), parentContent) as any
+    const definitionProvider = new VueDefinitionProvider(index)
+
+    const definition = definitionProvider.provideDefinition(document, positionAt(parentContent, parentContent.indexOf('Child') + 1))
+
+    expect(definition).toBeUndefined()
+  })
+
   it('template prop 定义跳转和悬浮可用，未知 prop 不跳转', () => {
     const content = readFixture('Parent.vue')
     const document = new TestDocument(path.join(fixtureRoot, 'Parent.vue'), content) as any

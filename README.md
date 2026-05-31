@@ -1,18 +1,53 @@
 # vue-component-navigator
 
-A VS Code extension that improves Vue 2 component navigation for local `.vue` Options API components.
+A VS Code extension that improves Vue 2 component navigation for Options API `.vue` single-file components.
 
-MVP features:
+> 中文文档: [README.zh-CN.md](./README.zh-CN.md)
 
-- Navigate from `this.$refs.child.method()` to the child component method.
-- Navigate between `this.$emit('event')` and parent template event listeners.
-- Navigate from child component props used in templates to the child prop definition.
-- Show hover information and references only when a static component relationship proves the link.
+## Feature Coverage
 
-MVP scope and limits:
+| Area | Supported | Notes |
+| --- | --- | --- |
+| `$refs` method definition | Yes | Navigate from `this.$refs.child.method()` to the child component method. Optional chaining like `this.$refs.child?.method()` and `this.$refs?.child?.method()` is supported. |
+| `$refs` method completion | Yes | Completes methods from the statically resolved child component and gives them higher sort priority. |
+| `$refs` method hover | Yes | Shows method signature, JSDoc summary, params, and definition link when available. |
+| `$emit` to template listeners | Yes | Navigate from `this.$emit('event')` to parent template listeners. Multiple listeners are returned when found. |
+| Template event to child emits | Yes | Navigate from `@event` / `v-on:event` to matching `this.$emit('event')` calls in the child component. Event modifiers like `.once` and `.stop` are supported. |
+| Template prop to child prop | Yes | Navigate from `:prop`, `v-bind:prop`, static props, and `.sync` props to the child prop definition. |
+| Template prop hover | Yes | Shows prop definition detail, JSDoc summary, and definition link. |
+| Template event hover | Yes | Shows emit definition links for template listeners and usage summaries for emit sites. |
+| Prop / event / ref reverse references | Yes | Finds parent template prop usages, event listeners, and `$refs` method calls through the indexed relationship graph. |
+| Local component relationships | Yes | Resolves static default imports registered in the component's `components` option. Component tag definition jumps for local components are intentionally left to the official Vue tooling to avoid duplicate definitions. |
+| Global component relationships | Yes | Resolves static `Vue.component(...)` / `app.component(...)` style registrations when the tag and imported component can be proven statically. |
+| `Component.name` global registration | Yes | Supports `Vue.component(Component.name, Component)` by reading the imported `.vue` component `name`. |
+| Constant tag global registration | Yes | Supports patterns like `const name = 'MyComponent'; Vue.component(name, MyComponent)`. |
+| `require.context` global registration | Partial | Supports conservative Vue 2 auto-registration patterns like `require.context('./components', true, /\.vue$/)` and reads each `.vue` component `name`. |
+| `@/` alias imports | Yes | Resolves aliases from the nearest `tsconfig.json` or `jsconfig.json` using `compilerOptions.baseUrl` and `compilerOptions.paths`, with a fallback for common `@/src` usage. |
+| Workspace reindexing | Yes | Provides a `Vue Component Navigator: Reindex Workspace` command and keeps an in-memory index for fast provider responses. |
+| Incremental updates | Yes | Updates `.vue` file indexes on edit/save and refreshes global component mappings when related `.js`, `.ts`, or global component source files change. |
 
-- Supports Vue 2 `.vue` single-file components using Options API.
-- Resolves only local static imports registered in `components`.
-- Supports static template props/events and static `ref="name"` relationships.
-- Does not support Vue 3 Composition API, `<script setup>`, global components, dynamic refs, dynamic prop/event names, external `.js/.ts` component definitions, or component auto-registration.
-- Uses lightweight parsing for Vue 2 Options API. Complex JavaScript or template syntax outside the static patterns above may be ignored instead of guessed.
+## Scope And Limits
+
+| Area | Status | Reason |
+| --- | --- | --- |
+| Vue version | Vue 2 Options API | The parser is optimized for Vue 2 Options API SFCs. |
+| Vue 3 / `<script setup>` | Not supported | Official Vue tooling already covers most modern Vue navigation better. |
+| Dynamic component registrations | Not supported | Dynamic expressions are skipped instead of guessed to avoid false positives. |
+| Dynamic refs / prop names / event names | Not supported | Only static relationships are indexed. |
+| Local component tag definition jump | Intentionally not handled | Avoids duplicate definitions with the official Vue extension. Other relationships for local components are still supported. |
+| External component source outside workspace | Ignored | Keeps indexing safe and bounded to the workspace. |
+| Complex JavaScript parsing | Best effort | Uses lightweight static parsing. Unsupported syntax is ignored rather than guessed. |
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `Vue Component Navigator: Show Status` | Shows index status and current file coverage. |
+| `Vue Component Navigator: Reindex Workspace` | Rebuilds the workspace index manually. Use this after large refactors or when opening an already-running extension host. |
+
+## Design Principles
+
+- Prefer static proof over guessing.
+- Avoid duplicating official Vue tooling, especially for local component tag definitions.
+- Keep indexing lightweight enough for large Vue 2 workspaces.
+- Keep unsafe or ambiguous dynamic patterns out of the result set.

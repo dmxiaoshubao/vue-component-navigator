@@ -1,6 +1,6 @@
 import * as vscode from 'vscode'
 import { WorkspaceIndex, findRefCompletionContextInFile } from '../indexer/workspaceIndex'
-import { findRefComponent } from '../indexer/relationResolver'
+import { findResolvedRefComponent } from '../indexer/relationResolver'
 import { formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 
 const HIGH_PRIORITY_SORT_PREFIX = '\u0000\u0000'
@@ -21,7 +21,7 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
       return undefined
     }
 
-    const childUri = findRefComponent(file, refContext.refName)
+    const childUri = findResolvedRefComponent(this.index, file, refContext.refName)
     const child = childUri ? this.index.getFile(childUri) : undefined
     if (!child) {
       return undefined

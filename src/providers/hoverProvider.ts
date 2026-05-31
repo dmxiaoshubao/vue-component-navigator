@@ -2,7 +2,7 @@ import * as path from 'node:path'
 import * as vscode from 'vscode'
 import type { MethodInfo, PropInfo, TextSpan, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedTemplateEventUsages, findMethod, findProp, findRefComponent, findRegisteredComponent } from '../indexer/relationResolver'
+import { findEmit, findIndexedTemplateEventUsages, findMethod, findProp, findResolvedComponent, findResolvedRefComponent } from '../indexer/relationResolver'
 import { containsOffsetStrict, offsetToPosition } from '../utils/position'
 import { escapeMarkdownText, formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 
@@ -100,14 +100,14 @@ export class VueHoverProvider implements vscode.HoverProvider {
 
     const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
-      const childUri = findRefComponent(file, refAccess.refName)
+      const childUri = findResolvedRefComponent(this.index, file, refAccess.refName)
       const child = childUri ? this.index.getFile(childUri) : undefined
       const method = child ? findMethod(child, refAccess.methodName) : undefined
       return child && method ? methodHover(child, method, this.baseDirectory()) : undefined
     }
 
     for (const component of file.templateIndex.components) {
-      const childUri = findRegisteredComponent(file, component.tag)
+      const childUri = findResolvedComponent(this.index, file, component.tag)
       const child = childUri ? this.index.getFile(childUri) : undefined
       if (!child) {
         continue

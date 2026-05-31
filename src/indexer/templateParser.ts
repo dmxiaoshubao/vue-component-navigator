@@ -149,7 +149,7 @@ export function parseTemplate(content: string, templateStart: number, registered
     }
 
     const rawTag = match[1]
-    if (!uniqueTags.has(toKebabCase(rawTag))) {
+    if (!uniqueTags.has(toKebabCase(rawTag)) && !isLikelyComponentTag(rawTag)) {
       continue
     }
 
@@ -168,6 +168,10 @@ export function parseTemplate(content: string, templateStart: number, registered
 
   components.sort((a, b) => a.span.start - b.span.start)
   return { components }
+}
+
+function isLikelyComponentTag(tag: string): boolean {
+  return /^[A-Z]/.test(tag) || tag.includes('-')
 }
 
 function findHtmlCommentEnd(content: string, start: number): number {

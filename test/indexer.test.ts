@@ -178,6 +178,106 @@ describe('Vue2 relation resolver', () => {
     expect(findEmit(alias, 'onLoadSuccess')).toHaveLength(1)
   })
 
+  it('解析全局注册组件到 props、events 和 ref 方法关系', async () => {
+    const index = await buildIndex()
+    const parent = index.getFile(path.join(fixtureRoot, 'GlobalParent.vue'))!
+    const globalChild = index.getFile(path.join(fixtureRoot, 'global-components/GlobalChild.vue'))!
+    const globalDialog = index.getFile(path.join(fixtureRoot, 'global-components/dialog/index.vue'))!
+    const namedOnlyDialog = index.getFile(path.join(fixtureRoot, 'global-components/NamedOnlyDialog.vue'))!
+    const autoWidget = index.getFile(path.join(fixtureRoot, 'global-components/auto-widget/index.vue'))!
+
+    expect(index.getGlobalComponents().map((component) => component.tag)).toContain('GlobalChild')
+    expect(index.resolveComponent(parent, 'GlobalChild')).toBe(globalChild.uri)
+    expect(index.resolveComponent(parent, 'GlobalDialog')).toBe(globalDialog.uri)
+    expect(index.resolveComponent(parent, 'NamedOnlyDialog')).toBe(namedOnlyDialog.uri)
+    expect(index.resolveComponent(parent, 'AutoWidget')).toBe(autoWidget.uri)
+    expect(index.resolveRefComponent(parent, 'globalChild')).toBe(globalChild.uri)
+    expect(index.resolveRefComponent(parent, 'dialog')).toBe(globalDialog.uri)
+    expect(index.resolveRefComponent(parent, 'namedOnlyDialog')).toBe(namedOnlyDialog.uri)
+    expect(index.resolveRefComponent(parent, 'autoWidget')).toBe(autoWidget.uri)
+    expect(index.findTemplatePropUsages(globalChild.uri, 'label')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(globalChild.uri, 'ready')).toHaveLength(1)
+    expect(index.findRefMethodUsages(globalChild.uri, 'focus')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(globalDialog.uri, 'title')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(globalDialog.uri, 'confirm')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(namedOnlyDialog.uri, 'title')).toHaveLength(1)
+    expect(index.findRefMethodUsages(namedOnlyDialog.uri, 'show')).toHaveLength(1)
+    expect(index.findRefMethodUsages(autoWidget.uri, 'refresh')).toHaveLength(1)
+  })
+
+  it('全局注册文件与组件 name 变化后会刷新索引', async () => {
+    const index = new WorkspaceIndex()
+    const parentUri = path.join(fixtureRoot, 'IncrementalGlobalParent.vue')
+    const childUri = path.join(fixtureRoot, 'IncrementalGlobalChild.vue')
+    const registerUri = path.join(fixtureRoot, 'incremental-global.js')
+
+    index.indexContent(parentUri, `
+<template>
+  <IncrementalGlobalChild ref="child" title="hello" />
+</template>
+<script>
+export default {
+  methods: {
+    callChild() {
+      this.$refs.child.open()
+    },
+  },
+}
+</script>
+`)
+    index.indexContent(childUri, `
+<template><div /></template>
+<script>
+export default {
+  name: 'IncrementalGlobalChild',
+  props: { title: String },
+  methods: { open() {} },
+}
+</script>
+`)
+
+    await index.indexGlobalComponentContent(registerUri, `
+import IncrementalGlobalChild from './IncrementalGlobalChild.vue'
+Vue.component(IncrementalGlobalChild.name, IncrementalGlobalChild)
+`)
+    await index.refreshGlobalComponentsForVueFile(childUri)
+
+    expect(index.resolveComponent(index.getFile(parentUri)!, 'IncrementalGlobalChild')).toBe(childUri)
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findRefMethodUsages(childUri, 'open')).toHaveLength(1)
+
+    index.syncContent(childUri, `
+<template><div /></template>
+<script>
+export default {
+  name: 'RenamedGlobalChild',
+  props: { title: String },
+  methods: { open() {} },
+}
+</script>
+`)
+    index.syncContent(parentUri, `
+<template>
+  <RenamedGlobalChild ref="child" title="hello" />
+</template>
+<script>
+export default {
+  methods: {
+    callChild() {
+      this.$refs.child.open()
+    },
+  },
+}
+</script>
+`)
+    await index.refreshGlobalComponentsForVueFile(childUri)
+
+    expect(index.resolveComponent(index.getFile(parentUri)!, 'IncrementalGlobalChild')).toBeUndefined()
+    expect(index.resolveComponent(index.getFile(parentUri)!, 'RenamedGlobalChild')).toBe(childUri)
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findRefMethodUsages(childUri, 'open')).toHaveLength(1)
+  })
+
   it('只返回真实 props、emit、ref 方法引用', async () => {
     const index = await buildIndex()
     const files = index.getAllFiles()

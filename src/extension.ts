@@ -68,6 +68,33 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  async function syncGlobalComponentFile(filePath: string): Promise<void> {
+    try {
+      await index.syncGlobalComponentFile(filePath)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      void vscode.window.showWarningMessage(`Vue Component Navigator failed to index ${filePath}: ${message}`)
+    }
+  }
+
+  async function refreshGlobalComponentsFromVueFiles(): Promise<void> {
+    try {
+      await index.refreshGlobalComponentsFromVueFiles()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      void vscode.window.showWarningMessage(`Vue Component Navigator failed to refresh global components: ${message}`)
+    }
+  }
+
+  async function refreshGlobalComponentsForVueFile(filePath: string): Promise<void> {
+    try {
+      await index.refreshGlobalComponentsForVueFile(filePath)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      void vscode.window.showWarningMessage(`Vue Component Navigator failed to refresh global components: ${message}`)
+    }
+  }
+
   async function indexWorkspaceFolders(title: string, showSuccess: boolean): Promise<void> {
     if (indexStatus === 'indexing') {
       void vscode.window.showInformationMessage('Vue Component Navigator is already indexing the workspace.')
@@ -154,6 +181,9 @@ export function activate(context: vscode.ExtensionContext): void {
       if (document.languageId === 'vue' && document.uri.scheme === 'file') {
         clearPendingSync(document.uri.fsPath)
         index.syncContent(document.uri.fsPath, document.getText())
+        void refreshGlobalComponentsForVueFile(document.uri.fsPath)
+      } else if (isScriptFile(document.uri.fsPath) && document.uri.scheme === 'file') {
+        void syncGlobalComponentFile(document.uri.fsPath)
       }
     }),
     vscode.workspace.onDidChangeTextDocument((event) => {
@@ -167,23 +197,38 @@ export function activate(context: vscode.ExtensionContext): void {
         if (file.fsPath.endsWith('.vue')) {
           clearPendingSync(file.fsPath)
           index.remove(file.fsPath)
+          void refreshGlobalComponentsForVueFile(file.fsPath)
+        } else if (isScriptFile(file.fsPath)) {
+          index.removeGlobalComponentFile(file.fsPath)
         }
       }
     }),
     vscode.workspace.onDidCreateFiles(async (event) => {
-      await Promise.all(event.files
-        .filter((file) => file.fsPath.endsWith('.vue'))
-        .map((file) => indexVueFile(file.fsPath)))
+      await Promise.all(event.files.map((file) => {
+        if (file.fsPath.endsWith('.vue')) {
+          return indexVueFile(file.fsPath).then(refreshGlobalComponentsFromVueFiles)
+        }
+        if (isScriptFile(file.fsPath)) {
+          return syncGlobalComponentFile(file.fsPath)
+        }
+        return Promise.resolve()
+      }))
     }),
     vscode.workspace.onDidRenameFiles(async (event) => {
       for (const file of event.files) {
         if (file.oldUri.fsPath.endsWith('.vue')) {
           clearPendingSync(file.oldUri.fsPath)
           index.remove(file.oldUri.fsPath)
+          await refreshGlobalComponentsForVueFile(file.oldUri.fsPath)
+        } else if (isScriptFile(file.oldUri.fsPath)) {
+          index.removeGlobalComponentFile(file.oldUri.fsPath)
         }
         if (file.newUri.fsPath.endsWith('.vue')) {
           clearPendingSync(file.newUri.fsPath)
           await indexVueFile(file.newUri.fsPath)
+          await refreshGlobalComponentsFromVueFiles()
+        } else if (isScriptFile(file.newUri.fsPath)) {
+          await syncGlobalComponentFile(file.newUri.fsPath)
         }
       }
     }),
@@ -204,3 +249,7 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {}
+
+function isScriptFile(filePath: string): boolean {
+  return filePath.endsWith('.js') || filePath.endsWith('.ts')
+}
