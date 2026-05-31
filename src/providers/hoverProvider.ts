@@ -1,13 +1,20 @@
 import * as path from 'node:path'
 import * as vscode from 'vscode'
-import type { MethodInfo, PropInfo, TextSpan, VueFileIndex } from '../indexer/types'
+import type { MethodInfo, PropInfo, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedTemplateEventUsages, findMethod, findProp, findResolvedComponent, findResolvedRefComponent } from '../indexer/relationResolver'
+import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedTemplateEventUsages, findInject, findMethod, findProp, findProvideAtOffset, findResolvedComponent, findResolvedRefComponent } from '../indexer/relationResolver'
 import { containsOffsetStrict, offsetToPosition } from '../utils/position'
 import { escapeMarkdownText, formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
-import { commonDirectory, shortestUniquePathLabels, usagePathLabels } from '../utils/pathDisplay'
+import { commonDirectory, relativePath, shortestUniquePathLabels } from '../utils/pathDisplay'
 
-export const SHOW_EMIT_USAGES_COMMAND = 'vueComponentNavigator.showEmitUsages'
+export const SHOW_USAGES_COMMAND = 'vueComponentNavigator.showUsages'
+const MAX_VISIBLE_USAGES = 5
+
+type UsageCommandArgs =
+  | { kind: 'event-listeners', childUri: string, eventName: string }
+  | { kind: 'prop-usages', childUri: string, propName: string }
+  | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
+  | { kind: 'inject-usages', providerUri: string, provideKey: string }
 
 function definitionLink(file: VueFileIndex, span: TextSpan, label: string): string {
   const position = offsetToPosition(file.lineStarts, span.start)
@@ -17,7 +24,7 @@ function definitionLink(file: VueFileIndex, span: TextSpan, label: string): stri
 
 function markdownHover(value: string, trusted = false): vscode.Hover {
   const markdown = new vscode.MarkdownString(value)
-  markdown.isTrusted = trusted ? { enabledCommands: [SHOW_EMIT_USAGES_COMMAND] } : false
+  markdown.isTrusted = trusted ? { enabledCommands: [SHOW_USAGES_COMMAND] } : false
   return new vscode.Hover(markdown)
 }
 
@@ -47,15 +54,47 @@ function propHover(child: VueFileIndex, prop: PropInfo, label: string): vscode.H
   return markdownHover(`${docText}${markdownCodeBlock(formatCodeBlock(prop.detail))}\n\nDefinition: ${definitionLink(child, prop.span, label)}`)
 }
 
-function formatUsage(file: VueFileIndex, offset: number, label: string): string {
+function formatUsage(file: VueFileIndex, offset: number, baseDirectory: string): string {
   const position = offsetToPosition(file.lineStarts, offset)
   const target = vscode.Uri.file(file.uri).with({ fragment: `L${position.line + 1},${position.character + 1}` })
-  return `- [${escapeMarkdownText(label)}:${position.line + 1}](${target.toString()})`
+  const relativeFile = relativePath(file.uri, baseDirectory)
+  const directory = path.dirname(relativeFile)
+  const directoryText = directory && directory !== '.'
+    ? ` - ${escapeMarkdownText(directory)}`
+    : ''
+  return `- [${escapeMarkdownText(path.basename(file.uri))}](${target.toString()})${directoryText}`
 }
 
-function commandLink(childUri: string, eventName: string, usageCount: number): string {
-  const args = encodeURIComponent(JSON.stringify([{ childUri, eventName }]))
-  return `[▶ Show all ${usageCount} listeners](command:${SHOW_EMIT_USAGES_COMMAND}?${args})`
+function commandLink(args: UsageCommandArgs, label: string): string {
+  const encoded = encodeURIComponent(JSON.stringify([args]))
+  return `[▶ ${label}](command:${SHOW_USAGES_COMMAND}?${encoded})`
+}
+
+function usageSummary(
+  usages: UsageInfo[],
+  baseDirectory: string,
+  options: {
+    noneText: string
+    title: string
+    singular: string
+    plural: string
+    commandArgs: UsageCommandArgs
+  },
+): { text: string, trusted: boolean } {
+  if (usages.length === 0) {
+    return { text: options.noneText, trusted: false }
+  }
+
+  const visibleUsages = usages.slice(0, MAX_VISIBLE_USAGES)
+  const lines = visibleUsages.map((usage) => formatUsage(usage.file, usage.span.start, baseDirectory))
+  const noun = usages.length === 1 ? options.singular : options.plural
+  const more = usages.length > visibleUsages.length
+    ? `\n\n${commandLink(options.commandArgs, `Show all ${usages.length} ${noun}`)}`
+    : ''
+  return {
+    text: `${options.title} ${usages.length} ${noun}:\n\n${lines.join('\n')}${more}`,
+    trusted: usages.length > visibleUsages.length,
+  }
 }
 
 function eventHover(child: VueFileIndex, eventName: string, labels: Map<string, string>): vscode.Hover | undefined {
@@ -73,6 +112,18 @@ function eventHover(child: VueFileIndex, eventName: string, labels: Map<string, 
   return markdownHover(`Definitions:\n\n${definitions}`)
 }
 
+function propDefinitionHover(index: WorkspaceIndex, child: VueFileIndex, prop: PropInfo, baseDirectory: string): vscode.Hover {
+  const usages = index.findTemplatePropUsages(child.uri, prop.name)
+  const summary = usageSummary(usages, baseDirectory, {
+    noneText: 'No template prop usages found.',
+    title: 'Used by',
+    singular: 'template prop',
+    plural: 'template props',
+    commandArgs: { kind: 'prop-usages', childUri: child.uri, propName: prop.name },
+  })
+  return markdownHover(summary.text, summary.trusted)
+}
+
 export class VueHoverProvider implements vscode.HoverProvider {
   constructor(private readonly index: WorkspaceIndex) {}
 
@@ -82,14 +133,18 @@ export class VueHoverProvider implements vscode.HoverProvider {
     if (offset === undefined) {
       return undefined
     }
-    const labels = this.definitionLabels()
+    let labels: Map<string, string> | undefined
+    const definitionLabels = () => {
+      labels ??= this.definitionLabels()
+      return labels
+    }
 
     const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
       const childUri = findResolvedRefComponent(this.index, file, refAccess.refName)
       const child = childUri ? this.index.getFile(childUri) : undefined
       const method = child ? findMethod(child, refAccess.methodName) : undefined
-      return child && method ? methodHover(child, method, labels.get(child.uri) ?? path.basename(child.uri)) : undefined
+      return child && method ? methodHover(child, method, definitionLabels().get(child.uri) ?? path.basename(child.uri)) : undefined
     }
 
     for (const component of file.templateIndex.components) {
@@ -105,10 +160,10 @@ export class VueHoverProvider implements vscode.HoverProvider {
         }
         if (attr.kind === 'prop') {
           const prop = findProp(child, attr.normalizedName)
-          return prop ? propHover(child, prop, labels.get(child.uri) ?? path.basename(child.uri)) : undefined
+          return prop ? propHover(child, prop, definitionLabels().get(child.uri) ?? path.basename(child.uri)) : undefined
         }
         if (attr.kind === 'event') {
-          return eventHover(child, attr.normalizedName, labels)
+          return eventHover(child, attr.normalizedName, definitionLabels())
         }
       }
     }
@@ -117,6 +172,22 @@ export class VueHoverProvider implements vscode.HoverProvider {
       if (containsOffsetStrict(emit.eventSpan, offset)) {
         return this.emitHover(file, emit.eventName)
       }
+    }
+
+    for (const prop of file.scriptIndex.props) {
+      if (containsOffsetStrict(prop.span, offset)) {
+        return propDefinitionHover(this.index, file, prop, this.workspaceBaseDirectory())
+      }
+    }
+
+    const inject = findInject(file, offset)
+    if (inject) {
+      return this.injectHover(file, inject.key)
+    }
+
+    const provide = findProvideAtOffset(file, offset)
+    if (provide) {
+      return this.provideKeyHover(file, provide.key)
     }
 
     return undefined
@@ -129,15 +200,49 @@ export class VueHoverProvider implements vscode.HoverProvider {
 
   private emitHover(child: VueFileIndex, eventName: string): vscode.Hover {
     const usages = findIndexedTemplateEventUsages(this.index, child.uri, eventName)
-    const visibleUsages = usages.slice(0, 5)
-    const labels = usagePathLabels(visibleUsages.map((usage) => usage.file.uri), commonDirectory(this.index.getAllFiles().map((file) => file.uri)))
-    const usageLines = visibleUsages.map((usage) => formatUsage(usage.file, usage.span.start, labels.get(usage.file.uri) ?? path.basename(usage.file.uri)))
-    const usageText = usages.length > 0
-      ? `Used by ${usages.length} listener${usages.length === 1 ? '' : 's'}:\n\n${usageLines.join('\n')}`
-      : 'No template listeners found.'
-    const more = usages.length > visibleUsages.length
-      ? `\n\n${commandLink(child.uri, eventName, usages.length)}`
-      : ''
-    return markdownHover(`${usageText}${more}`, usages.length > visibleUsages.length)
+    const summary = usageSummary(usages, this.workspaceBaseDirectory(), {
+      noneText: 'No template listeners found.',
+      title: 'Used by',
+      singular: 'listener',
+      plural: 'listeners',
+      commandArgs: { kind: 'event-listeners', childUri: child.uri, eventName },
+    })
+    return markdownHover(summary.text, summary.trusted)
+  }
+
+  private injectHover(consumer: VueFileIndex, injectKey: string): vscode.Hover {
+    const providers = findIndexedProvideDefinitions(this.index, consumer, injectKey)
+    if (providers.length === 0) {
+      return markdownHover('No static provide definition found.')
+    }
+
+    const summary = usageSummary(providers, this.workspaceBaseDirectory(), {
+      noneText: 'No static provide definition found.',
+      title: 'Provided by',
+      singular: 'definition',
+      plural: 'definitions',
+      commandArgs: { kind: 'provide-definitions', consumerUri: consumer.uri, injectKey },
+    })
+    return markdownHover(summary.text, summary.trusted)
+  }
+
+  private provideKeyHover(provider: VueFileIndex, provideKey: string): vscode.Hover {
+    const usages = findIndexedInjectUsages(this.index, provider.uri, provideKey)
+    if (usages.length === 0) {
+      return markdownHover('No static inject usages found.')
+    }
+
+    const summary = usageSummary(usages, this.workspaceBaseDirectory(), {
+      noneText: 'No static inject usages found.',
+      title: 'Injected by',
+      singular: 'consumer',
+      plural: 'consumers',
+      commandArgs: { kind: 'inject-usages', providerUri: provider.uri, provideKey },
+    })
+    return markdownHover(summary.text, summary.trusted)
+  }
+
+  private workspaceBaseDirectory(): string {
+    return commonDirectory(this.index.getAllFiles().map((file) => file.uri))
   }
 }

@@ -75,6 +75,8 @@ export const renameListeners: Array<(event: any) => any> = []
 export const workspaceFolderListeners: Array<(event: any) => any> = []
 export const informationMessages: string[] = []
 export const warningMessages: string[] = []
+export const quickPickCalls: Array<{ items: any[], options?: any }> = []
+export const shownDocuments: Array<{ uri: Uri, options?: any }> = []
 
 function disposable(): Disposable {
   return { dispose() {} }
@@ -90,6 +92,8 @@ export function resetMockState(): void {
   workspaceFolderListeners.length = 0
   informationMessages.length = 0
   warningMessages.length = 0
+  quickPickCalls.length = 0
+  shownDocuments.length = 0
   workspace.workspaceFolders = []
   window.activeTextEditor = undefined
 }
@@ -118,8 +122,14 @@ export const window = {
     warningMessages.push(message)
     return Promise.resolve(message)
   },
-  showQuickPick: async (items: any[]) => items[0],
-  showTextDocument: async () => undefined,
+  showQuickPick: async (items: any[], options?: any) => {
+    quickPickCalls.push({ items, options })
+    return items[0]
+  },
+  showTextDocument: async (uri: Uri, options?: any) => {
+    shownDocuments.push({ uri, options })
+    return undefined
+  },
   withProgress: async (_options: any, task: (progress: any, token: { isCancellationRequested: boolean }) => any) => task({}, { isCancellationRequested: false }),
 }
 

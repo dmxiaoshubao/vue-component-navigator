@@ -27,6 +27,11 @@ function writeVue(filePath: string, name: string): void {
   fs.writeFileSync(filePath, `<template><div /></template>\n<script>export default { name: '${name}' }</script>\n`)
 }
 
+function writeText(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  fs.writeFileSync(filePath, content)
+}
+
 describe('Extension lifecycle indexing', () => {
   beforeEach(() => {
     vi.resetModules()
@@ -87,5 +92,47 @@ describe('Extension lifecycle indexing', () => {
     vscode.window.activeTextEditor = { document: new TestDocument(newFile, changed) }
     await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
     expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: yes')
+  })
+
+  it('Show usages 命令可以打开 prop 使用位置', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-usages-'))
+    const childFile = path.join(root, 'Child.vue')
+    const parentFile = path.join(root, 'Parent.vue')
+    writeText(childFile, `
+<template><div /></template>
+<script>
+export default {
+  props: {
+    title: String,
+  },
+}
+</script>
+`)
+    writeText(parentFile, `
+<template>
+  <Child :title="title" />
+</template>
+<script>
+import Child from './Child.vue'
+export default { components: { Child } }
+</script>
+`)
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+    await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'prop-usages',
+      childUri: childFile,
+      propName: 'title',
+    })
+
+    expect(vscode.quickPickCalls.at(-1)?.items[0].label).toContain('Parent.vue')
+    expect(vscode.shownDocuments.at(-1)?.uri.fsPath).toBe(parentFile)
   })
 })

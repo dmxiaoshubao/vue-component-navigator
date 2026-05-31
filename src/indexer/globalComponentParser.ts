@@ -212,12 +212,13 @@ export function parseGlobalComponents(uri: string, content: string, workspaceRoo
       const tag = readStaticComponentName(content, args[0])
       const localName = readLocalComponentName(content, args[1])
       const source = localName ? imports.find((item) => item.localName === localName.value)?.source : undefined
-      if (tag && localName && source) {
+      const targetUri = source ? resolveImportPath(uri, source, workspaceRoots) : undefined
+      if (tag && localName && source && targetUri && !isInsideNodeModules(targetUri)) {
         results.push({
           tag: tag.value,
           localName: localName.value,
           source,
-          targetUri: resolveImportPath(uri, source, workspaceRoots),
+          targetUri,
           usesImportedName: tag.usesImportedName,
           nameSpan: tag.span,
           registerSpan: { start: componentIndex, end: close + 1 },
@@ -263,6 +264,10 @@ export function guessGlobalComponentsFromRequireContext(uri: string, content: st
   }
 
   const root = path.resolve(path.dirname(uri), contextMatch[2])
+  if (isInsideNodeModules(root)) {
+    return []
+  }
+
   return [{
     source: contextMatch[2],
     targetUri: root,
@@ -270,4 +275,8 @@ export function guessGlobalComponentsFromRequireContext(uri: string, content: st
     registerSpan: { start: contextMatch.index, end: contextMatch.index + contextMatch[0].length },
     fileUri: uri,
   }]
+}
+
+function isInsideNodeModules(file: string): boolean {
+  return path.normalize(file).split(path.sep).includes('node_modules')
 }

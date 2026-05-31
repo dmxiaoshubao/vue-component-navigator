@@ -22,6 +22,9 @@ export class WorkspaceIndex {
   private readonly propUsages = new Map<string, UsageInfo[]>()
   private readonly eventUsages = new Map<string, UsageInfo[]>()
   private readonly refMethodUsages = new Map<string, UsageInfo[]>()
+  private readonly provideDefinitions = new Map<string, UsageInfo[]>()
+  private readonly injectUsages = new Map<string, UsageInfo[]>()
+  private isBulkIndexing = false
 
   clear(): void {
     this.files.clear()
@@ -51,10 +54,7 @@ export class WorkspaceIndex {
     for (const [fileUri, contexts] of other.globalComponentContexts) {
       this.globalComponentContexts.set(fileUri, [...contexts])
     }
-    this.clearReverseIndexes()
-    for (const file of this.files.values()) {
-      this.addReverseIndex(file)
-    }
+    this.rebuildReverseIndexes()
   }
 
   getWorkspaceRoots(): string[] {
@@ -127,7 +127,7 @@ export class WorkspaceIndex {
     const sfc = parseSfc(uri, content)
     const scriptIndex = sfc.script
       ? parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots)
-      : { imports: [], components: [], props: [], methods: [], emits: [] }
+      : { imports: [], components: [], props: [], methods: [], emits: [], provides: [], injects: [] }
     const registeredTags = [
       ...scriptIndex.components.flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
       ...this.getGlobalComponents().flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
@@ -150,7 +150,15 @@ export class WorkspaceIndex {
       refMethodCalls: findRefMethodCalls(searchableContent),
     }
     this.files.set(uri, file)
-    this.addReverseIndex(file)
+    if (this.isBulkIndexing) {
+      return file
+    }
+
+    this.addProvideDefinitions(file)
+    this.addRelationshipUsages(file)
+    if (file.scriptIndex.provides.length > 0 || (previous?.scriptIndex.provides.length ?? 0) > 0) {
+      this.rebuildReverseIndexes()
+    }
     return file
   }
 
@@ -203,11 +211,17 @@ export class WorkspaceIndex {
       return
     }
 
-    for (const file of vueFiles) {
-      await this.indexFile(file)
-      if (token?.isCancellationRequested) {
-        return
+    this.isBulkIndexing = true
+    try {
+      for (const file of vueFiles) {
+        await this.indexFile(file)
+        if (token?.isCancellationRequested) {
+          return
+        }
       }
+    } finally {
+      this.isBulkIndexing = false
+      this.rebuildReverseIndexes()
     }
   }
 
@@ -282,13 +296,30 @@ export class WorkspaceIndex {
     return [...(this.refMethodUsages.get(usageKey(childUri, methodName)) ?? [])]
   }
 
+  findInjectUsages(providerUri: string, provideKey: string): UsageInfo[] {
+    return [...(this.injectUsages.get(usageKey(providerUri, provideKey)) ?? [])]
+  }
+
+  findProvideDefinitions(consumer: VueFileIndex, injectKey: string): UsageInfo[] {
+    return (this.provideDefinitions.get(injectKey) ?? [])
+      .filter((usage) => isSameProjectFileOrUnknown(consumer.uri, usage.file.uri))
+  }
+
   private clearReverseIndexes(): void {
     this.propUsages.clear()
     this.eventUsages.clear()
     this.refMethodUsages.clear()
+    this.provideDefinitions.clear()
+    this.injectUsages.clear()
   }
 
-  private addReverseIndex(file: VueFileIndex): void {
+  private addProvideDefinitions(file: VueFileIndex): void {
+    for (const provide of file.scriptIndex.provides) {
+      addUsage(this.provideDefinitions, provide.key, { file, span: provide.keySpan })
+    }
+  }
+
+  private addRelationshipUsages(file: VueFileIndex): void {
     for (const component of file.templateIndex.components) {
       const childUri = this.resolveComponent(file, component.tag)
       if (!childUri) {
@@ -310,11 +341,20 @@ export class WorkspaceIndex {
         addUsage(this.refMethodUsages, usageKey(childUri, call.methodName), { file, span: call.methodSpan })
       }
     }
+
+    for (const inject of file.scriptIndex.injects) {
+      for (const provider of this.findProvideDefinitions(file, inject.key)) {
+        addUsage(this.injectUsages, usageKey(provider.file.uri, inject.key), { file, span: inject.keySpan })
+      }
+    }
   }
 
   private addGlobalComponents(components: GlobalComponentRegistration[]): void {
     for (const component of components) {
       if (!component.targetUri) {
+        continue
+      }
+      if (isInsideNodeModules(component.targetUri)) {
         continue
       }
       if (!this.isInsideWorkspace(component.targetUri)) {
@@ -395,8 +435,24 @@ export class WorkspaceIndex {
     const indexedFiles = this.getAllFiles().map((file) => ({ uri: file.uri, content: file.content }))
     this.files.clear()
     this.clearReverseIndexes()
-    for (const file of indexedFiles) {
-      this.indexContent(file.uri, file.content)
+    this.isBulkIndexing = true
+    try {
+      for (const file of indexedFiles) {
+        this.indexContent(file.uri, file.content)
+      }
+    } finally {
+      this.isBulkIndexing = false
+      this.rebuildReverseIndexes()
+    }
+  }
+
+  private rebuildReverseIndexes(): void {
+    this.clearReverseIndexes()
+    for (const file of this.files.values()) {
+      this.addProvideDefinitions(file)
+    }
+    for (const file of this.files.values()) {
+      this.addRelationshipUsages(file)
     }
   }
 
@@ -493,6 +549,9 @@ export class WorkspaceIndex {
     removeFileUsages(this.propUsages, file)
     removeFileUsages(this.eventUsages, file)
     removeFileUsages(this.refMethodUsages, file)
+    removeFileUsages(this.provideDefinitions, file)
+    removeFileUsages(this.injectUsages, file)
+    removeProviderUsages(this.injectUsages, file)
   }
 
   private propKeys(childUri: string, propName: string): string[] {
@@ -653,6 +712,14 @@ function removeFileUsages(map: Map<string, UsageInfo[]>, file: VueFileIndex): vo
   }
 }
 
+function removeProviderUsages(map: Map<string, UsageInfo[]>, file: VueFileIndex): void {
+  for (const key of [...map.keys()]) {
+    if (key.startsWith(`${file.uri}\0`)) {
+      map.delete(key)
+    }
+  }
+}
+
 function isScriptFile(file: string): boolean {
   return file.endsWith('.js') || file.endsWith('.ts')
 }
@@ -662,9 +729,22 @@ function isInsideDirectory(file: string, directory: string): boolean {
   return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative)
 }
 
+function isInsideNodeModules(file: string): boolean {
+  return path.normalize(file).split(path.sep).includes('node_modules')
+}
+
 function isSameProjectFile(left: string, right: string): boolean {
   const leftSrc = findSrcSegment(left)
   const rightSrc = findSrcSegment(right)
+  return leftSrc !== undefined && leftSrc === rightSrc
+}
+
+function isSameProjectFileOrUnknown(left: string, right: string): boolean {
+  const leftSrc = findSrcSegment(left)
+  const rightSrc = findSrcSegment(right)
+  if (leftSrc === undefined && rightSrc === undefined) {
+    return true
+  }
   return leftSrc !== undefined && leftSrc === rightSrc
 }
 

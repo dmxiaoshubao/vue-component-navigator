@@ -1,13 +1,19 @@
 import * as path from 'node:path'
 import * as vscode from 'vscode'
-import type { TextSpan, VueFileIndex } from './indexer/types'
+import type { TextSpan, UsageInfo, VueFileIndex } from './indexer/types'
 import { WorkspaceIndex } from './indexer/workspaceIndex'
 import { VueCompletionProvider } from './providers/completionProvider'
 import { VueDefinitionProvider } from './providers/definitionProvider'
-import { SHOW_EMIT_USAGES_COMMAND, VueHoverProvider } from './providers/hoverProvider'
+import { SHOW_USAGES_COMMAND, VueHoverProvider } from './providers/hoverProvider'
 import { VueReferenceProvider } from './providers/referenceProvider'
 import { offsetToPosition, spanToRange } from './utils/position'
 import { commonDirectory, relativePath, usagePathLabels } from './utils/pathDisplay'
+
+type UsageCommandArgs =
+  | { kind?: 'event-listeners', childUri: string, eventName: string }
+  | { kind: 'prop-usages', childUri: string, propName: string }
+  | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
+  | { kind: 'inject-usages', providerUri: string, provideKey: string }
 
 function usageLabel(file: VueFileIndex, span: TextSpan, label: string): string {
   const position = offsetToPosition(file.lineStarts, span.start)
@@ -118,6 +124,36 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  function resolveUsages(args: UsageCommandArgs): { usages: UsageInfo[], placeHolder: string } {
+    if (args.kind === 'prop-usages') {
+      return {
+        usages: index.findTemplatePropUsages(args.childUri, args.propName),
+        placeHolder: `Select ${args.propName} prop usage`,
+      }
+    }
+
+    if (args.kind === 'provide-definitions') {
+      const consumer = index.getFile(args.consumerUri)
+      return {
+        usages: consumer ? index.findProvideDefinitions(consumer, args.injectKey) : [],
+        placeHolder: `Select ${args.injectKey} provider`,
+      }
+    }
+
+    if (args.kind === 'inject-usages') {
+      return {
+        usages: index.findInjectUsages(args.providerUri, args.provideKey),
+        placeHolder: `Select ${args.provideKey} inject consumer`,
+      }
+    }
+
+    const child = index.getFile(args.childUri)
+    return {
+      usages: child ? index.findTemplateEventUsages(child.uri, args.eventName) : [],
+      placeHolder: `Select ${args.eventName} listener`,
+    }
+  }
+
   context.subscriptions.push(
     vscode.commands.registerCommand('vueComponentNavigator.showStatus', () => {
       const activeDocument = vscode.window.activeTextEditor?.document
@@ -134,14 +170,13 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('vueComponentNavigator.reindexWorkspace', async () => {
       await indexWorkspaceFolders('Reindexing Vue files...', true)
     }),
-    vscode.commands.registerCommand(SHOW_EMIT_USAGES_COMMAND, async ({ childUri, eventName }: { childUri: string, eventName: string }) => {
-      const child = index.getFile(childUri)
-      if (!child) {
+    vscode.commands.registerCommand(SHOW_USAGES_COMMAND, async (args: UsageCommandArgs) => {
+      const { usages, placeHolder } = resolveUsages(args)
+      if (usages.length === 0) {
         return
       }
 
       const files = index.getAllFiles()
-      const usages = index.findTemplateEventUsages(child.uri, eventName)
       const baseDirectory = commonDirectory(files.map((file) => file.uri))
       const labels = usagePathLabels(usages.map((usage) => usage.file.uri), baseDirectory)
       const selected = await vscode.window.showQuickPick(usages.map((usage) => ({
@@ -151,7 +186,7 @@ export function activate(context: vscode.ExtensionContext): void {
         span: usage.span,
       })), {
         matchOnDescription: true,
-        placeHolder: `Select ${eventName} listener`,
+        placeHolder,
       })
       if (!selected) {
         return

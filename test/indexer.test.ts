@@ -147,6 +147,102 @@ export default {
     expect(file.scriptIndex.components.find((component) => component.localName === 'FakeChild')?.targetUri).toBeUndefined()
     expect(file.templateIndex.components.map((component) => component.tag)).toEqual(['RealChild'])
   })
+
+  it('解析静态 provide 和 inject 关系', () => {
+    const index = new WorkspaceIndex()
+    const provider = index.indexContent(path.join(fixtureRoot, 'Provider.vue'), `
+<template><div /></template>
+<script>
+export default {
+  provide() {
+    return {
+      theme: this.theme,
+      'user-service': this.userService,
+    }
+  },
+}
+</script>
+`)
+    const consumer = index.indexContent(path.join(fixtureRoot, 'Consumer.vue'), `
+<template><div /></template>
+<script>
+export default {
+  inject: {
+    localTheme: 'theme',
+    userService: {
+      from: 'user-service',
+    },
+  },
+}
+</script>
+`)
+
+    expect(provider.scriptIndex.provides.map((item) => item.key)).toEqual(['theme', 'user-service'])
+    expect(consumer.scriptIndex.injects.map((item) => [item.localName, item.key])).toEqual([
+      ['localTheme', 'theme'],
+      ['userService', 'user-service'],
+    ])
+    expect(index.findProvideDefinitions(consumer, 'theme').map((usage) => usage.file.uri)).toEqual([provider.uri])
+    expect(index.findInjectUsages(provider.uri, 'user-service').map((usage) => usage.file.uri)).toEqual([consumer.uri])
+  })
+
+  it('provide 更新后同步刷新 inject 反向索引', () => {
+    const index = new WorkspaceIndex()
+    const providerUri = path.join(fixtureRoot, 'ChangingProvider.vue')
+    const consumerUri = path.join(fixtureRoot, 'ChangingConsumer.vue')
+    const consumer = index.indexContent(consumerUri, `
+<template><div /></template>
+<script>
+export default {
+  inject: ['service'],
+}
+</script>
+`)
+    const provider = index.indexContent(providerUri, `
+<template><div /></template>
+<script>
+export default {
+  provide: {
+    service: this.service,
+  },
+}
+</script>
+`)
+
+    expect(index.findProvideDefinitions(consumer, 'service').map((usage) => usage.file.uri)).toEqual([provider.uri])
+    expect(index.findInjectUsages(provider.uri, 'service')).toHaveLength(1)
+
+    index.syncContent(providerUri, `
+<template><div /></template>
+<script>
+export default {
+  provide: {
+    renamedService: this.service,
+  },
+}
+</script>
+`)
+
+    expect(index.findProvideDefinitions(consumer, 'service')).toHaveLength(0)
+    expect(index.findInjectUsages(provider.uri, 'service')).toHaveLength(0)
+  })
+
+  it('没有 tsconfig 或 jsconfig 时不猜测 @/ 别名', () => {
+    const index = new WorkspaceIndex()
+    const file = index.indexContent(path.join(__dirname, 'no-config/Parent.vue'), `
+<template>
+  <AliasChild />
+</template>
+<script>
+import AliasChild from '@/components/AliasChild.vue'
+export default {
+  components: { AliasChild },
+}
+</script>
+`)
+
+    expect(file.scriptIndex.components.find((component) => component.localName === 'AliasChild')?.targetUri).toBeUndefined()
+  })
 })
 
 describe('Vue2 relation resolver', () => {
@@ -203,6 +299,32 @@ describe('Vue2 relation resolver', () => {
     expect(index.findTemplatePropUsages(namedOnlyDialog.uri, 'title')).toHaveLength(1)
     expect(index.findRefMethodUsages(namedOnlyDialog.uri, 'show')).toHaveLength(1)
     expect(index.findRefMethodUsages(autoWidget.uri, 'refresh')).toHaveLength(1)
+  })
+
+  it('全局注册会过滤第三方 package 组件', async () => {
+    const index = new WorkspaceIndex()
+    const root = path.join(fixtureRoot, 'third-party-filter')
+    const registerUri = path.join(root, 'src/bootstrap.js')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const thirdPartyUri = path.join(root, 'node_modules/vendor-ui/ElForm.vue')
+
+    await index.indexGlobalComponentContent(registerUri, `
+import ElForm from '../node_modules/vendor-ui/ElForm.vue'
+Vue.component('ElForm', ElForm)
+`)
+    index.indexContent(parentUri, `
+<template>
+  <ElForm :model="form" @validate="onValidate" />
+</template>
+<script>
+export default {}
+</script>
+`)
+
+    expect(index.getGlobalComponents().some((component) => component.targetUri === thirdPartyUri)).toBe(false)
+    expect(index.resolveComponent(index.getFile(parentUri)!, 'ElForm')).toBeUndefined()
+    expect(index.findTemplatePropUsages(thirdPartyUri, 'model')).toHaveLength(0)
+    expect(index.findTemplateEventUsages(thirdPartyUri, 'validate')).toHaveLength(0)
   })
 
   it('全局注册文件与组件 name 变化后会刷新索引', async () => {

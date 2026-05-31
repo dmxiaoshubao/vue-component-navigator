@@ -344,7 +344,7 @@ Vue.component('LateGlobalChild', LateGlobalChild)
     expect(hoverText(hover)).toContain('file://')
   })
 
-  it('emit 引用列表使用当前引用集合的最短差异路径', () => {
+  it('emit 引用列表使用文件名和目录上下文', () => {
     const childUri = path.join(fixtureRoot, 'NestedEmitChild.vue')
     const childContent = `
 <template><div /></template>
@@ -380,10 +380,112 @@ export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
     const hoverProvider = new VueHoverProvider(index)
     const hover = hoverProvider.provideHover(document, positionAt(childContent, childContent.indexOf("'submit'") + 2)) as any
 
-    expect(hoverText(hover)).toContain('[red-packet/index.vue:')
-    expect(hoverText(hover)).toContain('[activity/index.vue:')
-    expect(hoverText(hover)).toContain('[coupon/index.vue:')
-    expect(hoverText(hover)).not.toContain('- [pages/admin/marketing/red-packet/index.vue:')
+    expect(hoverText(hover)).toContain('- [index.vue]')
+    expect(hoverText(hover)).toContain('#L')
+    expect(hoverText(hover)).toContain('- pages/admin/marketing/red-packet')
+    expect(hoverText(hover)).toContain('- pages/admin/marketing/activity')
+    expect(hoverText(hover)).toContain('- pages/admin/marketing/coupon')
+    expect(hoverText(hover)).not.toContain('[index.vue:')
+    expect(hoverText(hover)).not.toContain('- [pages/admin/marketing/red-packet/index.vue')
+  })
+
+  it('prop 定义悬浮展示模板使用位置', () => {
+    const content = readFixture('Child.vue')
+    const document = new TestDocument(path.join(fixtureRoot, 'Child.vue'), content) as any
+    const hoverProvider = new VueHoverProvider(index)
+    const propOffset = content.indexOf('title: String') + 1
+
+    const hover = hoverProvider.provideHover(document, positionAt(content, propOffset)) as any
+
+    expect(hoverText(hover)).toContain('Used by 1 template prop')
+    expect(hoverText(hover)).toContain('- [Parent.vue]')
+    expect(hoverText(hover)).not.toContain('title: String')
+    expect(hoverText(hover)).not.toContain('[Parent.vue:')
+    expect(hover.contents.isTrusted).toBe(false)
+  })
+
+  it('provide 和 inject 支持双向定义、悬浮和引用', () => {
+    const providerUri = path.join(fixtureRoot, 'ProvideSource.vue')
+    const consumerUri = path.join(fixtureRoot, 'InjectConsumer.vue')
+    const providerContent = `
+<template><div /></template>
+<script>
+export default {
+  provide: {
+    service: this.service,
+  },
+}
+</script>
+`
+    const consumerContent = `
+<template><div /></template>
+<script>
+export default {
+  inject: {
+    localService: {
+      from: 'service',
+    },
+  },
+}
+</script>
+`
+    index.indexContent(providerUri, providerContent)
+    index.indexContent(consumerUri, consumerContent)
+    const definitionProvider = new VueDefinitionProvider(index)
+    const referenceProvider = new VueReferenceProvider(index)
+    const hoverProvider = new VueHoverProvider(index)
+    const providerDocument = new TestDocument(providerUri, providerContent) as any
+    const consumerDocument = new TestDocument(consumerUri, consumerContent) as any
+
+    const injectDefinition = definitionProvider.provideDefinition(consumerDocument, positionAt(consumerContent, consumerContent.indexOf("'service'") + 2)) as any[]
+    const provideDefinitions = definitionProvider.provideDefinition(providerDocument, positionAt(providerContent, providerContent.indexOf('service:') + 1)) as any[]
+    const provideReferences = referenceProvider.provideReferences(providerDocument, positionAt(providerContent, providerContent.indexOf('service:') + 1)) as any[]
+    const injectHover = hoverProvider.provideHover(consumerDocument, positionAt(consumerContent, consumerContent.indexOf("'service'") + 2)) as any
+    const provideHover = hoverProvider.provideHover(providerDocument, positionAt(providerContent, providerContent.indexOf('service:') + 1)) as any
+
+    expect(injectDefinition[0].uri.fsPath).toBe(providerUri)
+    expect(provideDefinitions[0].uri.fsPath).toBe(consumerUri)
+    expect(provideReferences[0].uri.fsPath).toBe(consumerUri)
+    expect(hoverText(injectHover)).toContain('Provided by 1 definition')
+    expect(hoverText(provideHover)).toContain('Injected by 1 consumer')
+    expect(hoverText(provideHover)).toContain('- [InjectConsumer.vue]')
+    expect(hoverText(provideHover)).not.toContain('[InjectConsumer.vue:')
+  })
+
+  it('inject provider 超过 5 个时只展示前 5 个并提供完整列表入口', () => {
+    const consumerUri = path.join(fixtureRoot, 'ManyProviderConsumer.vue')
+    const consumerContent = `
+<template><div /></template>
+<script>
+export default {
+  inject: ['service'],
+}
+</script>
+`
+    index.indexContent(consumerUri, consumerContent)
+    for (let count = 0; count < 6; count += 1) {
+      index.indexContent(path.join(fixtureRoot, `ManyProvider${count}.vue`), `
+<template><div /></template>
+<script>
+export default {
+  provide: {
+    service: this.service,
+  },
+}
+</script>
+`)
+    }
+
+    const document = new TestDocument(consumerUri, consumerContent) as any
+    const hoverProvider = new VueHoverProvider(index)
+    const hover = hoverProvider.provideHover(document, positionAt(consumerContent, consumerContent.indexOf("'service'") + 2)) as any
+
+    expect(hoverText(hover)).toContain('Provided by 6 definitions')
+    expect(hoverText(hover)).toContain('Show all 6 definitions')
+    expect(hoverText(hover)).toContain('- [ManyProvider0.vue]')
+    expect(hoverText(hover)).toContain('- [ManyProvider4.vue]')
+    expect(hoverText(hover)).not.toContain('- [ManyProvider5.vue]')
+    expect(hover.contents.isTrusted).toEqual({ enabledCommands: ['vueComponentNavigator.showUsages'] })
   })
 
   it('$emit 使用位置超过 5 个时才启用 command trusted hover', () => {
@@ -408,7 +510,7 @@ export default { components: { Child }, methods: { onSave${count}() {} } }
 
     expect(hoverText(hover)).toContain('Used by 6 listeners')
     expect(hoverText(hover)).toContain('Show all 6 listeners')
-    expect(hover.contents.isTrusted).toEqual({ enabledCommands: ['vueComponentNavigator.showEmitUsages'] })
+    expect(hover.contents.isTrusted).toEqual({ enabledCommands: ['vueComponentNavigator.showUsages'] })
   })
 
   it('Markdown 文档内容不会启用命令信任', () => {

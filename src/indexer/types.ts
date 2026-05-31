@@ -81,6 +81,21 @@ export interface EmitInfo {
   callSpan: TextSpan
 }
 
+export interface ProvideInfo {
+  key: string
+  keySpan: TextSpan
+  detail: string
+  documentation?: string
+}
+
+export interface InjectInfo {
+  key: string
+  keySpan: TextSpan
+  localName: string
+  localSpan: TextSpan
+  detail: string
+}
+
 export interface ScriptIndex {
   componentName?: string
   imports: ImportInfo[]
@@ -88,6 +103,8 @@ export interface ScriptIndex {
   props: PropInfo[]
   methods: MethodInfo[]
   emits: EmitInfo[]
+  provides: ProvideInfo[]
+  injects: InjectInfo[]
 }
 
 export interface TemplateAttrUsage {

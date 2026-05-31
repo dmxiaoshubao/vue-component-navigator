@@ -1,4 +1,4 @@
-import type { ComponentRegistration, ImportInfo, PropInfo, ScriptIndex, TextSpan } from './types'
+import type { ComponentRegistration, ImportInfo, PropInfo, ProvideInfo, ScriptIndex, TextSpan } from './types'
 import { resolveImportPath } from './relationResolver'
 import { findCodeToken, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
@@ -191,20 +191,18 @@ function findTopLevelProperty(content: string, open: number, close: number, name
     }
 
     let cursor = skipTrivia(content, propertyName.end)
-    if (content[cursor] !== ':') {
+    if (content[cursor] === ':') {
+      cursor = skipTrivia(content, cursor + 1)
+    } else if (content[cursor] !== '(') {
       index = propertyName.end
       continue
     }
 
-    cursor = skipTrivia(content, cursor + 1)
+    const valueEnd = findMemberValueEnd(content, cursor, close)
     if (propertyName.value !== name) {
-      index = cursor
+      index = valueEnd
       continue
     }
-
-    const valueEnd = content[cursor] === '{' || content[cursor] === '[' || content[cursor] === '('
-      ? findMatchingBracket(content, cursor) + 1
-      : findValueEnd(content, cursor, close)
 
     return {
       name: propertyName.value,
@@ -496,17 +494,135 @@ function parseEmits(content: string, scriptStart: number): ScriptIndex['emits'] 
   return emits
 }
 
+function parseProvides(content: string, provide: PropertyValue | undefined, scriptStart: number): ProvideInfo[] {
+  const objectRange = provide ? findProvideObjectRange(content, provide) : undefined
+  if (!objectRange) {
+    return []
+  }
+
+  const results: ProvideInfo[] = []
+  eachObjectMember(content, objectRange.open, objectRange.close, (member) => {
+    results.push({
+      key: member.name,
+      keySpan: { start: scriptStart + member.nameSpan.start, end: scriptStart + member.nameSpan.end },
+      detail: content.slice(member.nameSpan.start, member.valueEnd).trim(),
+      documentation: member.documentation,
+    })
+  })
+  return results
+}
+
+function findProvideObjectRange(content: string, provide: PropertyValue): { open: number, close: number } | undefined {
+  if (content[provide.valueStart] === '{') {
+    return { open: provide.valueStart, close: provide.valueEnd - 1 }
+  }
+
+  for (let index = provide.valueStart; index < provide.valueEnd; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    if (!content.startsWith('return', index)) {
+      continue
+    }
+
+    const cursor = skipTrivia(content, index + 'return'.length)
+    if (content[cursor] === '{') {
+      return { open: cursor, close: findMatchingBracket(content, cursor) }
+    }
+  }
+
+  return undefined
+}
+
+function parseInjects(content: string, inject: PropertyValue | undefined, scriptStart: number): ScriptIndex['injects'] {
+  if (!inject) {
+    return []
+  }
+
+  if (content[inject.valueStart] === '[') {
+    return parseInjectArray(content, inject, scriptStart)
+  }
+
+  if (content[inject.valueStart] !== '{') {
+    return []
+  }
+
+  const results: ScriptIndex['injects'] = []
+  eachObjectMember(content, inject.valueStart, inject.valueEnd - 1, (member) => {
+    const from = readInjectFrom(content, member)
+    const key = from?.value ?? member.name
+    const keySpan = from
+      ? { start: scriptStart + from.span.start, end: scriptStart + from.span.end }
+      : { start: scriptStart + member.nameSpan.start, end: scriptStart + member.nameSpan.end }
+    results.push({
+      key,
+      keySpan,
+      localName: member.name,
+      localSpan: { start: scriptStart + member.nameSpan.start, end: scriptStart + member.nameSpan.end },
+      detail: content.slice(member.nameSpan.start, member.valueEnd).trim(),
+    })
+  })
+  return results
+}
+
+function parseInjectArray(content: string, inject: PropertyValue, scriptStart: number): ScriptIndex['injects'] {
+  const results: ScriptIndex['injects'] = []
+  const pattern = /['"]([^'"]+)['"]/g
+  pattern.lastIndex = inject.valueStart
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(content)) && match.index < inject.valueEnd) {
+    results.push({
+      key: match[1],
+      keySpan: { start: scriptStart + match.index + 1, end: scriptStart + match.index + 1 + match[1].length },
+      localName: match[1],
+      localSpan: { start: scriptStart + match.index + 1, end: scriptStart + match.index + 1 + match[1].length },
+      detail: match[1],
+    })
+  }
+
+  return results
+}
+
+function readInjectFrom(content: string, member: PropertyValue): { value: string, span: TextSpan } | undefined {
+  const literal = readStringLiteral(content, member.valueStart)
+  if (literal && literal.end <= member.valueEnd) {
+    return { value: literal.value, span: { start: literal.start, end: literal.end } }
+  }
+
+  if (content[member.valueStart] !== '{') {
+    return undefined
+  }
+
+  let result: { value: string, span: TextSpan } | undefined
+  eachObjectMember(content, member.valueStart, member.valueEnd - 1, (nested) => {
+    if (result || nested.name !== 'from') {
+      return
+    }
+    const fromLiteral = readStringLiteral(content, nested.valueStart)
+    if (fromLiteral && fromLiteral.end <= nested.valueEnd) {
+      result = { value: fromLiteral.value, span: { start: fromLiteral.start, end: fromLiteral.end } }
+    }
+  })
+  return result
+}
+
 export function parseScript(uri: string, content: string, scriptStart: number, workspaceRoots: string[] = []): ScriptIndex {
   const imports = parseImports(content)
   const exportObject = findExportObject(content)
   if (!exportObject) {
-    return { imports, components: [], props: [], methods: [], emits: parseEmits(content, scriptStart) }
+    return { imports, components: [], props: [], methods: [], emits: parseEmits(content, scriptStart), provides: [], injects: [] }
   }
 
   const nameProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'name')
   const componentsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'components')
   const propsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'props')
   const methodsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'methods')
+  const provideProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'provide')
+  const injectProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'inject')
 
   return {
     componentName: nameProperty ? parseStringLiteral(content, nameProperty.valueStart, nameProperty.valueEnd) : undefined,
@@ -515,5 +631,7 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
     props: parseProps(content, propsProperty, scriptStart),
     methods: parseMethods(content, methodsProperty, scriptStart),
     emits: parseEmits(content, scriptStart),
+    provides: parseProvides(content, provideProperty, scriptStart),
+    injects: parseInjects(content, injectProperty, scriptStart),
   }
 }

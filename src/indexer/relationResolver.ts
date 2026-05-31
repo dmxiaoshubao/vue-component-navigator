@@ -24,24 +24,7 @@ function getRegisteredComponentCache(parent: VueFileIndex): Map<string, string |
 
 export function resolveImportPath(fromUri: string, source: string, workspaceRoots: string[] = []): string | undefined {
   if (!source.startsWith('.')) {
-    const fromConfig = resolveFromTsConfig(fromUri, source, workspaceRoots)
-    if (fromConfig) {
-      return fromConfig
-    }
-  }
-
-  if (source.startsWith('@/')) {
-    const suffix = source.slice(2)
-    const root = workspaceRoots.find((item) => fromUri.startsWith(item))
-    if (!root) {
-      return undefined
-    }
-    const resolved = path.resolve(root, 'src', suffix)
-    return path.extname(resolved) ? resolved : `${resolved}.vue`
-  }
-
-  if (!source.startsWith('.')) {
-    return undefined
+    return resolveFromTsConfig(fromUri, source, workspaceRoots)
   }
 
   const base = path.dirname(fromUri)
@@ -261,6 +244,29 @@ export function findTemplateEventUsages(files: VueFileIndex[], childUri: string,
 
 export function findIndexedTemplateEventUsages(index: WorkspaceIndex, childUri: string, eventName: string): UsageInfo[] {
   return index.findTemplateEventUsages(childUri, eventName)
+}
+
+export function findProvide(file: VueFileIndex, provideKey: string) {
+  return file.scriptIndex.provides.filter((provide) => provide.key === provideKey)
+}
+
+export function findInject(file: VueFileIndex, offset: number) {
+  return file.scriptIndex.injects.find((inject) => {
+    return (offset >= inject.keySpan.start && offset < inject.keySpan.end)
+      || (offset >= inject.localSpan.start && offset < inject.localSpan.end)
+  })
+}
+
+export function findProvideAtOffset(file: VueFileIndex, offset: number) {
+  return file.scriptIndex.provides.find((provide) => offset >= provide.keySpan.start && offset < provide.keySpan.end)
+}
+
+export function findIndexedInjectUsages(index: WorkspaceIndex, providerUri: string, provideKey: string): UsageInfo[] {
+  return index.findInjectUsages(providerUri, provideKey)
+}
+
+export function findIndexedProvideDefinitions(index: WorkspaceIndex, consumer: VueFileIndex, injectKey: string): UsageInfo[] {
+  return index.findProvideDefinitions(consumer, injectKey)
 }
 
 export function findRefMethodUsages(files: VueFileIndex[], childUri: string, methodName: string) {
