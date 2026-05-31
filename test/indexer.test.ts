@@ -148,6 +148,146 @@ export default {
     expect(file.templateIndex.components.map((component) => component.tag)).toEqual(['RealChild'])
   })
 
+  it('解析 components 中的 import() 异步组件注册', () => {
+    const index = new WorkspaceIndex()
+    const childUri = path.join(fixtureRoot, 'Child.vue')
+    const parentUri = path.join(fixtureRoot, 'AsyncParent.vue')
+    index.indexContent(childUri, readFixture('Child.vue'))
+    const parent = index.indexContent(parentUri, `
+<template>
+  <AsyncChild :title="title" @save="onSave" />
+</template>
+<script>
+export default {
+  components: {
+    AsyncChild: () => import('./Child.vue'),
+  },
+}
+</script>
+`)
+
+    expect(parent.scriptIndex.components).toContainEqual(expect.objectContaining({
+      tag: 'AsyncChild',
+      localName: 'AsyncChild',
+      targetUri: childUri,
+    }))
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(1)
+  })
+
+  it('解析 components 中的 require 数组异步组件注册', () => {
+    const index = new WorkspaceIndex()
+    const childUri = path.join(fixtureRoot, 'Child.vue')
+    const parentUri = path.join(fixtureRoot, 'RequireAsyncParent.vue')
+    index.indexContent(childUri, readFixture('Child.vue'))
+    const parent = index.indexContent(parentUri, `
+<template>
+  <AsyncChild :title="title" @save="onSave" />
+</template>
+<script>
+export default {
+  components: {
+    AsyncChild: resolve => require(['./Child.vue'], resolve),
+  },
+}
+</script>
+`)
+
+    expect(parent.scriptIndex.components).toContainEqual(expect.objectContaining({
+      tag: 'AsyncChild',
+      localName: 'AsyncChild',
+      targetUri: childUri,
+    }))
+    expect(parent.scriptIndex.components).toHaveLength(1)
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(1)
+  })
+
+  it('解析 components 中的静态变量别名注册', () => {
+    const index = new WorkspaceIndex()
+    const childUri = path.join(fixtureRoot, 'Child.vue')
+    const parentUri = path.join(fixtureRoot, 'AliasParent.vue')
+    index.indexContent(childUri, readFixture('Child.vue'))
+    const parent = index.indexContent(parentUri, `
+<template>
+  <RenamedChild :title="title" @save="onSave" />
+</template>
+<script>
+import Child from './Child.vue'
+const ChildAlias = Child
+export default {
+  components: {
+    RenamedChild: ChildAlias,
+  },
+}
+</script>
+`)
+
+    expect(parent.scriptIndex.components).toContainEqual(expect.objectContaining({
+      tag: 'RenamedChild',
+      localName: 'Child',
+      targetUri: childUri,
+    }))
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(1)
+  })
+
+  it('解析 components 中的异步变量别名注册', () => {
+    const index = new WorkspaceIndex()
+    const childUri = path.join(fixtureRoot, 'Child.vue')
+    const parentUri = path.join(fixtureRoot, 'AsyncAliasParent.vue')
+    index.indexContent(childUri, readFixture('Child.vue'))
+    const parent = index.indexContent(parentUri, `
+<template>
+  <AsyncChild :title="title" @save="onSave" />
+</template>
+<script>
+const AsyncChild = () => import('./Child.vue')
+export default {
+  components: {
+    AsyncChild,
+  },
+}
+</script>
+`)
+
+    expect(parent.scriptIndex.components).toContainEqual(expect.objectContaining({
+      tag: 'AsyncChild',
+      localName: 'AsyncChild',
+      targetUri: childUri,
+    }))
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(1)
+  })
+
+  it('解析带类型标注的异步变量别名注册', () => {
+    const index = new WorkspaceIndex()
+    const childUri = path.join(fixtureRoot, 'Child.vue')
+    const parentUri = path.join(fixtureRoot, 'TypedAsyncAliasParent.vue')
+    index.indexContent(childUri, readFixture('Child.vue'))
+    const parent = index.indexContent(parentUri, `
+<template>
+  <AsyncChild :title="title" @save="onSave" />
+</template>
+<script lang="ts">
+const AsyncChild: unknown = () => import('./Child.vue')
+export default {
+  components: {
+    AsyncChild,
+  },
+}
+</script>
+`)
+
+    expect(parent.scriptIndex.components).toContainEqual(expect.objectContaining({
+      tag: 'AsyncChild',
+      localName: 'AsyncChild',
+      targetUri: childUri,
+    }))
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(1)
+  })
+
   it('解析静态 provide 和 inject 关系', () => {
     const index = new WorkspaceIndex()
     const provider = index.indexContent(path.join(fixtureRoot, 'Provider.vue'), `

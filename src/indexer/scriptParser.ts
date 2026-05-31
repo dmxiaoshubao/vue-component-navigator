@@ -11,6 +11,11 @@ interface PropertyValue {
   documentation?: string
 }
 
+interface StaticComponentAlias {
+  localName?: string
+  source?: string
+}
+
 function skipWhitespace(content: string, index: number): number {
   while (index < content.length && /\s/.test(content[index])) {
     index += 1
@@ -83,6 +88,16 @@ function readIdentifier(content: string, index: number): { value: string, start:
     return undefined
   }
   return { value: match[0], start: index, end: index + match[0].length }
+}
+
+function isIdentifierChar(char: string | undefined): boolean {
+  return Boolean(char && /[\w$]/.test(char))
+}
+
+function isCodeTokenAt(content: string, token: string, index: number): boolean {
+  return content.startsWith(token, index)
+    && !isIdentifierChar(content[index - 1])
+    && !isIdentifierChar(content[index + token.length])
 }
 
 function readPropertyName(content: string, index: number): { value: string, start: number, end: number } | undefined {
@@ -216,24 +231,7 @@ function findTopLevelProperty(content: string, open: number, close: number, name
   return undefined
 }
 
-function findValueEnd(content: string, start: number, close: number): number {
-  let index = start
-  while (index < close) {
-    const skipped = skipStringCommentOrRegex(content, index)
-    if (skipped !== undefined) {
-      index = skipped
-      continue
-    }
-
-    if (content[index] === ',' || content[index] === '\n') {
-      break
-    }
-    index += 1
-  }
-  return index
-}
-
-function findFunctionLikeValueEnd(content: string, start: number): number | undefined {
+function findFunctionLikeValueEnd(content: string, start: number, close: number): number | undefined {
   let cursor = start
   const firstWord = readIdentifier(content, cursor)
   if (firstWord?.value === 'async') {
@@ -253,20 +251,59 @@ function findFunctionLikeValueEnd(content: string, start: number): number | unde
   cursor = skipWhitespace(content, paramsEnd + 1)
   if (content.slice(cursor, cursor + 2) === '=>') {
     cursor = skipWhitespace(content, cursor + 2)
+    if (content[cursor] === '{') {
+      return findMatchingBracket(content, cursor) + 1
+    }
+    return findExpressionEnd(content, cursor, close)
   }
 
   if (content[cursor] === '{') {
     return findMatchingBracket(content, cursor) + 1
   }
 
-  return paramsEnd + 1
+  return undefined
 }
 
 function findMemberValueEnd(content: string, start: number, objectEnd: number): number {
-  return findFunctionLikeValueEnd(content, start)
+  return findFunctionLikeValueEnd(content, start, objectEnd)
     ?? (content[start] === '{' || content[start] === '[' || content[start] === '('
       ? findMatchingBracket(content, start) + 1
-      : findValueEnd(content, start, objectEnd))
+      : findExpressionEnd(content, start, objectEnd))
+}
+
+function findExpressionEnd(content: string, start: number, close: number): number {
+  let index = start
+  let depth = 0
+
+  while (index < close) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped
+      continue
+    }
+
+    const char = content[index]
+    if (char === '{' || char === '[' || char === '(') {
+      depth += 1
+      index += 1
+      continue
+    }
+    if (char === '}' || char === ']' || char === ')') {
+      if (depth === 0) {
+        return index
+      }
+      depth -= 1
+      index += 1
+      continue
+    }
+    if (depth === 0 && (char === ',' || char === ';' || char === '\n')) {
+      return index
+    }
+
+    index += 1
+  }
+
+  return close
 }
 
 function eachObjectMember(content: string, objectStart: number, objectEnd: number, visit: (member: PropertyValue) => void): void {
@@ -355,16 +392,225 @@ function parseStringLiteral(content: string, start: number, end: number): string
   return text.slice(1, -1)
 }
 
+function readAsyncImportSource(content: string, start: number, end: number): string | undefined {
+  for (let index = start; index < end; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    if (!isCodeTokenAt(content, 'import', index)) {
+      continue
+    }
+
+    const open = skipTrivia(content, index + 'import'.length)
+    if (content[open] !== '(') {
+      continue
+    }
+
+    const literal = readStringLiteral(content, skipTrivia(content, open + 1))
+    if (literal && literal.end <= end) {
+      return literal.value
+    }
+  }
+
+  return undefined
+}
+
+function readRequireArraySource(content: string, start: number, end: number): string | undefined {
+  for (let index = start; index < end; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    if (!isCodeTokenAt(content, 'require', index)) {
+      continue
+    }
+
+    const open = skipTrivia(content, index + 'require'.length)
+    if (content[open] !== '(') {
+      continue
+    }
+
+    const arrayOpen = skipTrivia(content, open + 1)
+    if (content[arrayOpen] !== '[') {
+      continue
+    }
+
+    const literal = readStringLiteral(content, skipTrivia(content, arrayOpen + 1))
+    if (literal && literal.end <= end) {
+      return literal.value
+    }
+  }
+
+  return undefined
+}
+
+function readComponentExpressionSource(content: string, start: number, end: number): string | undefined {
+  return readAsyncImportSource(content, start, end)
+    ?? readRequireArraySource(content, start, end)
+}
+
+function findVariableInitializer(content: string, start: number): number | undefined {
+  let index = start
+  let depth = 0
+
+  while (index < content.length) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped
+      continue
+    }
+
+    const char = content[index]
+    if (char === '{' || char === '[' || char === '(' || char === '<') {
+      depth += 1
+      index += 1
+      continue
+    }
+    if (char === '}' || char === ']' || char === ')' || char === '>') {
+      depth = Math.max(0, depth - 1)
+      index += 1
+      continue
+    }
+    if (depth === 0 && char === '=') {
+      return index
+    }
+    if (depth === 0 && (char === ',' || char === ';' || char === '\n')) {
+      return undefined
+    }
+
+    index += 1
+  }
+
+  return undefined
+}
+
+function collectStaticComponentAliases(content: string, importSources: Map<string, string>): Map<string, StaticComponentAlias> {
+  const aliases = new Map<string, StaticComponentAlias>()
+  let depth = 0
+
+  for (let index = 0; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = content[index]
+    if (char === '{' || char === '[' || char === '(') {
+      depth += 1
+      continue
+    }
+    if (char === '}' || char === ']' || char === ')') {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth !== 0 || (!isCodeTokenAt(content, 'const', index) && !isCodeTokenAt(content, 'let', index) && !isCodeTokenAt(content, 'var', index))) {
+      continue
+    }
+
+    let cursor = skipTrivia(content, index + 3)
+    if (content.startsWith('const', index)) {
+      cursor = skipTrivia(content, index + 'const'.length)
+    }
+
+    while (cursor < content.length) {
+      const name = readIdentifier(content, cursor)
+      if (!name) {
+        break
+      }
+
+      cursor = skipTrivia(content, name.end)
+      const equals = findVariableInitializer(content, cursor)
+      if (equals === undefined) {
+        break
+      }
+
+      const valueStart = skipTrivia(content, equals + 1)
+      const valueEnd = findExpressionEnd(content, valueStart, content.length)
+      const identifier = readIdentifier(content, valueStart)
+      const importedSource = identifier ? importSources.get(identifier.value) : undefined
+      const asyncSource = readComponentExpressionSource(content, valueStart, valueEnd)
+
+      if (importedSource || asyncSource || identifier) {
+        aliases.set(name.value, {
+          localName: identifier?.value,
+          source: importedSource ?? asyncSource,
+        })
+      }
+
+      cursor = skipTrivia(content, valueEnd)
+      if (content[cursor] !== ',') {
+        break
+      }
+      cursor = skipTrivia(content, cursor + 1)
+    }
+  }
+
+  return aliases
+}
+
+function resolveStaticComponentAlias(name: string, aliases: Map<string, StaticComponentAlias>, importSources: Map<string, string>): StaticComponentAlias | undefined {
+  let current = name
+  const visited = new Set<string>()
+
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (visited.has(current)) {
+      return undefined
+    }
+    visited.add(current)
+
+    const importedSource = importSources.get(current)
+    if (importedSource) {
+      return { localName: current, source: importedSource }
+    }
+
+    const alias = aliases.get(current)
+    if (!alias) {
+      return undefined
+    }
+    if (alias.source) {
+      return { localName: alias.localName ?? current, source: alias.source }
+    }
+    if (!alias.localName || alias.localName === current) {
+      return undefined
+    }
+    current = alias.localName
+  }
+
+  return undefined
+}
+
+function resolveComponentRegistration(content: string, member: PropertyValue, importSources: Map<string, string>, aliases: Map<string, StaticComponentAlias>): { localName: string, source?: string } {
+  const valueEnd = findExpressionEnd(content, member.valueStart, member.valueEnd)
+  const identifier = readIdentifier(content, member.valueStart)
+  const localName = identifier?.value ?? member.name
+  const expressionSource = readComponentExpressionSource(content, member.valueStart, valueEnd)
+  if (expressionSource) {
+    return { localName: member.name, source: expressionSource }
+  }
+
+  const resolvedAlias = resolveStaticComponentAlias(localName, aliases, importSources)
+  return {
+    localName: resolvedAlias?.localName ?? localName,
+    source: resolvedAlias?.source,
+  }
+}
+
 function parseComponents(content: string, components: PropertyValue | undefined, imports: ImportInfo[], uri: string, scriptStart: number, workspaceRoots: string[]): ComponentRegistration[] {
   if (!components || content[components.valueStart] !== '{') {
     return []
   }
 
   const results: ComponentRegistration[] = []
+  const importSources = new Map(imports.map((item) => [item.localName, item.source]))
+  const aliases = collectStaticComponentAliases(content, importSources)
   eachObjectMember(content, components.valueStart, components.valueEnd - 1, (member) => {
-    const localIdentifier = readIdentifier(content, member.valueStart)
-    const localName = localIdentifier?.value ?? member.name
-    const source = imports.find((item) => item.localName === localName)?.source
+    const { localName, source } = resolveComponentRegistration(content, member, importSources, aliases)
     results.push({
       tag: member.name,
       localName,
