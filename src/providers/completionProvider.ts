@@ -1,6 +1,6 @@
 import * as vscode from 'vscode'
 import type { MethodInfo, VueFileIndex } from '../indexer/types'
-import { WorkspaceIndex, findRefCompletionContext, findRefCompletionContextInFile } from '../indexer/workspaceIndex'
+import { WorkspaceIndex, findRefCompletionContext, findRefCompletionContextInFile, findRefRootCompletionContext, findRefRootCompletionContextInFile } from '../indexer/workspaceIndex'
 import { findResolvedRefComponent } from '../indexer/relationResolver'
 import { formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 import { createLineStarts, positionToOffset } from '../utils/position'
@@ -52,6 +52,16 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
       ? findRefCompletionContextInFile(file, offset)
       : findRefCompletionContext(document.getText(), offset)
     if (!refContext) {
+      const refRootContext = isVueDocument(document) && file
+        ? findRefRootCompletionContextInFile(file, offset)
+        : findRefRootCompletionContext(document.getText(), offset)
+      if (!refRootContext || !file) {
+        return undefined
+      }
+      return this.refNameCompletions(file, refRootContext.partialRefName, position)
+    }
+
+    if (!file && !this.index.hasMixinSource(document.uri.fsPath)) {
       return undefined
     }
 
@@ -80,6 +90,31 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
       item.insertText = `${refContext.accessToken}${method.name}`
       item.filterText = `${refContext.accessToken}${refContext.partialMethodName}${method.name}`
       item.sortText = `${refContext.accessToken === '?.' ? OPTIONAL_CHAIN_SORT_PREFIX : HIGH_PRIORITY_SORT_PREFIX}${method.name}`
+      item.preselect = true
+      return item
+    })
+  }
+
+  private refNameCompletions(file: VueFileIndex, partialRefName: string, position: vscode.Position): vscode.CompletionItem[] | undefined {
+    const refNames = uniqueRefNames(file)
+    if (refNames.length === 0) {
+      return undefined
+    }
+
+    const range = new vscode.Range(
+      position.line,
+      position.character - partialRefName.length,
+      position.line,
+      position.character,
+    )
+
+    return refNames.map((refName) => {
+      const item = new vscode.CompletionItem(refName, vscode.CompletionItemKind.Method)
+      item.detail = 'template ref'
+      item.range = range
+      item.insertText = refName
+      item.filterText = refName
+      item.sortText = `${HIGH_PRIORITY_SORT_PREFIX}${refName}`
       item.preselect = true
       return item
     })
@@ -155,6 +190,21 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
     }
     return results
   }
+}
+
+function uniqueRefNames(file: VueFileIndex): string[] {
+  const seen = new Set<string>()
+  const results: string[] = []
+  for (const component of file.templateIndex.components) {
+    for (const attr of component.attrs) {
+      if (attr.kind !== 'ref' || seen.has(attr.name)) {
+        continue
+      }
+      seen.add(attr.name)
+      results.push(attr.name)
+    }
+  }
+  return results
 }
 
 function findInjectCompletionContext(content: string, offset: number): StringContext | undefined {

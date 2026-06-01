@@ -83,6 +83,57 @@ describe('Vue providers', () => {
     expect(hover.contents.isTrusted).toBe(false)
   })
 
+  it('$refs 根对象补全模板 ref 名称', () => {
+    const content = readFixture('Parent.vue')
+    const document = new TestDocument(path.join(fixtureRoot, 'Parent.vue'), content) as any
+    const completionProvider = new VueCompletionProvider(index)
+
+    const completions = completionProvider.provideCompletionItems(document, positionAt(content, content.indexOf('this.$refs.') + 'this.$refs.'.length)) as any[]
+
+    expect(completions.map((item) => item.label)).toEqual(['child'])
+    expect(completions.every((item) => item.detail === 'template ref')).toBe(true)
+    expect(completions.every((item) => item.preselect === true)).toBe(true)
+    expect(completions.find((item) => item.label === 'child')?.insertText).toBe('child')
+    expect(completions.find((item) => item.label === 'child')?.filterText).toBe('child')
+  })
+
+  it('$refs 裸对象也补全模板 ref 名称', () => {
+    const content = readFixture('Parent.vue')
+    const document = new TestDocument(path.join(fixtureRoot, 'Parent.vue'), content) as any
+    const completionProvider = new VueCompletionProvider(index)
+
+    const completions = completionProvider.provideCompletionItems(document, positionAt(content, content.indexOf('this.$refs') + 'this.$refs'.length)) as any[]
+
+    expect(completions.map((item) => item.label)).toEqual(['child'])
+  })
+
+  it('$refs 根对象可选链补全模板 ref 名称', () => {
+    const content = `
+<template>
+  <Child ref="child" />
+</template>
+<script>
+import Child from './Child.vue'
+export default {
+  components: { Child },
+  methods: {
+    call() {
+      this.$refs?.
+    },
+  },
+}
+</script>
+`
+    const uri = path.join(fixtureRoot, 'OptionalRefRootParent.vue')
+    index.indexContent(uri, content)
+    const document = new TestDocument(uri, content) as any
+    const completionProvider = new VueCompletionProvider(index)
+
+    const completions = completionProvider.provideCompletionItems(document, positionAt(content, content.indexOf('this.$refs?.') + 'this.$refs?.'.length)) as any[]
+
+    expect(completions.map((item) => item.label)).toEqual(['child'])
+  })
+
   it('$refs 可选链方法补全有更高排序优先级', () => {
     const content = readFixture('Parent.vue')
     const document = new TestDocument(path.join(fixtureRoot, 'Parent.vue'), content) as any

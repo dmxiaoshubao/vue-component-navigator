@@ -1129,6 +1129,19 @@ export interface RefCompletionContext {
   partialMethodName: string
 }
 
+export interface RefRootCompletionContext {
+  partialRefName: string
+}
+
+export function findRefRootCompletionContext(content: string, offset: number): RefRootCompletionContext | undefined {
+  const searchableContent = maskStringsAndComments(content)
+  return findRefRootCompletionContextInSearchableContent(searchableContent, offset)
+}
+
+export function findRefRootCompletionContextInFile(file: VueFileIndex, offset: number): RefRootCompletionContext | undefined {
+  return findRefRootCompletionContextInSearchableContent(file.searchableContent, offset)
+}
+
 export function findRefCompletionContext(content: string, offset: number): RefCompletionContext | undefined {
   const searchableContent = maskStringsAndComments(content)
   return findRefCompletionContextInSearchableContent(searchableContent, offset)
@@ -1148,6 +1161,25 @@ function findRefCompletionContextInSearchableContent(searchableContent: string, 
     refName: match[1],
     accessToken: match[2] === '?.' ? '?.' : '.',
     partialMethodName: match[3] ?? '',
+  }
+}
+
+function findRefRootCompletionContextInSearchableContent(searchableContent: string, offset: number): RefRootCompletionContext | undefined {
+  const prefix = searchableContent.slice(Math.max(0, offset - 80), offset)
+  const directMatch = /this\.\$refs(?:\.|\?\.)([A-Za-z_$][\w$]*)?$/.exec(prefix)
+  if (directMatch) {
+    return {
+      partialRefName: directMatch[1] ?? '',
+    }
+  }
+
+  const rootMatch = /this\.\$refs$/.exec(prefix)
+  if (!rootMatch) {
+    return undefined
+  }
+
+  return {
+    partialRefName: '',
   }
 }
 
