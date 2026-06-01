@@ -12,6 +12,9 @@ import MixinChild from './MixinChild.vue'
 
 export default {
   components: { MixinChild },
+  provide: {
+    sharedService: true,
+  },
   data() {
     return {
       title: 'hello',

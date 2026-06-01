@@ -290,6 +290,7 @@ export default {
 
   it('合并静态 mixin 中的 props、methods、emits、provide、inject 和 $refs 调用', async () => {
     const index = await buildIndex()
+    const parent = index.getFile(path.join(fixtureRoot, 'MixinParent.vue'))!
     const child = index.getFile(path.join(fixtureRoot, 'MixinChild.vue'))!
     const inner = index.getFile(path.join(fixtureRoot, 'MixinInner.vue'))!
     const defaultMixinUri = path.join(fixtureRoot, 'mixin-default.js')
@@ -316,8 +317,8 @@ export default {
     expect(index.findRefMethodUsages(child.uri, 'namedMethod')).toHaveLength(1)
     expect(index.findRefMethodUsages(child.uri, 'nestedMethod')).toHaveLength(1)
     expect(index.findRefMethodUsages(inner.uri, 'focus')[0]?.sourceLocation?.uri).toBe(defaultMixinUri)
-    expect(index.findProvideDefinitions(child, 'sharedService')[0]?.sourceLocation?.uri).toBe(defaultMixinUri)
-    expect(index.findInjectUsages(child.uri, 'sharedService')[0]?.sourceLocation?.uri).toBe(namedMixinUri)
+    expect(index.findProvideDefinitions(child, 'sharedService')[0]?.file.uri).toBe(parent.uri)
+    expect(index.findInjectUsages(parent.uri, 'sharedService')[0]?.sourceLocation?.uri).toBe(namedMixinUri)
   })
 
   it('忽略动态 mixin 表达式', () => {
@@ -370,9 +371,11 @@ export default {
   it('解析静态 provide 和 inject 关系', () => {
     const index = new WorkspaceIndex()
     const provider = index.indexContent(path.join(fixtureRoot, 'Provider.vue'), `
-<template><div /></template>
+<template><Consumer /></template>
 <script>
+import Consumer from './Consumer.vue'
 export default {
+  components: { Consumer },
   provide() {
     return {
       theme: this.theme,
@@ -418,9 +421,56 @@ export default {
 </script>
 `)
     const provider = index.indexContent(providerUri, `
+<template><ChangingConsumer /></template>
+<script>
+import ChangingConsumer from './ChangingConsumer.vue'
+export default {
+  components: { ChangingConsumer },
+  provide: {
+    service: this.service,
+  },
+}
+</script>
+`)
+
+    expect(index.findProvideDefinitions(consumer, 'service').map((usage) => usage.file.uri)).toEqual([provider.uri])
+    expect(index.findInjectUsages(provider.uri, 'service')).toHaveLength(1)
+
+    index.syncContent(providerUri, `
+<template><ChangingConsumer /></template>
+<script>
+import ChangingConsumer from './ChangingConsumer.vue'
+export default {
+  components: { ChangingConsumer },
+  provide: {
+    renamedService: this.service,
+  },
+}
+</script>
+`)
+
+    expect(index.findProvideDefinitions(consumer, 'service')).toHaveLength(0)
+    expect(index.findInjectUsages(provider.uri, 'service')).toHaveLength(0)
+  })
+
+  it('父组件模板更新后同步清理 provide/inject 静态父链', () => {
+    const index = new WorkspaceIndex()
+    const providerUri = path.join(fixtureRoot, 'TemplateChangingProvider.vue')
+    const consumerUri = path.join(fixtureRoot, 'TemplateChangingConsumer.vue')
+    const consumer = index.indexContent(consumerUri, `
 <template><div /></template>
 <script>
 export default {
+  inject: ['service'],
+}
+</script>
+`)
+    const provider = index.indexContent(providerUri, `
+<template><TemplateChangingConsumer /></template>
+<script>
+import TemplateChangingConsumer from './TemplateChangingConsumer.vue'
+export default {
+  components: { TemplateChangingConsumer },
   provide: {
     service: this.service,
   },
@@ -436,7 +486,7 @@ export default {
 <script>
 export default {
   provide: {
-    renamedService: this.service,
+    service: this.service,
   },
 }
 </script>
@@ -444,6 +494,67 @@ export default {
 
     expect(index.findProvideDefinitions(consumer, 'service')).toHaveLength(0)
     expect(index.findInjectUsages(provider.uri, 'service')).toHaveLength(0)
+  })
+
+  it('provide/inject 静态父链不把当前组件自身当作祖先', () => {
+    const index = new WorkspaceIndex()
+    const file = index.indexContent(path.join(fixtureRoot, 'SelfProvideInject.vue'), `
+<template><div /></template>
+<script>
+export default {
+  provide: {
+    service: this.service,
+  },
+  inject: ['service'],
+}
+</script>
+`)
+
+    expect(index.findProvideDefinitions(file, 'service')).toHaveLength(0)
+    expect(index.findInjectUsages(file.uri, 'service')).toHaveLength(0)
+  })
+
+  it('inject 优先匹配每条静态父链最近的 provide', () => {
+    const index = new WorkspaceIndex()
+    const consumerUri = path.join(fixtureRoot, 'NearestConsumer.vue')
+    const parentUri = path.join(fixtureRoot, 'NearestParent.vue')
+    const grandParentUri = path.join(fixtureRoot, 'NearestGrandParent.vue')
+    const consumer = index.indexContent(consumerUri, `
+<template><div /></template>
+<script>
+export default {
+  inject: ['service'],
+}
+</script>
+`)
+    const parent = index.indexContent(parentUri, `
+<template><NearestConsumer /></template>
+<script>
+import NearestConsumer from './NearestConsumer.vue'
+export default {
+  components: { NearestConsumer },
+  provide: {
+    service: this.parentService,
+  },
+}
+</script>
+`)
+    const grandParent = index.indexContent(grandParentUri, `
+<template><NearestParent /></template>
+<script>
+import NearestParent from './NearestParent.vue'
+export default {
+  components: { NearestParent },
+  provide: {
+    service: this.grandParentService,
+  },
+}
+</script>
+`)
+
+    expect(index.findProvideDefinitions(consumer, 'service').map((usage) => usage.file.uri)).toEqual([parent.uri])
+    expect(index.findInjectUsages(parent.uri, 'service').map((usage) => usage.file.uri)).toEqual([consumer.uri])
+    expect(index.findInjectUsages(grandParent.uri, 'service')).toHaveLength(0)
   })
 
   it('没有 tsconfig 或 jsconfig 时不猜测 @/ 别名', () => {

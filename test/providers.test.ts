@@ -468,9 +468,11 @@ export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
     const providerUri = path.join(fixtureRoot, 'ProvideSource.vue')
     const consumerUri = path.join(fixtureRoot, 'InjectConsumer.vue')
     const providerContent = `
-<template><div /></template>
+<template><InjectConsumer /></template>
 <script>
+import InjectConsumer from './InjectConsumer.vue'
 export default {
+  components: { InjectConsumer },
   provide: {
     service: this.service,
   },
@@ -512,6 +514,89 @@ export default {
     expect(hoverText(provideHover)).not.toContain('[InjectConsumer.vue:')
   })
 
+  it('inject 字符串支持 provide key 补全', () => {
+    const arrayChildUri = path.join(fixtureRoot, 'CompletionArrayChild.vue')
+    const objectChildUri = path.join(fixtureRoot, 'CompletionObjectChild.vue')
+    const middleUri = path.join(fixtureRoot, 'CompletionMiddle.vue')
+    const parentUri = path.join(fixtureRoot, 'CompletionParent.vue')
+    const unrelatedUri = path.join(fixtureRoot, 'CompletionUnrelated.vue')
+    const unrelatedContent = `
+<script>
+export default {
+  provide: {
+    unrelated: {},
+  },
+}
+</script>`
+    const arrayChildContent = `
+<script>
+export default {
+  name: 'CompletionArrayChild',
+  provide: {
+    selfOnly: {},
+  },
+  inject: [''],
+}
+</script>`
+    const objectChildContent = `
+<script>
+export default {
+  name: 'CompletionObjectChild',
+  inject: {
+    localService: { from: '' },
+    '': 'fallback',
+  },
+}
+</script>`
+    const middleContent = `
+<template>
+  <CompletionArrayChild />
+  <CompletionObjectChild />
+</template>
+<script>
+import CompletionArrayChild from './CompletionArrayChild.vue'
+import CompletionObjectChild from './CompletionObjectChild.vue'
+export default {
+  components: { CompletionArrayChild, CompletionObjectChild },
+  provide: {
+    middleService: {},
+  },
+}
+</script>`
+    const parentContent = `
+<template>
+  <CompletionMiddle />
+</template>
+<script>
+import CompletionMiddle from './CompletionMiddle.vue'
+export default {
+  components: { CompletionMiddle },
+  provide: {
+    localService: {},
+  },
+}
+</script>`
+    const localIndex = new WorkspaceIndex()
+    localIndex.indexContent(unrelatedUri, unrelatedContent)
+    localIndex.indexContent(arrayChildUri, arrayChildContent)
+    localIndex.indexContent(objectChildUri, objectChildContent)
+    localIndex.indexContent(middleUri, middleContent)
+    localIndex.indexContent(parentUri, parentContent)
+    const completionProvider = new VueCompletionProvider(localIndex)
+    const arrayDocument = new TestDocument(arrayChildUri, arrayChildContent) as any
+    const objectDocument = new TestDocument(objectChildUri, objectChildContent) as any
+
+    const arrayCompletions = completionProvider.provideCompletionItems(arrayDocument, positionAt(arrayChildContent, arrayChildContent.indexOf("''") + 1)) as any[]
+    const fromCompletions = completionProvider.provideCompletionItems(objectDocument, positionAt(objectChildContent, objectChildContent.indexOf("from: ''") + "from: '".length)) as any[]
+    const keyCompletions = completionProvider.provideCompletionItems(objectDocument, positionAt(objectChildContent, objectChildContent.indexOf("'':") + 1)) as any[]
+    const nonInjectCompletions = completionProvider.provideCompletionItems(arrayDocument, positionAt(arrayChildContent, arrayChildContent.indexOf("'CompletionArrayChild'") + 2))
+
+    expect(arrayCompletions.map((item) => item.label)).toEqual(['middleService', 'localService'])
+    expect(fromCompletions.map((item) => item.label)).toEqual(['middleService', 'localService'])
+    expect(keyCompletions.map((item) => item.label)).toEqual(['middleService', 'localService'])
+    expect(nonInjectCompletions).toBeUndefined()
+  })
+
   it('inject provider 超过 5 个时只展示前 5 个并提供完整列表入口', () => {
     const consumerUri = path.join(fixtureRoot, 'ManyProviderConsumer.vue')
     const consumerContent = `
@@ -525,9 +610,11 @@ export default {
     index.indexContent(consumerUri, consumerContent)
     for (let count = 0; count < 6; count += 1) {
       index.indexContent(path.join(fixtureRoot, `ManyProvider${count}.vue`), `
-<template><div /></template>
+<template><ManyProviderConsumer /></template>
 <script>
+import ManyProviderConsumer from './ManyProviderConsumer.vue'
 export default {
+  components: { ManyProviderConsumer },
   provide: {
     service: this.service,
   },

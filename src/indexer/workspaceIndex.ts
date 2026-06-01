@@ -25,6 +25,7 @@ export class WorkspaceIndex {
   private readonly refMethodUsages = new Map<string, UsageInfo[]>()
   private readonly provideDefinitions = new Map<string, UsageInfo[]>()
   private readonly injectUsages = new Map<string, UsageInfo[]>()
+  private readonly parentComponents = new Map<string, Set<string>>()
   private readonly mixinIndexCache = new Map<string, { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } | undefined>()
   private readonly mixinSourceUris = new Set<string>()
   private isBulkIndexing = false
@@ -130,6 +131,7 @@ export class WorkspaceIndex {
 
   indexContent(uri: string, content: string): VueFileIndex {
     const previous = this.files.get(uri)
+    const previousRelationshipChildren = previous ? this.relationshipChildren(previous) : new Set<string>()
     const wasMixinSource = this.isMixinSourceFile(uri) || this.hasMixinCacheForFile(uri)
     this.clearMixinCacheForFile(uri)
     if (previous) {
@@ -172,8 +174,9 @@ export class WorkspaceIndex {
     }
 
     this.addProvideDefinitions(file)
-    this.addRelationshipUsages(file)
-    if (file.scriptIndex.provides.length > 0 || (previous?.scriptIndex.provides.length ?? 0) > 0) {
+    const relationshipChildren = this.addRelationshipUsages(file)
+    this.addInjectUsages(file)
+    if (file.scriptIndex.provides.length > 0 || (previous?.scriptIndex.provides.length ?? 0) > 0 || !sameStringSet(previousRelationshipChildren, relationshipChildren)) {
       this.rebuildReverseIndexes()
     }
     if (wasMixinSource) {
@@ -194,9 +197,14 @@ export class WorkspaceIndex {
     const wasMixinSource = this.isMixinSourceFile(uri) || this.hasMixinCacheForFile(uri)
     this.clearMixinCacheForFile(uri)
     const file = this.files.get(uri)
+    const hadRelationships = (file?.templateIndex.components.length ?? 0) > 0
     if (file) {
       this.removeReverseIndex(file)
       this.files.delete(uri)
+      this.parentComponents.delete(uri)
+    }
+    if (hadRelationships) {
+      this.rebuildReverseIndexes()
     }
     if (wasMixinSource) {
       this.rebuildIndexedFiles()
@@ -324,12 +332,49 @@ export class WorkspaceIndex {
   }
 
   findInjectUsages(providerUri: string, provideKey: string): UsageInfo[] {
-    return [...(this.injectUsages.get(usageKey(providerUri, provideKey)) ?? [])]
+    return (this.injectUsages.get(usageKey(providerUri, provideKey)) ?? [])
+      .filter((usage) => this.isStaticAncestor(providerUri, usage.file.uri))
   }
 
   findProvideDefinitions(consumer: VueFileIndex, injectKey: string): UsageInfo[] {
-    return (this.provideDefinitions.get(injectKey) ?? [])
-      .filter((usage) => isSameProjectFileOrUnknown(consumer.uri, usage.file.uri))
+    return this.findNearestProvideDefinitions(consumer, injectKey)
+  }
+
+  getProvideKeysForConsumer(consumerUri: string): string[] {
+    const results: string[] = []
+    const seen = new Set<string>()
+    const visited = new Set<string>([consumerUri])
+    let current = [...(this.parentComponents.get(consumerUri) ?? [])]
+
+    for (let depth = 0; depth < 8 && current.length > 0; depth += 1) {
+      const next: string[] = []
+      for (const uri of current) {
+        if (visited.has(uri)) {
+          continue
+        }
+        visited.add(uri)
+        const file = this.files.get(uri)
+        if (file) {
+          for (const provide of file.scriptIndex.provides) {
+            if (seen.has(provide.key)) {
+              continue
+            }
+            seen.add(provide.key)
+            results.push(provide.key)
+          }
+        }
+
+        for (const parentUri of this.parentComponents.get(uri) ?? []) {
+          if (visited.has(parentUri)) {
+            continue
+          }
+          next.push(parentUri)
+        }
+      }
+      current = next
+    }
+
+    return results
   }
 
   hasMixinSource(uri: string): boolean {
@@ -377,18 +422,96 @@ export class WorkspaceIndex {
     const results: VueFileIndex[] = []
     const seen = new Set<string>()
     for (const file of this.files.values()) {
-      const usesMixinSource = file.scriptIndex.props.some((item) => item.sourceLocation?.uri === sourceUri)
-        || file.scriptIndex.methods.some((item) => item.sourceLocation?.uri === sourceUri)
-        || file.scriptIndex.emits.some((item) => item.sourceLocation?.uri === sourceUri)
-        || file.scriptIndex.provides.some((item) => item.sourceLocation?.uri === sourceUri)
-        || file.scriptIndex.injects.some((item) => item.sourceLocation?.uri === sourceUri)
-        || file.refMethodCalls.some((call) => call.sourceLocation?.uri === sourceUri)
-      if (!usesMixinSource || seen.has(file.uri) || !this.resolveRefComponent(file, refName)) {
+      if (!usesSource(file, sourceUri) || seen.has(file.uri) || !this.resolveRefComponent(file, refName)) {
         continue
       }
       seen.add(file.uri)
       results.push(file)
     }
+    return results
+  }
+
+  findSourceConsumers(sourceUri: string): VueFileIndex[] {
+    return [...this.files.values()].filter((file) => usesSource(file, sourceUri))
+  }
+
+  private isStaticAncestor(ancestorUri: string, childUri: string): boolean {
+    if (ancestorUri === childUri) {
+      return false
+    }
+
+    const visited = new Set<string>([childUri])
+    let current = [childUri]
+    for (let depth = 0; depth < 8 && current.length > 0; depth += 1) {
+      const next: string[] = []
+      for (const uri of current) {
+        for (const parentUri of this.parentComponents.get(uri) ?? []) {
+          if (parentUri === ancestorUri) {
+            return true
+          }
+          if (visited.has(parentUri)) {
+            continue
+          }
+          visited.add(parentUri)
+          next.push(parentUri)
+        }
+      }
+      current = next
+    }
+
+    return false
+  }
+
+  private findNearestProvideDefinitions(consumer: VueFileIndex, injectKey: string): UsageInfo[] {
+    const definitionsByUri = new Map<string, UsageInfo[]>()
+    for (const usage of this.provideDefinitions.get(injectKey) ?? []) {
+      if (!isSameProjectFileOrUnknown(consumer.uri, usage.file.uri)) {
+        continue
+      }
+      const definitions = definitionsByUri.get(usage.file.uri) ?? []
+      definitions.push(usage)
+      definitionsByUri.set(usage.file.uri, definitions)
+    }
+
+    if (definitionsByUri.size === 0) {
+      return []
+    }
+
+    const results: UsageInfo[] = []
+    const seenDefinitions = new Set<string>()
+    const visited = new Set<string>([consumer.uri])
+    let current = [...(this.parentComponents.get(consumer.uri) ?? [])]
+
+    for (let depth = 0; depth < 8 && current.length > 0; depth += 1) {
+      const next: string[] = []
+      for (const uri of current) {
+        if (visited.has(uri)) {
+          continue
+        }
+        visited.add(uri)
+
+        const definitions = definitionsByUri.get(uri)
+        if (definitions) {
+          for (const definition of definitions) {
+            const key = `${definition.file.uri}\0${definition.span.start}\0${definition.span.end}`
+            if (seenDefinitions.has(key)) {
+              continue
+            }
+            seenDefinitions.add(key)
+            results.push(definition)
+          }
+          continue
+        }
+
+        for (const parentUri of this.parentComponents.get(uri) ?? []) {
+          if (!visited.has(parentUri)) {
+            next.push(parentUri)
+          }
+        }
+      }
+      current = next
+    }
+
     return results
   }
 
@@ -573,6 +696,7 @@ export class WorkspaceIndex {
     this.refMethodUsages.clear()
     this.provideDefinitions.clear()
     this.injectUsages.clear()
+    this.parentComponents.clear()
   }
 
   private addProvideDefinitions(file: VueFileIndex): void {
@@ -581,12 +705,15 @@ export class WorkspaceIndex {
     }
   }
 
-  private addRelationshipUsages(file: VueFileIndex): void {
+  private addRelationshipUsages(file: VueFileIndex): Set<string> {
+    const relationshipChildren = new Set<string>()
     for (const component of file.templateIndex.components) {
       const childUri = this.resolveComponent(file, component.tag)
       if (!childUri) {
         continue
       }
+      addParent(this.parentComponents, childUri, file.uri)
+      relationshipChildren.add(childUri)
 
       for (const attr of component.attrs) {
         if (attr.kind === 'prop') {
@@ -604,6 +731,10 @@ export class WorkspaceIndex {
       }
     }
 
+    return relationshipChildren
+  }
+
+  private addInjectUsages(file: VueFileIndex): void {
     for (const inject of file.scriptIndex.injects) {
       for (const provider of this.findProvideDefinitions(file, inject.key)) {
         addUsage(this.injectUsages, usageKey(provider.file.uri, inject.key), { file, span: inject.keySpan, sourceLocation: inject.sourceLocation })
@@ -716,6 +847,9 @@ export class WorkspaceIndex {
     for (const file of this.files.values()) {
       this.addRelationshipUsages(file)
     }
+    for (const file of this.files.values()) {
+      this.addInjectUsages(file)
+    }
   }
 
   private async resolveImportedNameGlobalComponents(components: GlobalComponentRegistration[]): Promise<GlobalComponentRegistration[]> {
@@ -814,6 +948,18 @@ export class WorkspaceIndex {
     removeFileUsages(this.provideDefinitions, file)
     removeFileUsages(this.injectUsages, file)
     removeProviderUsages(this.injectUsages, file)
+    removeParentLinks(this.parentComponents, file.uri)
+  }
+
+  private relationshipChildren(file: VueFileIndex): Set<string> {
+    const children = new Set<string>()
+    for (const component of file.templateIndex.components) {
+      const childUri = this.resolveComponent(file, component.tag)
+      if (childUri) {
+        children.add(childUri)
+      }
+    }
+    return children
   }
 
   private propKeys(childUri: string, propName: string): string[] {
@@ -894,6 +1040,15 @@ function dedupeUsages(usages: UsageInfo[]): UsageInfo[] {
     results.push(usage)
   }
   return results
+}
+
+function usesSource(file: VueFileIndex, sourceUri: string): boolean {
+  return file.scriptIndex.props.some((item) => item.sourceLocation?.uri === sourceUri)
+    || file.scriptIndex.methods.some((item) => item.sourceLocation?.uri === sourceUri)
+    || file.scriptIndex.emits.some((item) => item.sourceLocation?.uri === sourceUri)
+    || file.scriptIndex.provides.some((item) => item.sourceLocation?.uri === sourceUri)
+    || file.scriptIndex.injects.some((item) => item.sourceLocation?.uri === sourceUri)
+    || file.refMethodCalls.some((call) => call.sourceLocation?.uri === sourceUri)
 }
 
 async function walkIndexableFiles(root: string, visit: (file: string) => Promise<void>, token?: IndexCancellationToken): Promise<void> {
@@ -1023,6 +1178,24 @@ function addUsage(map: Map<string, UsageInfo[]>, key: string, usage: UsageInfo):
   }
 }
 
+function addParent(map: Map<string, Set<string>>, childUri: string, parentUri: string): void {
+  const parents = map.get(childUri)
+  if (parents) {
+    parents.add(parentUri)
+  } else {
+    map.set(childUri, new Set([parentUri]))
+  }
+}
+
+function removeParentLinks(map: Map<string, Set<string>>, parentUri: string): void {
+  for (const [childUri, parents] of map) {
+    parents.delete(parentUri)
+    if (parents.size === 0) {
+      map.delete(childUri)
+    }
+  }
+}
+
 function removeFileUsages(map: Map<string, UsageInfo[]>, file: VueFileIndex): void {
   for (const [key, usages] of map) {
     const kept = usages.filter((usage) => usage.file !== file)
@@ -1032,6 +1205,19 @@ function removeFileUsages(map: Map<string, UsageInfo[]>, file: VueFileIndex): vo
       map.set(key, kept)
     }
   }
+}
+
+function sameStringSet(left: Set<string>, right: Set<string>): boolean {
+  if (left.size !== right.size) {
+    return false
+  }
+
+  for (const value of left) {
+    if (!right.has(value)) {
+      return false
+    }
+  }
+  return true
 }
 
 function removeProviderUsages(map: Map<string, UsageInfo[]>, file: VueFileIndex): void {
