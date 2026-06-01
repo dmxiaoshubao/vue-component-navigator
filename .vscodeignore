@@ -3,6 +3,7 @@
 src/**
 test/**
 test-fixtures/**
+scripts/**
 coverage/**
 .vscode-test/**
 node_modules/**

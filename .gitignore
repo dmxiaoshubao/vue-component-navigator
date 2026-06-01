@@ -10,3 +10,4 @@ pnpm-debug.log*
 .DS_Store
 .env
 .env.*
+scripts/*.local.mjs
