@@ -19,7 +19,7 @@
 | prop / event / ref 反向引用 | 支持 | 基于索引关系查找父组件模板 prop 使用、事件监听和 `$refs` 方法调用。 |
 | `provide` / `inject` 导航 | 支持 | 从静态 `inject` key 跳到匹配的 `provide` key，也支持从 `provide` key 反向跳到静态 inject 消费方。 |
 | `provide` / `inject` 悬浮和引用 | 支持 | 展示 provider / consumer 概览，并为静态 provide key 返回 inject 引用。 |
-| 局部组件关系 | 支持 | 支持静态 default import 并注册在 `components` 里的局部组件关系。局部组件标签名跳转刻意交给 Vue 官方扩展，避免重复定义。 |
+| 局部组件关系 | 支持 | 支持 `components` 中的静态 default import、静态别名，以及 `() => import('./Child.vue')` 或 `resolve => require(['./Child.vue'], resolve)` 这类异步组件注册。局部组件标签名跳转刻意交给 Vue 官方扩展，避免重复定义。 |
 | 全局组件关系 | 支持 | 支持静态可证明的 `Vue.component(...)` / `app.component(...)` 风格全局注册。 |
 | `Component.name` 全局注册 | 支持 | 支持 `Vue.component(Component.name, Component)`，会读取被 import 的 `.vue` 组件 `name`。 |
 | 常量组件名全局注册 | 支持 | 支持 `const name = 'MyComponent'; Vue.component(name, MyComponent)`。 |
@@ -34,7 +34,7 @@
 | --- | --- | --- |
 | Vue 版本 | Vue 2 Options API | 解析器面向 Vue 2 Options API SFC 做了优化。 |
 | Vue 3 / `<script setup>` | 不支持 | 现代 Vue 场景官方 Vue 工具通常覆盖得更好。 |
-| 动态组件注册 | 不支持 | 动态表达式不做猜测，避免误跳转。 |
+| 动态组件注册 | 不支持 | 无法静态证明的组件注册不做猜测，避免误跳转；静态异步 import 支持。 |
 | 动态 refs / prop 名 / event 名 | 不支持 | 只索引静态可证明的关系。 |
 | 动态 provide / inject key | 不支持 | 只索引静态字符串/对象 key；不会推断运行时祖先/后代作用域。 |
 | 局部组件标签名定义跳转 | 刻意不处理 | 避免和 Vue 官方扩展产生重复定义；局部组件的 prop、event、ref 关系仍支持。 |
