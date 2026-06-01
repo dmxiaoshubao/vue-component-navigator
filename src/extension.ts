@@ -1,6 +1,6 @@
 import * as path from 'node:path'
 import * as vscode from 'vscode'
-import type { TextSpan, UsageInfo, VueFileIndex } from './indexer/types'
+import type { SourceLocation, TextSpan, UsageInfo, VueFileIndex } from './indexer/types'
 import { WorkspaceIndex } from './indexer/workspaceIndex'
 import { VueCompletionProvider } from './providers/completionProvider'
 import { VueDefinitionProvider } from './providers/definitionProvider'
@@ -14,20 +14,27 @@ type UsageCommandArgs =
   | { kind: 'prop-usages', childUri: string, propName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
+  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'method' | 'event' | 'provide' | 'inject' }
 
-function usageLabel(file: VueFileIndex, span: TextSpan, label: string): string {
-  const position = offsetToPosition(file.lineStarts, span.start)
+function usageLabel(file: VueFileIndex, span: TextSpan, label: string, sourceLocation?: SourceLocation): string {
+  const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
+  const position = offsetToPosition(location.lineStarts, location.span.start)
   return `${label}:${position.line + 1}:${position.character + 1}`
 }
 
-function toVsCodeRange(file: VueFileIndex, span: TextSpan): vscode.Range {
-  const range = spanToRange(file.lineStarts, span)
+function toVsCodeRange(file: VueFileIndex, span: TextSpan, sourceLocation?: SourceLocation): vscode.Range {
+  const location = sourceLocation ?? { lineStarts: file.lineStarts, span }
+  const range = spanToRange(location.lineStarts, location.span)
   return new vscode.Range(range.start.line, range.start.character, range.end.line, range.end.character)
 }
 
 export function activate(context: vscode.ExtensionContext): void {
   const index = new WorkspaceIndex()
-  const selector: vscode.DocumentSelector = [{ language: 'vue', scheme: 'file' }]
+  const selector: vscode.DocumentSelector = [
+    { language: 'vue', scheme: 'file' },
+    { language: 'javascript', scheme: 'file' },
+    { language: 'typescript', scheme: 'file' },
+  ]
   const pendingSyncTimers = new Map<string, ReturnType<typeof setTimeout>>()
   let indexStatus: 'idle' | 'indexing' | 'ready' | 'failed' | 'cancelled' = 'idle'
 
@@ -125,6 +132,37 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   function resolveUsages(args: UsageCommandArgs): { usages: UsageInfo[], placeHolder: string } {
+    if (args.kind === 'source-usages') {
+      if (args.relation === 'prop') {
+        return {
+          usages: index.findTemplatePropUsagesFromSource(args.sourceUri, args.offset),
+          placeHolder: 'Select prop usage',
+        }
+      }
+      if (args.relation === 'method') {
+        return {
+          usages: index.findRefMethodUsagesFromSource(args.sourceUri, args.offset),
+          placeHolder: 'Select ref method usage',
+        }
+      }
+      if (args.relation === 'provide') {
+        return {
+          usages: index.findInjectUsagesFromProvideSource(args.sourceUri, args.offset),
+          placeHolder: 'Select inject consumer',
+        }
+      }
+      if (args.relation === 'inject') {
+        return {
+          usages: index.findProvideDefinitionsFromInjectSource(args.sourceUri, args.offset),
+          placeHolder: 'Select provide definition',
+        }
+      }
+      return {
+        usages: index.findTemplateEventUsagesFromSource(args.sourceUri, args.offset),
+        placeHolder: 'Select event listener',
+      }
+    }
+
     if (args.kind === 'prop-usages') {
       return {
         usages: index.findTemplatePropUsages(args.childUri, args.propName),
@@ -178,12 +216,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
       const files = index.getAllFiles()
       const baseDirectory = commonDirectory(files.map((file) => file.uri))
-      const labels = usagePathLabels(usages.map((usage) => usage.file.uri), baseDirectory)
+      const labels = usagePathLabels(usages.map((usage) => usage.sourceLocation?.uri ?? usage.file.uri), baseDirectory)
       const selected = await vscode.window.showQuickPick(usages.map((usage) => ({
-        label: usageLabel(usage.file, usage.span, labels.get(usage.file.uri) ?? path.basename(usage.file.uri)),
-        description: relativePath(usage.file.uri, baseDirectory),
+        label: usageLabel(usage.file, usage.span, labels.get(usage.sourceLocation?.uri ?? usage.file.uri) ?? path.basename(usage.sourceLocation?.uri ?? usage.file.uri), usage.sourceLocation),
+        description: relativePath(usage.sourceLocation?.uri ?? usage.file.uri, baseDirectory),
         file: usage.file,
         span: usage.span,
+        sourceLocation: usage.sourceLocation,
       })), {
         matchOnDescription: true,
         placeHolder,
@@ -192,8 +231,8 @@ export function activate(context: vscode.ExtensionContext): void {
         return
       }
 
-      const range = toVsCodeRange(selected.file, selected.span)
-      await vscode.window.showTextDocument(vscode.Uri.file(selected.file.uri), { selection: range, preview: true })
+      const range = toVsCodeRange(selected.file, selected.span, selected.sourceLocation)
+      await vscode.window.showTextDocument(vscode.Uri.file(selected.sourceLocation?.uri ?? selected.file.uri), { selection: range, preview: true })
     }),
     vscode.languages.registerDefinitionProvider(selector, new VueDefinitionProvider(index)),
     vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?'),

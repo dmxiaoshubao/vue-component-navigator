@@ -1,9 +1,9 @@
 import * as path from 'node:path'
 import * as vscode from 'vscode'
-import type { MethodInfo, PropInfo, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
+import type { MethodInfo, PropInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
 import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedTemplateEventUsages, findInject, findMethod, findProp, findProvideAtOffset, findResolvedComponent, findResolvedRefComponent } from '../indexer/relationResolver'
-import { containsOffsetStrict, offsetToPosition } from '../utils/position'
+import { containsOffsetStrict, createLineStarts, offsetToPosition, positionToOffset } from '../utils/position'
 import { escapeMarkdownText, formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 import { commonDirectory, relativePath, shortestUniquePathLabels } from '../utils/pathDisplay'
 
@@ -15,10 +15,12 @@ type UsageCommandArgs =
   | { kind: 'prop-usages', childUri: string, propName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
+  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'method' | 'event' | 'provide' | 'inject' }
 
-function definitionLink(file: VueFileIndex, span: TextSpan, label: string): string {
-  const position = offsetToPosition(file.lineStarts, span.start)
-  const target = vscode.Uri.file(file.uri).with({ fragment: `L${position.line + 1},${position.character + 1}` })
+function definitionLink(file: VueFileIndex, span: TextSpan, label: string, sourceLocation?: SourceLocation): string {
+  const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
+  const position = offsetToPosition(location.lineStarts, location.span.start)
+  const target = vscode.Uri.file(location.uri).with({ fragment: `L${position.line + 1},${position.character + 1}` })
   return `[${escapeMarkdownText(label)}](${target.toString()})`
 }
 
@@ -31,7 +33,7 @@ function markdownHover(value: string, trusted = false): vscode.Hover {
 function methodHover(child: VueFileIndex, method: MethodInfo, label: string): vscode.Hover {
   const docs = formatJSDocMarkdown(method.documentation)
   const docText = docs ? `${docs}\n\n` : ''
-  return markdownHover(`${docText}${markdownCodeBlock(method.signature)}\n\nDefinition: ${definitionLink(child, method.span, label)}`)
+  return markdownHover(`${docText}${markdownCodeBlock(method.signature)}\n\nDefinition: ${definitionLink(child, method.span, label, method.sourceLocation)}`)
 }
 
 function formatCodeBlock(code: string): string {
@@ -51,18 +53,28 @@ function formatCodeBlock(code: string): string {
 function propHover(child: VueFileIndex, prop: PropInfo, label: string): vscode.Hover {
   const docs = formatJSDocMarkdown(prop.documentation)
   const docText = docs ? `${docs}\n\n` : ''
-  return markdownHover(`${docText}${markdownCodeBlock(formatCodeBlock(prop.detail))}\n\nDefinition: ${definitionLink(child, prop.span, label)}`)
+  return markdownHover(`${docText}${markdownCodeBlock(formatCodeBlock(prop.detail))}\n\nDefinition: ${definitionLink(child, prop.span, label, prop.sourceLocation)}`)
+}
+
+function labelForDefinition(labels: Map<string, string>, file: VueFileIndex, sourceLocation?: SourceLocation): string {
+  const uri = sourceLocation?.uri ?? file.uri
+  return labels.get(uri) ?? path.basename(uri)
 }
 
 function formatUsage(file: VueFileIndex, offset: number, baseDirectory: string): string {
-  const position = offsetToPosition(file.lineStarts, offset)
-  const target = vscode.Uri.file(file.uri).with({ fragment: `L${position.line + 1},${position.character + 1}` })
-  const relativeFile = relativePath(file.uri, baseDirectory)
+  return formatUsageLocation(file, { start: offset, end: offset }, baseDirectory)
+}
+
+function formatUsageLocation(file: VueFileIndex, span: TextSpan, baseDirectory: string, sourceLocation?: SourceLocation): string {
+  const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
+  const position = offsetToPosition(location.lineStarts, location.span.start)
+  const target = vscode.Uri.file(location.uri).with({ fragment: `L${position.line + 1},${position.character + 1}` })
+  const relativeFile = relativePath(location.uri, baseDirectory)
   const directory = path.dirname(relativeFile)
   const directoryText = directory && directory !== '.'
     ? ` - ${escapeMarkdownText(directory)}`
     : ''
-  return `- [${escapeMarkdownText(path.basename(file.uri))}](${target.toString()})${directoryText}`
+  return `- [${escapeMarkdownText(path.basename(location.uri))}](${target.toString()})${directoryText}`
 }
 
 function commandLink(args: UsageCommandArgs, label: string): string {
@@ -86,7 +98,7 @@ function usageSummary(
   }
 
   const visibleUsages = usages.slice(0, MAX_VISIBLE_USAGES)
-  const lines = visibleUsages.map((usage) => formatUsage(usage.file, usage.span.start, baseDirectory))
+  const lines = visibleUsages.map((usage) => formatUsageLocation(usage.file, usage.span, baseDirectory, usage.sourceLocation))
   const noun = usages.length === 1 ? options.singular : options.plural
   const more = usages.length > visibleUsages.length
     ? `\n\n${commandLink(options.commandArgs, `Show all ${usages.length} ${noun}`)}`
@@ -103,13 +115,24 @@ function eventHover(child: VueFileIndex, eventName: string, labels: Map<string, 
     return undefined
   }
 
-  const label = labels.get(child.uri) ?? path.basename(child.uri)
   if (emits.length === 1) {
-    return markdownHover(`Definition: ${definitionLink(child, emits[0].eventSpan, label)}`)
+    const label = labelForDefinition(labels, child, emits[0].sourceLocation)
+    return markdownHover(`Definition: ${definitionLink(child, emits[0].eventSpan, label, emits[0].sourceLocation)}`)
   }
 
-  const definitions = emits.map((emit) => `- ${definitionLink(child, emit.eventSpan, label)}`).join('\n')
+  const definitions = emits.map((emit) => {
+    const label = labelForDefinition(labels, child, emit.sourceLocation)
+    return `- ${definitionLink(child, emit.eventSpan, label, emit.sourceLocation)}`
+  }).join('\n')
   return markdownHover(`Definitions:\n\n${definitions}`)
+}
+
+function isVueDocument(document: vscode.TextDocument): boolean {
+  return document.languageId === 'vue' || document.uri.fsPath.endsWith('.vue')
+}
+
+function offsetInDocument(document: vscode.TextDocument, position: vscode.Position): number | undefined {
+  return positionToOffset(createLineStarts(document.getText()), { line: position.line, character: position.character })
 }
 
 function propDefinitionHover(index: WorkspaceIndex, child: VueFileIndex, prop: PropInfo, baseDirectory: string): vscode.Hover {
@@ -128,9 +151,22 @@ export class VueHoverProvider implements vscode.HoverProvider {
   constructor(private readonly index: WorkspaceIndex) {}
 
   provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.Hover> {
-    const file = this.index.syncContent(document.uri.fsPath, document.getText())
-    const offset = this.index.offsetAt(document.uri.fsPath, position.line, position.character)
+    const file = isVueDocument(document)
+      ? this.index.syncContent(document.uri.fsPath, document.getText())
+      : this.index.getFile(document.uri.fsPath)
+    const offset = isVueDocument(document)
+      ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
+      : offsetInDocument(document, position)
     if (offset === undefined) {
+      return undefined
+    }
+    const sourceHover = this.index.hasMixinSource(document.uri.fsPath)
+      ? this.sourceHover(document.uri.fsPath, offset)
+      : undefined
+    if (sourceHover) {
+      return sourceHover
+    }
+    if (!file) {
       return undefined
     }
     let labels: Map<string, string> | undefined
@@ -144,7 +180,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
       const childUri = findResolvedRefComponent(this.index, file, refAccess.refName)
       const child = childUri ? this.index.getFile(childUri) : undefined
       const method = child ? findMethod(child, refAccess.methodName) : undefined
-      return child && method ? methodHover(child, method, definitionLabels().get(child.uri) ?? path.basename(child.uri)) : undefined
+      return child && method ? methodHover(child, method, labelForDefinition(definitionLabels(), child, method.sourceLocation)) : undefined
     }
 
     for (const component of file.templateIndex.components) {
@@ -160,7 +196,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
         }
         if (attr.kind === 'prop') {
           const prop = findProp(child, attr.normalizedName)
-          return prop ? propHover(child, prop, definitionLabels().get(child.uri) ?? path.basename(child.uri)) : undefined
+          return prop ? propHover(child, prop, labelForDefinition(definitionLabels(), child, prop.sourceLocation)) : undefined
         }
         if (attr.kind === 'event') {
           return eventHover(child, attr.normalizedName, definitionLabels())
@@ -193,8 +229,88 @@ export class VueHoverProvider implements vscode.HoverProvider {
     return undefined
   }
 
+  private sourceHover(sourceUri: string, offset: number): vscode.Hover | undefined {
+    const refDefinitions = this.index.findSourceRefMethodCalls(sourceUri, offset).flatMap(({ file, call }) => {
+      const childUri = findResolvedRefComponent(this.index, file, call.refName)
+      const child = childUri ? this.index.getFile(childUri) : undefined
+      const method = child ? findMethod(child, call.methodName) : undefined
+      return child && method ? [{ child, method }] : []
+    })
+    if (refDefinitions.length > 0) {
+      const { child, method } = refDefinitions[0]
+      return methodHover(child, method, labelForDefinition(this.definitionLabels(), child, method.sourceLocation))
+    }
+
+    const propUsages = this.index.findTemplatePropUsagesFromSource(sourceUri, offset)
+    if (propUsages.length > 0) {
+      const summary = usageSummary(propUsages, this.workspaceBaseDirectory(), {
+        noneText: 'No template prop usages found.',
+        title: 'Used by',
+        singular: 'template prop',
+        plural: 'template props',
+        commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'prop' },
+      })
+      return markdownHover(summary.text, summary.trusted)
+    }
+
+    const methodUsages = this.index.findRefMethodUsagesFromSource(sourceUri, offset)
+    if (methodUsages.length > 0) {
+      const summary = usageSummary(methodUsages, this.workspaceBaseDirectory(), {
+        noneText: 'No ref method usages found.',
+        title: 'Used by',
+        singular: 'ref method',
+        plural: 'ref methods',
+        commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'method' },
+      })
+      return markdownHover(summary.text, summary.trusted)
+    }
+
+    const eventUsages = this.index.findTemplateEventUsagesFromSource(sourceUri, offset)
+    if (eventUsages.length > 0) {
+      const summary = usageSummary(eventUsages, this.workspaceBaseDirectory(), {
+        noneText: 'No template listeners found.',
+        title: 'Used by',
+        singular: 'listener',
+        plural: 'listeners',
+        commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'event' },
+      })
+      return markdownHover(summary.text, summary.trusted)
+    }
+
+    const providerUsages = this.index.findProvideDefinitionsFromInjectSource(sourceUri, offset)
+    if (providerUsages.length > 0) {
+      const summary = usageSummary(providerUsages, this.workspaceBaseDirectory(), {
+        noneText: 'No static provide definition found.',
+        title: 'Provided by',
+        singular: 'definition',
+        plural: 'definitions',
+        commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'inject' },
+      })
+      return markdownHover(summary.text, summary.trusted)
+    }
+
+    const injectUsages = this.index.findInjectUsagesFromProvideSource(sourceUri, offset)
+    if (injectUsages.length > 0) {
+      const summary = usageSummary(injectUsages, this.workspaceBaseDirectory(), {
+        noneText: 'No static inject usages found.',
+        title: 'Injected by',
+        singular: 'consumer',
+        plural: 'consumers',
+        commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'provide' },
+      })
+      return markdownHover(summary.text, summary.trusted)
+    }
+
+    return undefined
+  }
+
   private definitionLabels(): Map<string, string> {
-    const uris = this.index.getAllFiles().map((file) => file.uri)
+    const uris = this.index.getAllFiles().flatMap((file) => [
+      file.uri,
+      ...file.scriptIndex.props.map((item) => item.sourceLocation?.uri),
+      ...file.scriptIndex.methods.map((item) => item.sourceLocation?.uri),
+      ...file.scriptIndex.emits.map((item) => item.sourceLocation?.uri),
+    ]).filter((uri): uri is string => Boolean(uri))
     return shortestUniquePathLabels(uris, commonDirectory(uris))
   }
 

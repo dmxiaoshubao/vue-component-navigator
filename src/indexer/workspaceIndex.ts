@@ -1,11 +1,12 @@
+import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { GlobalComponentContext, GlobalComponentRegistration, RefMethodAccess, TextSpan, UsageInfo, VueFileIndex } from './types'
+import type { ComponentRegistration, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from './types'
 import { guessGlobalComponentsFromRequireContext, parseGlobalComponents } from './globalComponentParser'
 import { parseSfc } from './sfcParser'
 import { parseScript } from './scriptParser'
 import { parseTemplate } from './templateParser'
-import { positionToOffset } from '../utils/position'
+import { createLineStarts, positionToOffset } from '../utils/position'
 import { matchesName, toKebabCase } from '../utils/casing'
 import { maskStringsAndComments } from '../utils/scriptScan'
 
@@ -24,6 +25,8 @@ export class WorkspaceIndex {
   private readonly refMethodUsages = new Map<string, UsageInfo[]>()
   private readonly provideDefinitions = new Map<string, UsageInfo[]>()
   private readonly injectUsages = new Map<string, UsageInfo[]>()
+  private readonly mixinIndexCache = new Map<string, { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } | undefined>()
+  private readonly mixinSourceUris = new Set<string>()
   private isBulkIndexing = false
 
   clear(): void {
@@ -32,6 +35,8 @@ export class WorkspaceIndex {
     this.globalComponents.clear()
     this.globalComponentRegistrations.clear()
     this.globalComponentContexts.clear()
+    this.mixinIndexCache.clear()
+    this.mixinSourceUris.clear()
     this.clearReverseIndexes()
   }
 
@@ -53,6 +58,11 @@ export class WorkspaceIndex {
     this.globalComponentContexts.clear()
     for (const [fileUri, contexts] of other.globalComponentContexts) {
       this.globalComponentContexts.set(fileUri, [...contexts])
+    }
+    this.mixinIndexCache.clear()
+    this.mixinSourceUris.clear()
+    for (const uri of other.mixinSourceUris) {
+      this.mixinSourceUris.add(uri)
     }
     this.rebuildReverseIndexes()
   }
@@ -120,14 +130,18 @@ export class WorkspaceIndex {
 
   indexContent(uri: string, content: string): VueFileIndex {
     const previous = this.files.get(uri)
+    const wasMixinSource = this.isMixinSourceFile(uri) || this.hasMixinCacheForFile(uri)
+    this.clearMixinCacheForFile(uri)
     if (previous) {
       this.removeReverseIndex(previous)
     }
 
     const sfc = parseSfc(uri, content)
-    const scriptIndex = sfc.script
+    const ownScriptIndex = sfc.script
       ? parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots)
-      : { imports: [], components: [], props: [], methods: [], emits: [], provides: [], injects: [] }
+      : { imports: [], mixins: [], components: [], props: [], methods: [], emits: [], provides: [], injects: [] }
+    const mixed = this.mergeStaticMixins(uri, ownScriptIndex)
+    const scriptIndex = mixed.scriptIndex
     const registeredTags = [
       ...scriptIndex.components.flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
       ...this.getGlobalComponents().flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
@@ -147,7 +161,10 @@ export class WorkspaceIndex {
       template: sfc.template,
       scriptIndex,
       templateIndex,
-      refMethodCalls: findRefMethodCalls(searchableContent),
+      refMethodCalls: [
+        ...findRefMethodCalls(searchableContent),
+        ...mixed.refMethodCalls,
+      ],
     }
     this.files.set(uri, file)
     if (this.isBulkIndexing) {
@@ -158,6 +175,9 @@ export class WorkspaceIndex {
     this.addRelationshipUsages(file)
     if (file.scriptIndex.provides.length > 0 || (previous?.scriptIndex.provides.length ?? 0) > 0) {
       this.rebuildReverseIndexes()
+    }
+    if (wasMixinSource) {
+      this.rebuildIndexedFiles()
     }
     return file
   }
@@ -171,10 +191,15 @@ export class WorkspaceIndex {
   }
 
   remove(uri: string): void {
+    const wasMixinSource = this.isMixinSourceFile(uri) || this.hasMixinCacheForFile(uri)
+    this.clearMixinCacheForFile(uri)
     const file = this.files.get(uri)
     if (file) {
       this.removeReverseIndex(file)
       this.files.delete(uri)
+    }
+    if (wasMixinSource) {
+      this.rebuildIndexedFiles()
     }
   }
 
@@ -244,12 +269,14 @@ export class WorkspaceIndex {
   }
 
   async syncGlobalComponentFile(uri: string): Promise<void> {
+    this.clearMixinCacheForFile(uri)
     await this.indexGlobalComponentFile(uri)
     await this.refreshRequireContextGlobals(this.getIndexedUris())
     this.rebuildIndexedFiles()
   }
 
   removeGlobalComponentFile(uri: string): void {
+    this.clearMixinCacheForFile(uri)
     this.removeGlobalRegistrationsFromFile(uri)
     this.rebuildIndexedFiles()
   }
@@ -305,6 +332,241 @@ export class WorkspaceIndex {
       .filter((usage) => isSameProjectFileOrUnknown(consumer.uri, usage.file.uri))
   }
 
+  hasMixinSource(uri: string): boolean {
+    return this.mixinSourceUris.has(uri) || this.hasMixinCacheForFile(uri)
+  }
+
+  findTemplatePropUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
+    return dedupeUsages(this.findSourceProps(sourceUri, offset)
+      .flatMap(({ file, prop }) => this.findTemplatePropUsages(file.uri, prop.name)))
+  }
+
+  findRefMethodUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
+    return dedupeUsages(this.findSourceMethods(sourceUri, offset)
+      .flatMap(({ file, method }) => this.findRefMethodUsages(file.uri, method.name)))
+  }
+
+  findTemplateEventUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
+    return dedupeUsages(this.findSourceEmits(sourceUri, offset)
+      .flatMap(({ file, emit }) => this.findTemplateEventUsages(file.uri, emit.eventName)))
+  }
+
+  findInjectUsagesFromProvideSource(sourceUri: string, offset: number): UsageInfo[] {
+    return dedupeUsages(this.findSourceProvides(sourceUri, offset)
+      .flatMap(({ file, provide }) => this.findInjectUsages(file.uri, provide.key)))
+  }
+
+  findProvideDefinitionsFromInjectSource(sourceUri: string, offset: number): UsageInfo[] {
+    return dedupeUsages(this.findSourceInjects(sourceUri, offset)
+      .flatMap(({ file, inject }) => this.findProvideDefinitions(file, inject.key)))
+  }
+
+  findSourceRefMethodCalls(sourceUri: string, offset: number): Array<{ file: VueFileIndex, call: RefMethodAccess }> {
+    const results: Array<{ file: VueFileIndex, call: RefMethodAccess }> = []
+    for (const file of this.files.values()) {
+      for (const call of file.refMethodCalls) {
+        if (containsSourceOffset(call.sourceLocation, sourceUri, offset)) {
+          results.push({ file, call })
+        }
+      }
+    }
+    return results
+  }
+
+  findSourceRefOwners(sourceUri: string, refName: string): VueFileIndex[] {
+    const results: VueFileIndex[] = []
+    const seen = new Set<string>()
+    for (const file of this.files.values()) {
+      const usesMixinSource = file.scriptIndex.props.some((item) => item.sourceLocation?.uri === sourceUri)
+        || file.scriptIndex.methods.some((item) => item.sourceLocation?.uri === sourceUri)
+        || file.scriptIndex.emits.some((item) => item.sourceLocation?.uri === sourceUri)
+        || file.scriptIndex.provides.some((item) => item.sourceLocation?.uri === sourceUri)
+        || file.scriptIndex.injects.some((item) => item.sourceLocation?.uri === sourceUri)
+        || file.refMethodCalls.some((call) => call.sourceLocation?.uri === sourceUri)
+      if (!usesMixinSource || seen.has(file.uri) || !this.resolveRefComponent(file, refName)) {
+        continue
+      }
+      seen.add(file.uri)
+      results.push(file)
+    }
+    return results
+  }
+
+  private findSourceProps(sourceUri: string, offset: number): Array<{ file: VueFileIndex, prop: PropInfo }> {
+    const results: Array<{ file: VueFileIndex, prop: PropInfo }> = []
+    for (const file of this.files.values()) {
+      for (const prop of file.scriptIndex.props) {
+        if (containsSourceOffset(prop.sourceLocation, sourceUri, offset)) {
+          results.push({ file, prop })
+        }
+      }
+    }
+    return results
+  }
+
+  private findSourceMethods(sourceUri: string, offset: number): Array<{ file: VueFileIndex, method: MethodInfo }> {
+    const results: Array<{ file: VueFileIndex, method: MethodInfo }> = []
+    for (const file of this.files.values()) {
+      for (const method of file.scriptIndex.methods) {
+        if (containsSourceOffset(method.sourceLocation, sourceUri, offset)) {
+          results.push({ file, method })
+        }
+      }
+    }
+    return results
+  }
+
+  private findSourceEmits(sourceUri: string, offset: number): Array<{ file: VueFileIndex, emit: ScriptIndex['emits'][number] }> {
+    const results: Array<{ file: VueFileIndex, emit: ScriptIndex['emits'][number] }> = []
+    for (const file of this.files.values()) {
+      for (const emit of file.scriptIndex.emits) {
+        if (containsSourceOffset(emit.sourceLocation, sourceUri, offset)) {
+          results.push({ file, emit })
+        }
+      }
+    }
+    return results
+  }
+
+  private findSourceProvides(sourceUri: string, offset: number): Array<{ file: VueFileIndex, provide: ProvideInfo }> {
+    const results: Array<{ file: VueFileIndex, provide: ProvideInfo }> = []
+    for (const file of this.files.values()) {
+      for (const provide of file.scriptIndex.provides) {
+        if (containsSourceOffset(provide.sourceLocation, sourceUri, offset)) {
+          results.push({ file, provide })
+        }
+      }
+    }
+    return results
+  }
+
+  private findSourceInjects(sourceUri: string, offset: number): Array<{ file: VueFileIndex, inject: InjectInfo }> {
+    const results: Array<{ file: VueFileIndex, inject: InjectInfo }> = []
+    for (const file of this.files.values()) {
+      for (const inject of file.scriptIndex.injects) {
+        if (containsSourceOffset(inject.sourceLocation, sourceUri, offset)) {
+          results.push({ file, inject })
+        }
+      }
+    }
+    return results
+  }
+
+  private mergeStaticMixins(uri: string, own: ScriptIndex): { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } {
+    const collected = this.collectMixinIndexes(own.mixins, new Set([`${uri}\0default`]), 0)
+    if (collected.length === 0) {
+      return { scriptIndex: own, refMethodCalls: [] }
+    }
+
+    const mixinIndexes = collected.map((item) => item.scriptIndex)
+    return {
+      scriptIndex: {
+        ...own,
+        components: mergeNamed(own.components, mixinIndexes.flatMap((item) => item.components), (item) => item.tag),
+        props: mergeNamed(own.props, mixinIndexes.flatMap((item) => item.props), (item) => item.name),
+        methods: mergeNamed(own.methods, mixinIndexes.flatMap((item) => item.methods), (item) => item.name),
+        emits: [...own.emits, ...mixinIndexes.flatMap((item) => item.emits)],
+        provides: mergeNamed(own.provides, mixinIndexes.flatMap((item) => item.provides), (item) => item.key),
+        injects: mergeNamed(own.injects, mixinIndexes.flatMap((item) => item.injects), (item) => item.localName),
+      },
+      refMethodCalls: collected.flatMap((item) => item.refMethodCalls),
+    }
+  }
+
+  private collectMixinIndexes(mixins: MixinReference[], visited: Set<string>, depth: number): Array<{ scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] }> {
+    if (depth >= 4) {
+      return []
+    }
+
+    const results: Array<{ scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] }> = []
+    for (const mixin of mixins) {
+      const key = mixinKey(mixin)
+      if (!mixin.targetUri || visited.has(key) || !this.isInsideWorkspace(mixin.targetUri) || isInsideNodeModules(mixin.targetUri)) {
+        continue
+      }
+      this.mixinSourceUris.add(mixin.targetUri)
+
+      const parsed = this.parseMixin(mixin)
+      if (!parsed) {
+        continue
+      }
+
+      results.push(parsed)
+      visited.add(key)
+      results.push(...this.collectMixinIndexes(parsed.scriptIndex.mixins, visited, depth + 1))
+      visited.delete(key)
+    }
+
+    return results
+  }
+
+  private parseMixin(mixin: MixinReference): { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } | undefined {
+    if (!mixin.targetUri) {
+      return undefined
+    }
+
+    const exportName = mixin.importedName ?? 'default'
+    const cacheKey = `${mixin.targetUri}\0${exportName}`
+    if (this.mixinIndexCache.has(cacheKey)) {
+      return this.mixinIndexCache.get(cacheKey)
+    }
+
+    const parsed = this.readMixinIndex(mixin.targetUri, exportName)
+    this.mixinIndexCache.set(cacheKey, parsed)
+    return parsed
+  }
+
+  private isMixinSourceFile(uri: string): boolean {
+    return this.getAllFiles().some((file) => file.scriptIndex.mixins.some((mixin) => mixin.targetUri === uri))
+  }
+
+  private clearMixinCacheForFile(uri: string): void {
+    for (const key of [...this.mixinIndexCache.keys()]) {
+      if (key.startsWith(`${uri}\0`)) {
+        this.mixinIndexCache.delete(key)
+      }
+    }
+  }
+
+  private hasMixinCacheForFile(uri: string): boolean {
+    for (const key of this.mixinIndexCache.keys()) {
+      if (key.startsWith(`${uri}\0`)) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private readMixinIndex(uri: string, exportName: string): { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } | undefined {
+    try {
+      const content = fsSync.readFileSync(uri, 'utf8')
+      const lineStarts = createLineStarts(content)
+      const source = (span: TextSpan): SourceLocation => ({ uri, lineStarts, span })
+
+      if (uri.endsWith('.vue')) {
+        const sfc = parseSfc(uri, content)
+        if (!sfc.script) {
+          return undefined
+        }
+        const scriptIndex = parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots, exportName)
+        return {
+          scriptIndex: withSourceLocations(scriptIndex, source),
+          refMethodCalls: findRefMethodCalls(maskStringsAndComments(sfc.script.content))
+            .map((call) => withRefSourceLocation(call, sfc.script!.start, source)),
+        }
+      }
+
+      const scriptIndex = parseScript(uri, content, 0, this.workspaceRoots, exportName)
+      return {
+        scriptIndex: withSourceLocations(scriptIndex, source),
+        refMethodCalls: findRefMethodCalls(maskStringsAndComments(content))
+          .map((call) => withRefSourceLocation(call, 0, source)),
+      }
+    } catch {
+      return undefined
+    }
+  }
+
   private clearReverseIndexes(): void {
     this.propUsages.clear()
     this.eventUsages.clear()
@@ -315,7 +577,7 @@ export class WorkspaceIndex {
 
   private addProvideDefinitions(file: VueFileIndex): void {
     for (const provide of file.scriptIndex.provides) {
-      addUsage(this.provideDefinitions, provide.key, { file, span: provide.keySpan })
+      addUsage(this.provideDefinitions, provide.key, { file, span: provide.keySpan, sourceLocation: provide.sourceLocation })
     }
   }
 
@@ -338,13 +600,13 @@ export class WorkspaceIndex {
     for (const call of file.refMethodCalls) {
       const childUri = this.resolveRefComponent(file, call.refName)
       if (childUri) {
-        addUsage(this.refMethodUsages, usageKey(childUri, call.methodName), { file, span: call.methodSpan })
+        addUsage(this.refMethodUsages, usageKey(childUri, call.methodName), { file, span: call.methodSpan, sourceLocation: call.sourceLocation })
       }
     }
 
     for (const inject of file.scriptIndex.injects) {
       for (const provider of this.findProvideDefinitions(file, inject.key)) {
-        addUsage(this.injectUsages, usageKey(provider.file.uri, inject.key), { file, span: inject.keySpan })
+        addUsage(this.injectUsages, usageKey(provider.file.uri, inject.key), { file, span: inject.keySpan, sourceLocation: inject.sourceLocation })
       }
     }
   }
@@ -572,6 +834,66 @@ export class WorkspaceIndex {
 
     return [...keys]
   }
+}
+
+function mergeNamed<T>(own: T[], mixed: T[], keyOf: (item: T) => string): T[] {
+  const seen = new Set(own.map(keyOf))
+  const results = [...own]
+  for (const item of mixed) {
+    const key = keyOf(item)
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    results.push(item)
+  }
+  return results
+}
+
+function mixinKey(mixin: MixinReference): string {
+  return `${mixin.targetUri ?? ''}\0${mixin.importedName ?? 'default'}`
+}
+
+function withSourceLocations(scriptIndex: ScriptIndex, source: (span: TextSpan) => SourceLocation): ScriptIndex {
+  return {
+    ...scriptIndex,
+    props: scriptIndex.props.map((item) => ({ ...item, sourceLocation: source(item.span) })),
+    methods: scriptIndex.methods.map((item) => ({ ...item, sourceLocation: source(item.span) })),
+    emits: scriptIndex.emits.map((item) => ({ ...item, sourceLocation: source(item.eventSpan) })),
+    provides: scriptIndex.provides.map((item) => ({ ...item, sourceLocation: source(item.keySpan) })),
+    injects: scriptIndex.injects.map((item) => ({ ...item, sourceLocation: source(item.keySpan) })),
+  }
+}
+
+function withRefSourceLocation(call: RefMethodAccess, offset: number, source: (span: TextSpan) => SourceLocation): RefMethodAccess {
+  const methodSpan = { start: call.methodSpan.start + offset, end: call.methodSpan.end + offset }
+  return {
+    ...call,
+    methodSpan,
+    sourceLocation: source(methodSpan),
+  }
+}
+
+function containsSourceOffset(sourceLocation: SourceLocation | undefined, sourceUri: string, offset: number): boolean {
+  return sourceLocation?.uri === sourceUri
+    && offset >= sourceLocation.span.start
+    && offset < sourceLocation.span.end
+}
+
+function dedupeUsages(usages: UsageInfo[]): UsageInfo[] {
+  const seen = new Set<string>()
+  const results: UsageInfo[] = []
+  for (const usage of usages) {
+    const uri = usage.sourceLocation?.uri ?? usage.file.uri
+    const span = usage.sourceLocation?.span ?? usage.span
+    const key = `${uri}\0${span.start}\0${span.end}`
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    results.push(usage)
+  }
+  return results
 }
 
 async function walkIndexableFiles(root: string, visit: (file: string) => Promise<void>, token?: IndexCancellationToken): Promise<void> {

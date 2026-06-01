@@ -1,52 +1,90 @@
 import * as vscode from 'vscode'
-import type { TextSpan, VueFileIndex } from '../indexer/types'
+import type { SourceLocation, TextSpan, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex } from '../indexer/workspaceIndex'
 import { findIndexedInjectUsages, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findIndexedTemplatePropUsages } from '../indexer/relationResolver'
-import { containsOffsetStrict, spanToRange } from '../utils/position'
+import { containsOffsetStrict, createLineStarts, positionToOffset, spanToRange } from '../utils/position'
 
 function toRange(file: VueFileIndex, span: TextSpan): vscode.Range {
   const range = spanToRange(file.lineStarts, span)
   return new vscode.Range(range.start.line, range.start.character, range.end.line, range.end.character)
 }
 
-function toLocation(file: VueFileIndex, span: TextSpan): vscode.Location {
+function toLocation(file: VueFileIndex, span: TextSpan, sourceLocation?: SourceLocation): vscode.Location {
+  if (sourceLocation) {
+    const range = spanToRange(sourceLocation.lineStarts, sourceLocation.span)
+    return new vscode.Location(
+      vscode.Uri.file(sourceLocation.uri),
+      new vscode.Range(range.start.line, range.start.character, range.end.line, range.end.character),
+    )
+  }
   return new vscode.Location(vscode.Uri.file(file.uri), toRange(file, span))
+}
+
+function isVueDocument(document: vscode.TextDocument): boolean {
+  return document.languageId === 'vue' || document.uri.fsPath.endsWith('.vue')
+}
+
+function offsetInDocument(document: vscode.TextDocument, position: vscode.Position): number | undefined {
+  return positionToOffset(createLineStarts(document.getText()), { line: position.line, character: position.character })
 }
 
 export class VueReferenceProvider implements vscode.ReferenceProvider {
   constructor(private readonly index: WorkspaceIndex) {}
 
   provideReferences(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.Location[]> {
-    const file = this.index.syncContent(document.uri.fsPath, document.getText())
-    const offset = this.index.offsetAt(document.uri.fsPath, position.line, position.character)
+    const file = isVueDocument(document)
+      ? this.index.syncContent(document.uri.fsPath, document.getText())
+      : this.index.getFile(document.uri.fsPath)
+    const offset = isVueDocument(document)
+      ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
+      : offsetInDocument(document, position)
     if (offset === undefined) {
+      return []
+    }
+
+    const sourceReferences = this.index.hasMixinSource(document.uri.fsPath)
+      ? this.sourceReferences(document.uri.fsPath, offset)
+      : []
+    if (sourceReferences.length > 0) {
+      return sourceReferences
+    }
+    if (!file) {
       return []
     }
 
     for (const method of file.scriptIndex.methods) {
       if (containsOffsetStrict(method.span, offset)) {
-        return findIndexedRefMethodUsages(this.index, file.uri, method.name).map((usage) => toLocation(usage.file, usage.span))
+        return findIndexedRefMethodUsages(this.index, file.uri, method.name).map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
       }
     }
 
     for (const prop of file.scriptIndex.props) {
       if (containsOffsetStrict(prop.span, offset)) {
-        return findIndexedTemplatePropUsages(this.index, file.uri, prop.name).map((usage) => toLocation(usage.file, usage.span))
+        return findIndexedTemplatePropUsages(this.index, file.uri, prop.name).map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
       }
     }
 
     for (const emit of file.scriptIndex.emits) {
       if (containsOffsetStrict(emit.eventSpan, offset)) {
-        return findIndexedTemplateEventUsages(this.index, file.uri, emit.eventName).map((usage) => toLocation(usage.file, usage.span))
+        return findIndexedTemplateEventUsages(this.index, file.uri, emit.eventName).map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
       }
     }
 
     for (const provide of file.scriptIndex.provides) {
       if (containsOffsetStrict(provide.keySpan, offset)) {
-        return findIndexedInjectUsages(this.index, file.uri, provide.key).map((usage) => toLocation(usage.file, usage.span))
+        return findIndexedInjectUsages(this.index, file.uri, provide.key).map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
       }
     }
 
     return []
+  }
+
+  private sourceReferences(sourceUri: string, offset: number): vscode.Location[] {
+    return [
+      ...this.index.findRefMethodUsagesFromSource(sourceUri, offset),
+      ...this.index.findTemplatePropUsagesFromSource(sourceUri, offset),
+      ...this.index.findTemplateEventUsagesFromSource(sourceUri, offset),
+      ...this.index.findInjectUsagesFromProvideSource(sourceUri, offset),
+    ].map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
   }
 }

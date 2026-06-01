@@ -8,9 +8,8 @@ const fixtureRoot = path.resolve(__dirname, '../test-fixtures/vue2-basic')
 
 class TestDocument {
   uri: { fsPath: string }
-  languageId = 'vue'
 
-  constructor(public filePath: string, private readonly content: string) {
+  constructor(public filePath: string, private readonly content: string, public languageId = 'vue') {
     this.uri = { fsPath: filePath }
   }
 
@@ -126,6 +125,67 @@ describe('Vue providers', () => {
     expect(hoverText(hover)).toContain('async load()')
     expect(hoverText(hover)).toContain('Definition: [Child.vue]')
   })
+
+  it('静态 mixin 中的定义和 $refs 引用 provider 可用', () => {
+    const parentContent = readFixture('MixinParent.vue')
+    const innerContent = readFixture('MixinInner.vue')
+    const parentDocument = new TestDocument(path.join(fixtureRoot, 'MixinParent.vue'), parentContent) as any
+    const innerDocument = new TestDocument(path.join(fixtureRoot, 'MixinInner.vue'), innerContent) as any
+    const definitionProvider = new VueDefinitionProvider(index)
+    const referenceProvider = new VueReferenceProvider(index)
+    const completionProvider = new VueCompletionProvider(index)
+
+    const propDefinition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf(':mixed-title') + 2)) as any
+    const eventDefinition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('@mixed-save') + 1)) as any[]
+    const methodDefinition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('mixedMethod()') + 1)) as any
+    const completions = completionProvider.provideCompletionItems(parentDocument, positionAt(parentContent, parentContent.indexOf('this.$refs.mixinChild.') + 'this.$refs.mixinChild.'.length)) as any[]
+    const innerReferences = referenceProvider.provideReferences(innerDocument, positionAt(innerContent, innerContent.indexOf('focus()') + 1)) as any[]
+
+    expect(propDefinition.uri.fsPath).toBe(path.join(fixtureRoot, 'mixin-default.js'))
+    expect(eventDefinition[0].uri.fsPath).toBe(path.join(fixtureRoot, 'mixin-default.js'))
+    expect(methodDefinition.uri.fsPath).toBe(path.join(fixtureRoot, 'mixin-default.js'))
+    expect(completions.map((item) => item.label)).toContain('mixedMethod')
+    expect(completions.map((item) => item.label)).toContain('namedMethod')
+    expect(completions.map((item) => item.label)).toContain('nestedMethod')
+    expect(innerReferences[0].uri.fsPath).toBe(path.join(fixtureRoot, 'mixin-default.js'))
+  })
+
+  it('JS mixin 源文件中的定义、悬浮和引用 provider 可用', () => {
+    const mixinContent = readFixture('mixin-default.js')
+    const mixinDocument = new TestDocument(path.join(fixtureRoot, 'mixin-default.js'), mixinContent, 'javascript') as any
+    const definitionProvider = new VueDefinitionProvider(index)
+    const referenceProvider = new VueReferenceProvider(index)
+    const hoverProvider = new VueHoverProvider(index)
+    const completionProvider = new VueCompletionProvider(index)
+
+    const eventDefinitions = definitionProvider.provideDefinition(mixinDocument, positionAt(mixinContent, mixinContent.indexOf("'mixed-save'") + 2)) as any[]
+    const refDefinition = definitionProvider.provideDefinition(mixinDocument, positionAt(mixinContent, mixinContent.indexOf('focus?.') + 1)) as any[]
+    const propHover = hoverProvider.provideHover(mixinDocument, positionAt(mixinContent, mixinContent.indexOf('mixedTitle') + 1)) as any
+    const methodReferences = referenceProvider.provideReferences(mixinDocument, positionAt(mixinContent, mixinContent.indexOf('mixedMethod') + 1)) as any[]
+    const completions = completionProvider.provideCompletionItems(mixinDocument, positionAt(mixinContent, mixinContent.indexOf('this.$refs?.inner?.') + 'this.$refs?.inner?.'.length)) as any[]
+
+    expect(eventDefinitions[0].uri.fsPath).toBe(path.join(fixtureRoot, 'MixinParent.vue'))
+    expect(refDefinition[0].uri.fsPath).toBe(path.join(fixtureRoot, 'MixinInner.vue'))
+    expect(hoverText(propHover)).toContain('Used by 1 template prop')
+    expect(methodReferences[0].uri.fsPath).toBe(path.join(fixtureRoot, 'MixinParent.vue'))
+    expect(completions.map((item) => item.label)).toEqual(['focus'])
+  })
+
+  it('Vue mixin 源文件中的引用按消费组件查询', () => {
+    const sourceContent = readFixture('MixinVueSource.vue')
+    const sourceDocument = new TestDocument(path.join(fixtureRoot, 'MixinVueSource.vue'), sourceContent) as any
+    const referenceProvider = new VueReferenceProvider(index)
+    const hoverProvider = new VueHoverProvider(index)
+
+    const propReferences = referenceProvider.provideReferences(sourceDocument, positionAt(sourceContent, sourceContent.indexOf('vueMixedTitle') + 1)) as any[]
+    const methodReferences = referenceProvider.provideReferences(sourceDocument, positionAt(sourceContent, sourceContent.indexOf('vueMixedMethod') + 1)) as any[]
+    const propHover = hoverProvider.provideHover(sourceDocument, positionAt(sourceContent, sourceContent.indexOf('vueMixedTitle') + 1)) as any
+
+    expect(propReferences[0].uri.fsPath).toBe(path.join(fixtureRoot, 'MixinVueParent.vue'))
+    expect(methodReferences[0].uri.fsPath).toBe(path.join(fixtureRoot, 'MixinVueParent.vue'))
+    expect(hoverText(propHover)).toContain('Used by 1 template prop')
+  })
+
   it('$emit 与 template 事件双向定义跳转可用', () => {
     const childContent = readFixture('Child.vue')
     const parentContent = readFixture('Parent.vue')

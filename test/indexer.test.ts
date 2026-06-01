@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { WorkspaceIndex, findRefMethodAccess } from '../src/indexer/workspaceIndex'
-import { findEmit, findProp, findRefComponent, findRefMethodUsages, findRegisteredComponent, findTemplateEventUsages, findTemplatePropUsages } from '../src/indexer/relationResolver'
+import { findEmit, findMethod, findProp, findRefComponent, findRefMethodUsages, findRegisteredComponent, findTemplateEventUsages, findTemplatePropUsages } from '../src/indexer/relationResolver'
 
 const fixtureRoot = path.resolve(__dirname, '../test-fixtures/vue2-basic')
 
@@ -286,6 +286,85 @@ export default {
     }))
     expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
     expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(1)
+  })
+
+  it('合并静态 mixin 中的 props、methods、emits、provide、inject 和 $refs 调用', async () => {
+    const index = await buildIndex()
+    const child = index.getFile(path.join(fixtureRoot, 'MixinChild.vue'))!
+    const inner = index.getFile(path.join(fixtureRoot, 'MixinInner.vue'))!
+    const defaultMixinUri = path.join(fixtureRoot, 'mixin-default.js')
+    const namedMixinUri = path.join(fixtureRoot, 'mixin-named.js')
+    const nestedMixinUri = path.join(fixtureRoot, 'mixin-nested.js')
+
+    expect(child.scriptIndex.mixins.map((mixin) => [mixin.localName, mixin.importedName, mixin.targetUri])).toEqual([
+      ['baseMixin', undefined, defaultMixinUri],
+      ['aliasedMixin', 'namedMixin', namedMixinUri],
+    ])
+    expect(findProp(child, 'mixedTitle')?.sourceLocation?.uri).toBe(defaultMixinUri)
+    expect(findProp(child, 'nestedTitle')?.sourceLocation?.uri).toBe(nestedMixinUri)
+    expect(findMethod(child, 'mixedMethod')?.sourceLocation?.uri).toBe(defaultMixinUri)
+    expect(findMethod(child, 'namedMethod')?.sourceLocation?.uri).toBe(namedMixinUri)
+    expect(findMethod(child, 'nestedMethod')?.sourceLocation?.uri).toBe(nestedMixinUri)
+    expect(findEmit(child, 'mixed-save')[0]?.sourceLocation?.uri).toBe(defaultMixinUri)
+    expect(child.scriptIndex.provides.find((provide) => provide.key === 'sharedService')?.sourceLocation?.uri).toBe(defaultMixinUri)
+    expect(child.scriptIndex.injects.find((inject) => inject.key === 'sharedService')?.sourceLocation?.uri).toBe(namedMixinUri)
+
+    expect(index.findTemplatePropUsages(child.uri, 'mixedTitle')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(child.uri, 'nestedTitle')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(child.uri, 'mixed-save')).toHaveLength(1)
+    expect(index.findRefMethodUsages(child.uri, 'mixedMethod')).toHaveLength(1)
+    expect(index.findRefMethodUsages(child.uri, 'namedMethod')).toHaveLength(1)
+    expect(index.findRefMethodUsages(child.uri, 'nestedMethod')).toHaveLength(1)
+    expect(index.findRefMethodUsages(inner.uri, 'focus')[0]?.sourceLocation?.uri).toBe(defaultMixinUri)
+    expect(index.findProvideDefinitions(child, 'sharedService')[0]?.sourceLocation?.uri).toBe(defaultMixinUri)
+    expect(index.findInjectUsages(child.uri, 'sharedService')[0]?.sourceLocation?.uri).toBe(namedMixinUri)
+  })
+
+  it('忽略动态 mixin 表达式', () => {
+    const index = new WorkspaceIndex()
+    const file = index.indexContent(path.join(fixtureRoot, 'DynamicMixin.vue'), `
+<template><div /></template>
+<script>
+import baseMixin from './mixin-default'
+export default {
+  mixins: [enabled ? baseMixin : null],
+}
+</script>
+`)
+
+    expect(file.scriptIndex.mixins).toHaveLength(0)
+    expect(file.scriptIndex.props).toHaveLength(0)
+    expect(file.scriptIndex.methods).toHaveLength(0)
+  })
+
+  it('静态 mixin 循环引用不会导致递归解析', () => {
+    const index = new WorkspaceIndex()
+    const file = index.indexContent(path.join(fixtureRoot, 'CycleMixinConsumer.vue'), `
+<template><div /></template>
+<script>
+import cycleA from './mixin-cycle-a'
+export default {
+  mixins: [cycleA],
+}
+</script>
+`)
+
+    expect(file.scriptIndex.methods.map((method) => method.name).sort()).toEqual(['cycleA', 'cycleB'])
+  })
+
+  it('命名导出不存在时不会把同文件其他 mixin 的 emit 合并进来', () => {
+    const index = new WorkspaceIndex()
+    const file = index.indexContent(path.join(fixtureRoot, 'MissingNamedMixinConsumer.vue'), `
+<template><div /></template>
+<script>
+import { missingMixin } from './mixin-export-miss'
+export default {
+  mixins: [missingMixin],
+}
+</script>
+`)
+
+    expect(findEmit(file, 'other-event')).toHaveLength(0)
   })
 
   it('解析静态 provide 和 inject 关系', () => {

@@ -13,6 +13,12 @@ export interface TextSpan {
   end: number
 }
 
+export interface SourceLocation {
+  uri: string
+  lineStarts: number[]
+  span: TextSpan
+}
+
 export interface SfcBlock {
   content: string
   start: number
@@ -31,6 +37,15 @@ export interface ParsedSfc {
 export interface ImportInfo {
   localName: string
   source: string
+  importedName?: string
+}
+
+export interface MixinReference {
+  localName: string
+  source?: string
+  importedName?: string
+  targetUri?: string
+  span: TextSpan
 }
 
 export interface ComponentRegistration {
@@ -65,6 +80,7 @@ export interface PropInfo {
   span: TextSpan
   detail: string
   documentation?: string
+  sourceLocation?: SourceLocation
 }
 
 export interface MethodInfo {
@@ -73,12 +89,14 @@ export interface MethodInfo {
   detail: string
   signature: string
   documentation?: string
+  sourceLocation?: SourceLocation
 }
 
 export interface EmitInfo {
   eventName: string
   eventSpan: TextSpan
   callSpan: TextSpan
+  sourceLocation?: SourceLocation
 }
 
 export interface ProvideInfo {
@@ -86,6 +104,7 @@ export interface ProvideInfo {
   keySpan: TextSpan
   detail: string
   documentation?: string
+  sourceLocation?: SourceLocation
 }
 
 export interface InjectInfo {
@@ -94,11 +113,13 @@ export interface InjectInfo {
   localName: string
   localSpan: TextSpan
   detail: string
+  sourceLocation?: SourceLocation
 }
 
 export interface ScriptIndex {
   componentName?: string
   imports: ImportInfo[]
+  mixins: MixinReference[]
   components: ComponentRegistration[]
   props: PropInfo[]
   methods: MethodInfo[]
@@ -142,9 +163,11 @@ export interface RefMethodAccess {
   refName: string
   methodName: string
   methodSpan: TextSpan
+  sourceLocation?: SourceLocation
 }
 
 export interface UsageInfo {
   file: VueFileIndex
   span: TextSpan
+  sourceLocation?: SourceLocation
 }

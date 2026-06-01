@@ -20,6 +20,7 @@ A VS Code extension that improves Vue 2 component navigation for Options API `.v
 | `provide` / `inject` navigation | Yes | Navigate from static `inject` keys to matching `provide` keys, and from `provide` keys back to static inject consumers. |
 | `provide` / `inject` hover and references | Yes | Shows provider/consumer summaries and returns inject references for static provide keys. |
 | Local component relationships | Yes | Resolves static default imports, static aliases, and async component registrations such as `() => import('./Child.vue')` or `resolve => require(['./Child.vue'], resolve)` in the `components` option. Component tag definition jumps for local components are intentionally left to the official Vue tooling to avoid duplicate definitions. |
+| Static mixin relationships | Yes | Merges statically imported `mixins: [foo]` from workspace `.js`, `.ts`, or `.vue` files, including `export default { ... }` and `export const foo = { ... }` object-literal mixins. Mixin props, methods, emits, provide/inject, local components, and `$refs` method calls participate in navigation. |
 | Global component relationships | Yes | Resolves static `Vue.component(...)` / `app.component(...)` style registrations when the tag and imported component can be proven statically. |
 | `Component.name` global registration | Yes | Supports `Vue.component(Component.name, Component)` by reading the imported `.vue` component `name`. |
 | Constant tag global registration | Yes | Supports patterns like `const name = 'MyComponent'; Vue.component(name, MyComponent)`. |
@@ -35,6 +36,7 @@ A VS Code extension that improves Vue 2 component navigation for Options API `.v
 | Vue version | Vue 2 Options API | The parser is optimized for Vue 2 Options API SFCs. |
 | Vue 3 / `<script setup>` | Not supported | Official Vue tooling already covers most modern Vue navigation better. |
 | Dynamic component registrations | Not supported | Component registrations that cannot be proven statically are skipped instead of guessed to avoid false positives. Static async imports are supported. |
+| Dynamic or global mixins | Not supported | Only statically imported local `mixins: [...]` entries are merged. `Vue.mixin(...)`, spread, conditional mixins, and package mixins are ignored. |
 | Dynamic refs / prop names / event names | Not supported | Only static relationships are indexed. |
 | Dynamic provide / inject keys | Not supported | Only static string/object keys are indexed; runtime ancestor/descendant scope is not inferred. |
 | Local component tag definition jump | Intentionally not handled | Avoids duplicate definitions with the official Vue extension. Other relationships for local components are still supported. |

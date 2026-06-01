@@ -23,16 +23,20 @@ function getRegisteredComponentCache(parent: VueFileIndex): Map<string, string |
 }
 
 export function resolveImportPath(fromUri: string, source: string, workspaceRoots: string[] = []): string | undefined {
+  return resolveImportPathWithExtensions(fromUri, source, workspaceRoots, ['.vue'])
+}
+
+export function resolveImportPathWithExtensions(fromUri: string, source: string, workspaceRoots: string[] = [], extensions: string[] = ['.vue']): string | undefined {
   if (!source.startsWith('.')) {
-    return resolveFromTsConfig(fromUri, source, workspaceRoots)
+    return resolveFromTsConfig(fromUri, source, workspaceRoots, extensions)
   }
 
   const base = path.dirname(fromUri)
   const resolved = path.resolve(base, source)
-  return path.extname(resolved) ? resolved : `${resolved}.vue`
+  return withDefaultExtensions(resolved, extensions)
 }
 
-function resolveFromTsConfig(fromUri: string, source: string, workspaceRoots: string[]): string | undefined {
+function resolveFromTsConfig(fromUri: string, source: string, workspaceRoots: string[], extensions: string[]): string | undefined {
   const config = findNearestTsConfig(path.dirname(fromUri), workspaceRoots)
   if (!config) {
     return undefined
@@ -46,7 +50,7 @@ function resolveFromTsConfig(fromUri: string, source: string, workspaceRoots: st
 
     for (const target of targets) {
       const resolved = path.resolve(config.configDir, config.baseUrl, target.replace('*', wildcard))
-      return withDefaultVueExtension(resolved)
+      return withDefaultExtensions(resolved, extensions)
     }
   }
 
@@ -133,8 +137,26 @@ function matchPathAlias(alias: string, source: string): string | undefined {
   return source.slice(prefix.length, source.length - suffix.length)
 }
 
-function withDefaultVueExtension(resolved: string): string {
-  return path.extname(resolved) ? resolved : `${resolved}.vue`
+function withDefaultExtensions(resolved: string, extensions: string[]): string {
+  if (path.extname(resolved)) {
+    return resolved
+  }
+
+  for (const extension of extensions) {
+    const candidate = `${resolved}${extension}`
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  for (const extension of extensions) {
+    const candidate = path.join(resolved, `index${extension}`)
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  return `${resolved}${extensions[0]}`
 }
 
 function stripJsonComments(content: string): string {
@@ -277,7 +299,7 @@ export function findRefMethodUsages(files: VueFileIndex[], childUri: string, met
       if (call.methodName !== methodName || findRefComponent(file, call.refName) !== childUri) {
         continue
       }
-      results.push({ file, span: call.methodSpan })
+      results.push({ file, span: call.methodSpan, sourceLocation: call.sourceLocation })
     }
   }
 

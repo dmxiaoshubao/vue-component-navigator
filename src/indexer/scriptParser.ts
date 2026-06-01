@@ -1,5 +1,5 @@
-import type { ComponentRegistration, ImportInfo, PropInfo, ProvideInfo, ScriptIndex, TextSpan } from './types'
-import { resolveImportPath } from './relationResolver'
+import type { ComponentRegistration, ImportInfo, MixinReference, PropInfo, ProvideInfo, ScriptIndex, TextSpan } from './types'
+import { resolveImportPath, resolveImportPathWithExtensions } from './relationResolver'
 import { findCodeToken, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
 interface PropertyValue {
@@ -140,7 +140,7 @@ function findMatchingBracket(content: string, openIndex: number): number {
   return content.length - 1
 }
 
-function findExportObject(content: string): { open: number, close: number } | undefined {
+function findDefaultExportObject(content: string): { open: number, close: number } | undefined {
   const exportIndex = findCodeToken(content, 'export default')
   if (exportIndex === -1) {
     return undefined
@@ -161,6 +161,51 @@ function findExportObject(content: string): { open: number, close: number } | un
   }
 
   return undefined
+}
+
+function findNamedExportObject(content: string, exportName: string): { open: number, close: number } | undefined {
+  let index = 0
+
+  while (index < content.length) {
+    const exportIndex = findCodeToken(content, 'export', index)
+    if (exportIndex === -1) {
+      return undefined
+    }
+
+    let cursor = skipTrivia(content, exportIndex + 'export'.length)
+    const declaration = readIdentifier(content, cursor)
+    if (!declaration || !['const', 'let', 'var'].includes(declaration.value)) {
+      index = exportIndex + 'export'.length
+      continue
+    }
+
+    cursor = skipTrivia(content, declaration.end)
+    const name = readIdentifier(content, cursor)
+    if (name?.value !== exportName) {
+      index = declaration.end
+      continue
+    }
+
+    cursor = skipTrivia(content, name.end)
+    if (content[cursor] !== '=') {
+      index = name.end
+      continue
+    }
+
+    cursor = skipTrivia(content, cursor + 1)
+    if (content[cursor] === '{') {
+      return { open: cursor, close: findMatchingBracket(content, cursor) }
+    }
+    index = cursor
+  }
+
+  return undefined
+}
+
+function findExportObject(content: string, exportName = 'default'): { open: number, close: number } | undefined {
+  return exportName === 'default'
+    ? findDefaultExportObject(content)
+    : findNamedExportObject(content, exportName)
 }
 
 function findTopLevelProperty(content: string, open: number, close: number, name: string): PropertyValue | undefined {
@@ -358,26 +403,89 @@ function parseImports(content: string): ImportInfo[] {
       break
     }
 
-    const localName = readIdentifier(content, skipTrivia(content, importIndex + 'import'.length))
-    if (!localName) {
+    const clauseStart = skipTrivia(content, importIndex + 'import'.length)
+    if (content[clauseStart] === '(') {
       index = importIndex + 'import'.length
       continue
     }
 
-    const fromIndex = findCodeToken(content, 'from', localName.end)
+    const fromIndex = findImportFromIndex(content, clauseStart)
     if (fromIndex === -1) {
-      index = localName.end
+      index = importIndex + 'import'.length
       continue
     }
 
     const source = readStringLiteral(content, skipTrivia(content, fromIndex + 'from'.length))
     if (source) {
-      imports.push({ localName: localName.value, source: source.value })
+      imports.push(...parseImportClause(content.slice(clauseStart, fromIndex).trim(), source.value))
       index = source.end + 1
       continue
     }
 
     index = fromIndex + 'from'.length
+  }
+
+  return imports
+}
+
+function findImportFromIndex(content: string, start: number): number {
+  let depth = 0
+
+  for (let index = start; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = content[index]
+    if (char === '{') {
+      depth += 1
+      continue
+    }
+    if (char === '}') {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth === 0 && isCodeTokenAt(content, 'from', index)) {
+      return index
+    }
+    if (depth === 0 && char === ';') {
+      return -1
+    }
+  }
+
+  return -1
+}
+
+function parseImportClause(clause: string, source: string): ImportInfo[] {
+  const imports: ImportInfo[] = []
+  const namedStart = clause.indexOf('{')
+  const defaultClause = namedStart === -1 ? clause : clause.slice(0, namedStart).replace(/,$/, '').trim()
+  const defaultName = readIdentifier(defaultClause, 0)
+  if (defaultName) {
+    imports.push({ localName: defaultName.value, source })
+  }
+
+  if (namedStart === -1) {
+    return imports
+  }
+
+  const namedEnd = clause.indexOf('}', namedStart + 1)
+  if (namedEnd === -1) {
+    return imports
+  }
+
+  for (const part of clause.slice(namedStart + 1, namedEnd).split(',')) {
+    const match = /^\s*([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*$/.exec(part)
+    if (!match) {
+      continue
+    }
+    imports.push({
+      localName: match[2] ?? match[1],
+      importedName: match[1],
+      source,
+    })
   }
 
   return imports
@@ -622,6 +730,84 @@ function parseComponents(content: string, components: PropertyValue | undefined,
   return results
 }
 
+function parseMixins(content: string, mixins: PropertyValue | undefined, imports: ImportInfo[], uri: string, scriptStart: number, workspaceRoots: string[]): MixinReference[] {
+  if (!mixins || content[mixins.valueStart] !== '[') {
+    return []
+  }
+
+  const importMap = new Map(imports.map((item) => [item.localName, item]))
+  const results: MixinReference[] = []
+  let index = mixins.valueStart + 1
+  const end = mixins.valueEnd - 1
+
+  while (index < end) {
+    index = skipTrivia(content, index)
+    if (content[index] === ',') {
+      index += 1
+      continue
+    }
+
+    const entryEnd = findArrayEntryEnd(content, index, end)
+    const identifier = readIdentifier(content, index)
+    if (!identifier || skipTrivia(content, identifier.end) !== entryEnd) {
+      index = entryEnd + 1
+      continue
+    }
+
+    const imported = importMap.get(identifier.value)
+    const source = imported?.source
+    results.push({
+      localName: identifier.value,
+      importedName: imported?.importedName,
+      source,
+      targetUri: source ? resolveImportPathWithExtensions(uri, source, workspaceRoots, ['.js', '.ts', '.vue']) : undefined,
+      span: { start: scriptStart + identifier.start, end: scriptStart + identifier.end },
+    })
+    index = entryEnd + 1
+  }
+
+  return results
+}
+
+function findArrayEntryEnd(content: string, start: number, end: number): number {
+  let index = start
+  let depth = 0
+
+  while (index < end) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped
+      continue
+    }
+
+    const char = content[index]
+    if (char === '(' || char === '[' || char === '{') {
+      depth += 1
+      index += 1
+      continue
+    }
+    if (char === ')' || char === ']' || char === '}') {
+      depth = Math.max(0, depth - 1)
+      index += 1
+      continue
+    }
+    if (char === ',' && depth === 0) {
+      return skipWhitespaceBackward(content, index - 1, start)
+    }
+    index += 1
+  }
+
+  return skipWhitespaceBackward(content, end - 1, start)
+}
+
+function skipWhitespaceBackward(content: string, index: number, min: number): number {
+  let cursor = index
+  while (cursor >= min && /\s/.test(content[cursor])) {
+    cursor -= 1
+  }
+  return cursor + 1
+}
+
 function parseProps(content: string, props: PropertyValue | undefined, scriptStart: number): PropInfo[] {
   if (!props) {
     return []
@@ -704,11 +890,11 @@ function parseMethods(content: string, methods: PropertyValue | undefined, scrip
   return results
 }
 
-function parseEmits(content: string, scriptStart: number): ScriptIndex['emits'] {
+function parseEmits(content: string, scriptStart: number, start = 0, end = content.length): ScriptIndex['emits'] {
   const emits: ScriptIndex['emits'] = []
   const emitToken = 'this.$emit'
 
-  for (let index = 0; index < content.length; index += 1) {
+  for (let index = start; index < end; index += 1) {
     const skipped = skipStringCommentOrRegex(content, index)
     if (skipped !== undefined) {
       index = skipped - 1
@@ -720,13 +906,13 @@ function parseEmits(content: string, scriptStart: number): ScriptIndex['emits'] 
     }
 
     let cursor = skipTrivia(content, index + emitToken.length)
-    if (content[cursor] !== '(') {
+    if (content[cursor] !== '(' || cursor >= end) {
       continue
     }
 
     cursor = skipTrivia(content, cursor + 1)
     const literal = readStringLiteral(content, cursor)
-    if (!literal) {
+    if (!literal || literal.end > end) {
       continue
     }
 
@@ -856,14 +1042,15 @@ function readInjectFrom(content: string, member: PropertyValue): { value: string
   return result
 }
 
-export function parseScript(uri: string, content: string, scriptStart: number, workspaceRoots: string[] = []): ScriptIndex {
+export function parseScript(uri: string, content: string, scriptStart: number, workspaceRoots: string[] = [], exportName = 'default'): ScriptIndex {
   const imports = parseImports(content)
-  const exportObject = findExportObject(content)
+  const exportObject = findExportObject(content, exportName)
   if (!exportObject) {
-    return { imports, components: [], props: [], methods: [], emits: parseEmits(content, scriptStart), provides: [], injects: [] }
+    return { imports, mixins: [], components: [], props: [], methods: [], emits: exportName === 'default' ? parseEmits(content, scriptStart) : [], provides: [], injects: [] }
   }
 
   const nameProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'name')
+  const mixinsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'mixins')
   const componentsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'components')
   const propsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'props')
   const methodsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'methods')
@@ -873,10 +1060,11 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
   return {
     componentName: nameProperty ? parseStringLiteral(content, nameProperty.valueStart, nameProperty.valueEnd) : undefined,
     imports,
+    mixins: parseMixins(content, mixinsProperty, imports, uri, scriptStart, workspaceRoots),
     components: parseComponents(content, componentsProperty, imports, uri, scriptStart, workspaceRoots),
     props: parseProps(content, propsProperty, scriptStart),
     methods: parseMethods(content, methodsProperty, scriptStart),
-    emits: parseEmits(content, scriptStart),
+    emits: parseEmits(content, scriptStart, exportObject.open, exportObject.close),
     provides: parseProvides(content, provideProperty, scriptStart),
     injects: parseInjects(content, injectProperty, scriptStart),
   }
