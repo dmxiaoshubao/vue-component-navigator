@@ -77,6 +77,7 @@ export const informationMessages: string[] = []
 export const warningMessages: string[] = []
 export const quickPickCalls: Array<{ items: any[], options?: any }> = []
 export const shownDocuments: Array<{ uri: Uri, options?: any }> = []
+export const providerRegistrations: string[] = []
 
 function disposable(): Disposable {
   return { dispose() {} }
@@ -94,15 +95,28 @@ export function resetMockState(): void {
   warningMessages.length = 0
   quickPickCalls.length = 0
   shownDocuments.length = 0
+  providerRegistrations.length = 0
   workspace.workspaceFolders = []
   window.activeTextEditor = undefined
 }
 
 export const languages = {
-  registerDefinitionProvider: () => disposable(),
-  registerCompletionItemProvider: () => disposable(),
-  registerHoverProvider: () => disposable(),
-  registerReferenceProvider: () => disposable(),
+  registerDefinitionProvider: () => {
+    providerRegistrations.push('definition')
+    return disposable()
+  },
+  registerCompletionItemProvider: () => {
+    providerRegistrations.push('completion')
+    return disposable()
+  },
+  registerHoverProvider: () => {
+    providerRegistrations.push('hover')
+    return disposable()
+  },
+  registerReferenceProvider: () => {
+    providerRegistrations.push('reference')
+    return disposable()
+  },
 }
 
 export const commands = {

@@ -1,3 +1,4 @@
+import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as vscode from 'vscode'
 import type { SourceLocation, TextSpan, UsageInfo, VueFileIndex } from './indexer/types'
@@ -15,6 +16,15 @@ type UsageCommandArgs =
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
   | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'method' | 'event' | 'provide' | 'inject' }
+
+type PackageDependencies = Record<string, string | undefined> | undefined
+
+interface PackageJson {
+  dependencies?: PackageDependencies
+  devDependencies?: PackageDependencies
+  peerDependencies?: PackageDependencies
+  optionalDependencies?: PackageDependencies
+}
 
 function usageLabel(file: VueFileIndex, span: TextSpan, label: string, sourceLocation?: SourceLocation): string {
   const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
@@ -36,6 +46,9 @@ export function activate(context: vscode.ExtensionContext): void {
     { language: 'typescript', scheme: 'file' },
   ]
   const pendingSyncTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const featureDisposables: vscode.Disposable[] = []
+  let vue2Workspace: boolean | undefined
+  let featuresRegistered = false
   let indexStatus: 'idle' | 'indexing' | 'ready' | 'failed' | 'cancelled' = 'idle'
 
   function clearPendingSync(filePath: string): void {
@@ -131,6 +144,106 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  function registerWorkspaceFeatures(): void {
+    if (featuresRegistered) {
+      return
+    }
+    featuresRegistered = true
+    featureDisposables.push(
+      vscode.languages.registerDefinitionProvider(selector, new VueDefinitionProvider(index)),
+      vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?'),
+      vscode.languages.registerHoverProvider(selector, new VueHoverProvider(index)),
+      vscode.languages.registerReferenceProvider(selector, new VueReferenceProvider(index)),
+      vscode.workspace.onDidSaveTextDocument((document) => {
+        if (document.languageId === 'vue' && document.uri.scheme === 'file') {
+          clearPendingSync(document.uri.fsPath)
+          index.syncContent(document.uri.fsPath, document.getText())
+          void refreshGlobalComponentsForVueFile(document.uri.fsPath)
+        } else if (isScriptFile(document.uri.fsPath) && document.uri.scheme === 'file') {
+          void syncGlobalComponentFile(document.uri.fsPath)
+        }
+      }),
+      vscode.workspace.onDidChangeTextDocument((event) => {
+        const document = event.document
+        if (document.languageId === 'vue' && document.uri.scheme === 'file') {
+          scheduleSync(document.uri.fsPath, document.getText())
+        }
+      }),
+      vscode.workspace.onDidDeleteFiles((event) => {
+        for (const file of event.files) {
+          if (file.fsPath.endsWith('.vue')) {
+            clearPendingSync(file.fsPath)
+            index.remove(file.fsPath)
+            void refreshGlobalComponentsForVueFile(file.fsPath)
+          } else if (isScriptFile(file.fsPath)) {
+            index.removeGlobalComponentFile(file.fsPath)
+          }
+        }
+      }),
+      vscode.workspace.onDidCreateFiles(async (event) => {
+        await Promise.all(event.files.map((file) => {
+          if (file.fsPath.endsWith('.vue')) {
+            return indexVueFile(file.fsPath).then(refreshGlobalComponentsFromVueFiles)
+          }
+          if (isScriptFile(file.fsPath)) {
+            return syncGlobalComponentFile(file.fsPath)
+          }
+          return Promise.resolve()
+        }))
+      }),
+      vscode.workspace.onDidRenameFiles(async (event) => {
+        for (const file of event.files) {
+          if (file.oldUri.fsPath.endsWith('.vue')) {
+            clearPendingSync(file.oldUri.fsPath)
+            index.remove(file.oldUri.fsPath)
+            await refreshGlobalComponentsForVueFile(file.oldUri.fsPath)
+          } else if (isScriptFile(file.oldUri.fsPath)) {
+            index.removeGlobalComponentFile(file.oldUri.fsPath)
+          }
+          if (file.newUri.fsPath.endsWith('.vue')) {
+            clearPendingSync(file.newUri.fsPath)
+            await indexVueFile(file.newUri.fsPath)
+            await refreshGlobalComponentsFromVueFiles()
+          } else if (isScriptFile(file.newUri.fsPath)) {
+            await syncGlobalComponentFile(file.newUri.fsPath)
+          }
+        }
+      }),
+      vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+        if (await ensureVue2Workspace(false)) {
+          await indexWorkspaceFolders('Indexing Vue files...', false)
+        }
+      }),
+    )
+  }
+
+  function disableWorkspaceFeatures(): void {
+    for (const disposable of featureDisposables.splice(0)) {
+      disposable.dispose()
+    }
+    featuresRegistered = false
+    for (const timer of pendingSyncTimers.values()) {
+      clearTimeout(timer)
+    }
+    pendingSyncTimers.clear()
+    index.replaceWith(new WorkspaceIndex())
+  }
+
+  async function ensureVue2Workspace(showMessage: boolean): Promise<boolean> {
+    vue2Workspace = await hasVue2Workspace()
+    if (!vue2Workspace) {
+      disableWorkspaceFeatures()
+      indexStatus = 'idle'
+      if (showMessage) {
+        void vscode.window.showInformationMessage('Vue Component Navigator is disabled because no Vue 2 dependency was found in workspace package.json.')
+      }
+      return false
+    }
+
+    registerWorkspaceFeatures()
+    return true
+  }
+
   function resolveUsages(args: UsageCommandArgs): { usages: UsageInfo[], placeHolder: string } {
     if (args.kind === 'source-usages') {
       if (args.relation === 'prop') {
@@ -201,11 +314,15 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.window.showInformationMessage([
         `Vue Component Navigator indexed ${index.getFileCount()} Vue files.`,
         `Index status: ${indexStatus}.`,
+        `Vue 2 package detected: ${vue2Workspace === undefined ? 'unknown' : vue2Workspace ? 'yes' : 'no'}.`,
         activeDocument ? `Current language: ${activeDocument.languageId}.` : 'No active editor.',
         activeDocument ? `Current file indexed: ${indexedCurrentFile ? 'yes' : 'no'}.` : '',
       ].filter(Boolean).join(' '))
     }),
     vscode.commands.registerCommand('vueComponentNavigator.reindexWorkspace', async () => {
+      if (!await ensureVue2Workspace(true)) {
+        return
+      }
       await indexWorkspaceFolders('Reindexing Vue files...', true)
     }),
     vscode.commands.registerCommand(SHOW_USAGES_COMMAND, async (args: UsageCommandArgs) => {
@@ -234,83 +351,59 @@ export function activate(context: vscode.ExtensionContext): void {
       const range = toVsCodeRange(selected.file, selected.span, selected.sourceLocation)
       await vscode.window.showTextDocument(vscode.Uri.file(selected.sourceLocation?.uri ?? selected.file.uri), { selection: range, preview: true })
     }),
-    vscode.languages.registerDefinitionProvider(selector, new VueDefinitionProvider(index)),
-    vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?'),
-    vscode.languages.registerHoverProvider(selector, new VueHoverProvider(index)),
-    vscode.languages.registerReferenceProvider(selector, new VueReferenceProvider(index)),
-    vscode.workspace.onDidSaveTextDocument((document) => {
-      if (document.languageId === 'vue' && document.uri.scheme === 'file') {
-        clearPendingSync(document.uri.fsPath)
-        index.syncContent(document.uri.fsPath, document.getText())
-        void refreshGlobalComponentsForVueFile(document.uri.fsPath)
-      } else if (isScriptFile(document.uri.fsPath) && document.uri.scheme === 'file') {
-        void syncGlobalComponentFile(document.uri.fsPath)
-      }
-    }),
-    vscode.workspace.onDidChangeTextDocument((event) => {
-      const document = event.document
-      if (document.languageId === 'vue' && document.uri.scheme === 'file') {
-        scheduleSync(document.uri.fsPath, document.getText())
-      }
-    }),
-    vscode.workspace.onDidDeleteFiles((event) => {
-      for (const file of event.files) {
-        if (file.fsPath.endsWith('.vue')) {
-          clearPendingSync(file.fsPath)
-          index.remove(file.fsPath)
-          void refreshGlobalComponentsForVueFile(file.fsPath)
-        } else if (isScriptFile(file.fsPath)) {
-          index.removeGlobalComponentFile(file.fsPath)
-        }
-      }
-    }),
-    vscode.workspace.onDidCreateFiles(async (event) => {
-      await Promise.all(event.files.map((file) => {
-        if (file.fsPath.endsWith('.vue')) {
-          return indexVueFile(file.fsPath).then(refreshGlobalComponentsFromVueFiles)
-        }
-        if (isScriptFile(file.fsPath)) {
-          return syncGlobalComponentFile(file.fsPath)
-        }
-        return Promise.resolve()
-      }))
-    }),
-    vscode.workspace.onDidRenameFiles(async (event) => {
-      for (const file of event.files) {
-        if (file.oldUri.fsPath.endsWith('.vue')) {
-          clearPendingSync(file.oldUri.fsPath)
-          index.remove(file.oldUri.fsPath)
-          await refreshGlobalComponentsForVueFile(file.oldUri.fsPath)
-        } else if (isScriptFile(file.oldUri.fsPath)) {
-          index.removeGlobalComponentFile(file.oldUri.fsPath)
-        }
-        if (file.newUri.fsPath.endsWith('.vue')) {
-          clearPendingSync(file.newUri.fsPath)
-          await indexVueFile(file.newUri.fsPath)
-          await refreshGlobalComponentsFromVueFiles()
-        } else if (isScriptFile(file.newUri.fsPath)) {
-          await syncGlobalComponentFile(file.newUri.fsPath)
-        }
-      }
-    }),
-    vscode.workspace.onDidChangeWorkspaceFolders(() => {
-      void indexWorkspaceFolders('Indexing Vue files...', false)
-    }),
     {
       dispose: () => {
-        for (const timer of pendingSyncTimers.values()) {
-          clearTimeout(timer)
-        }
-        pendingSyncTimers.clear()
+        disableWorkspaceFeatures()
       },
     },
   )
 
-  void indexWorkspaceFolders('Indexing Vue files...', false)
+  void ensureVue2Workspace(false).then((enabled) => {
+    if (enabled) {
+      void indexWorkspaceFolders('Indexing Vue files...', false)
+    }
+  })
 }
 
 export function deactivate(): void {}
 
 function isScriptFile(filePath: string): boolean {
   return filePath.endsWith('.js') || filePath.endsWith('.ts')
+}
+
+async function hasVue2Workspace(): Promise<boolean> {
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    if (await hasVue2PackageJson(folder.uri.fsPath)) {
+      return true
+    }
+  }
+  return false
+}
+
+async function hasVue2PackageJson(root: string): Promise<boolean> {
+  try {
+    const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8')) as PackageJson
+    return packageHasVue2(pkg)
+  } catch {
+    return false
+  }
+}
+
+export function packageHasVue2(pkg: PackageJson): boolean {
+  const version = pkg.dependencies?.vue
+    ?? pkg.devDependencies?.vue
+    ?? pkg.peerDependencies?.vue
+    ?? pkg.optionalDependencies?.vue
+  return typeof version === 'string' && isVue2Version(version)
+}
+
+export function isVue2Version(version: string): boolean {
+  const normalized = version.trim().toLowerCase()
+  if (/^(?:npm:vue@)?[\^~]?\s*2(?:$|[.\s*x-])/.test(normalized)) {
+    return true
+  }
+  if (/\b2\.(?:x|\*)\b/.test(normalized)) {
+    return true
+  }
+  return /(?:^|\s)(?:>=|>|=)?\s*2(?:$|[.\s*x-])/.test(normalized) && /(?:^|\s)<\s*3(?:$|[.\s*x-])/.test(normalized)
 }

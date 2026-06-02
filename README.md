@@ -1,6 +1,6 @@
 # vue-component-navigator
 
-A VS Code extension that improves Vue 2 component navigation for Options API `.vue` single-file components.
+A VS Code extension that improves Vue 2 Options API component navigation, references, hover, and completions for statically provable component relationships.
 
 > 中文文档: [README.zh-CN.md](./README.zh-CN.md)
 
@@ -9,6 +9,7 @@ A VS Code extension that improves Vue 2 component navigation for Options API `.v
 | Area | Supported | Notes |
 | --- | --- | --- |
 | `$refs` method definition | Yes | Navigate from `this.$refs.child.method()` to the child component method. Optional chaining like `this.$refs.child?.method()` and `this.$refs?.child?.method()` is supported. |
+| `$refs` name completion | Yes | Completes template `ref` names after `this.$refs`, `this.$refs.`, and `this.$refs?.`, including refs from Vue files that statically consume the current mixin source. Ref completion items are prioritized in the suggestion list. |
 | `$refs` method completion | Yes | Completes methods from the statically resolved child component and gives them higher sort priority. |
 | `$refs` method hover | Yes | Shows method signature, JSDoc summary, params, and definition link when available. |
 | `$emit` to template listeners | Yes | Navigate from `this.$emit('event')` to parent template listeners. Multiple listeners are returned when found. |
@@ -17,15 +18,17 @@ A VS Code extension that improves Vue 2 component navigation for Options API `.v
 | Template prop / prop definition hover | Yes | Shows prop definition detail, JSDoc summary, definition links, and template usage summaries for prop definitions. |
 | Template event hover | Yes | Shows emit definition links for template listeners and usage summaries for emit sites. |
 | Prop / event / ref reverse references | Yes | Finds parent template prop usages, event listeners, and `$refs` method calls through the indexed relationship graph. |
-| `provide` / `inject` navigation | Yes | Navigate from static `inject` keys to matching `provide` keys, and from `provide` keys back to static inject consumers. |
+| `provide` / `inject` navigation | Yes | Navigate from static `inject` keys to matching `provide` keys, and from `provide` keys back to static inject consumers. Matching is scoped to the statically known parent chain and prefers the nearest provider per chain. |
 | `provide` / `inject` hover and references | Yes | Shows provider/consumer summaries and returns inject references for static provide keys. |
+| `inject` key completion | Yes | Completes known static `provide` keys inside `inject: ['']`, object-form local keys, and object-form `from: ''` values, scoped by the current component or static mixin consumers. |
 | Local component relationships | Yes | Resolves static default imports, static aliases, and async component registrations such as `() => import('./Child.vue')` or `resolve => require(['./Child.vue'], resolve)` in the `components` option. Component tag definition jumps for local components are intentionally left to the official Vue tooling to avoid duplicate definitions. |
-| Static mixin relationships | Yes | Merges statically imported `mixins: [foo]` from workspace `.js`, `.ts`, or `.vue` files, including `export default { ... }` and `export const foo = { ... }` object-literal mixins. Mixin props, methods, emits, provide/inject, local components, and `$refs` method calls participate in navigation. |
-| Global component relationships | Yes | Resolves static `Vue.component(...)` / `app.component(...)` style registrations when the tag and imported component can be proven statically. |
+| Static mixin relationships | Yes | Merges statically imported `mixins: [foo]` from workspace `.js`, `.ts`, or `.vue` files, including `export default { ... }` and `export const foo = { ... }` object-literal mixins. Mixin props, methods, emits, provide/inject, local components, and `$refs` calls participate in navigation, hover, references, and completions where a static consumer can be found. |
+| Global component relationships | Yes | Resolves static `Vue.component(...)` / `app.component(...)` style registrations when the tag and imported component can be proven statically. Global components participate in template prop, event, and `$refs` method providers. |
 | `Component.name` global registration | Yes | Supports `Vue.component(Component.name, Component)` by reading the imported `.vue` component `name`. |
 | Constant tag global registration | Yes | Supports patterns like `const name = 'MyComponent'; Vue.component(name, MyComponent)`. |
 | `require.context` global registration | Partial | Supports conservative Vue 2 auto-registration patterns like `require.context('./components', true, /\.vue$/)` and reads each `.vue` component `name`. |
 | `@/` alias imports | Yes | Resolves aliases from the nearest `tsconfig.json` or `jsconfig.json` using `compilerOptions.baseUrl` and `compilerOptions.paths`. No alias is guessed without config. |
+| Vue 2 workspace gating | Yes | Language providers and indexing are enabled only when a workspace `package.json` declares a Vue 2.x `vue` dependency. Vue 3 or non-Vue workspaces stay inactive except for extension commands. |
 | Workspace reindexing | Yes | Provides a `Vue Component Navigator: Reindex Workspace` command and keeps an in-memory index for fast provider responses. |
 | Incremental updates | Yes | Updates `.vue` file indexes on edit/save and refreshes global component mappings when related `.js`, `.ts`, or global component source files change. |
 

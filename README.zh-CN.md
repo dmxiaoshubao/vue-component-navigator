@@ -1,6 +1,6 @@
 # vue-component-navigator
 
-一个用于增强 Vue 2 Options API `.vue` 单文件组件导航能力的 VS Code 扩展。
+一个用于增强 Vue 2 Options API 静态组件关系导航、引用、悬浮和补全能力的 VS Code 扩展。
 
 > English documentation: [README.md](./README.md)
 
@@ -9,6 +9,7 @@
 | 能力范围 | 是否支持 | 说明 |
 | --- | --- | --- |
 | `$refs` 方法定义跳转 | 支持 | 从 `this.$refs.child.method()` 跳到子组件方法。支持 `this.$refs.child?.method()` 和 `this.$refs?.child?.method()`。 |
+| `$refs` 名称补全 | 支持 | 在 `this.$refs`、`this.$refs.`、`this.$refs?.` 后补全模板 `ref` 名称；JS/TS mixin 源文件会从静态消费它的 Vue 文件模板里收集 ref。ref 补全项会提高排序优先级。 |
 | `$refs` 方法补全 | 支持 | 基于静态解析到的子组件补全 methods，并提高排序优先级。 |
 | `$refs` 方法悬浮 | 支持 | 展示方法签名、JSDoc 摘要、参数和定义链接。 |
 | `$emit` 到模板监听 | 支持 | 从 `this.$emit('event')` 跳到父组件模板里的事件监听位置。 |
@@ -17,15 +18,17 @@
 | 模板 prop / prop 定义悬浮 | 支持 | 展示 prop 定义片段、JSDoc 摘要、定义链接，并在 prop 定义处展示模板使用概览。 |
 | 模板事件悬浮 | 支持 | 在模板监听处展示 emit 定义，在 emit 位置展示引用概览。 |
 | prop / event / ref 反向引用 | 支持 | 基于索引关系查找父组件模板 prop 使用、事件监听和 `$refs` 方法调用。 |
-| `provide` / `inject` 导航 | 支持 | 从静态 `inject` key 跳到匹配的 `provide` key，也支持从 `provide` key 反向跳到静态 inject 消费方。 |
+| `provide` / `inject` 导航 | 支持 | 从静态 `inject` key 跳到匹配的 `provide` key，也支持从 `provide` key 反向跳到静态 inject 消费方。匹配范围基于静态父组件链，并优先使用每条链上最近的 provider。 |
 | `provide` / `inject` 悬浮和引用 | 支持 | 展示 provider / consumer 概览，并为静态 provide key 返回 inject 引用。 |
+| `inject` key 补全 | 支持 | 在 `inject: ['']`、对象形式本地 key、对象形式 `from: ''` 中补全已知静态 `provide` key；范围基于当前组件或静态 mixin 消费组件。 |
 | 局部组件关系 | 支持 | 支持 `components` 中的静态 default import、静态别名，以及 `() => import('./Child.vue')` 或 `resolve => require(['./Child.vue'], resolve)` 这类异步组件注册。局部组件标签名跳转刻意交给 Vue 官方扩展，避免重复定义。 |
-| 静态 mixin 关系 | 支持 | 合并 workspace 内 `.js`、`.ts` 或 `.vue` 文件中静态 import 的 `mixins: [foo]`，支持 `export default { ... }` 和 `export const foo = { ... }` 对象字面量 mixin。mixin 内的 props、methods、emits、provide/inject、局部组件和 `$refs` 方法调用会参与导航。 |
-| 全局组件关系 | 支持 | 支持静态可证明的 `Vue.component(...)` / `app.component(...)` 风格全局注册。 |
+| 静态 mixin 关系 | 支持 | 合并 workspace 内 `.js`、`.ts` 或 `.vue` 文件中静态 import 的 `mixins: [foo]`，支持 `export default { ... }` 和 `export const foo = { ... }` 对象字面量 mixin。mixin 内的 props、methods、emits、provide/inject、局部组件和 `$refs` 调用，会在能找到静态消费组件时参与导航、悬浮、引用和补全。 |
+| 全局组件关系 | 支持 | 支持静态可证明的 `Vue.component(...)` / `app.component(...)` 风格全局注册。全局组件会参与模板 prop、event 和 `$refs` 方法相关 provider。 |
 | `Component.name` 全局注册 | 支持 | 支持 `Vue.component(Component.name, Component)`，会读取被 import 的 `.vue` 组件 `name`。 |
 | 常量组件名全局注册 | 支持 | 支持 `const name = 'MyComponent'; Vue.component(name, MyComponent)`。 |
 | `require.context` 全局注册 | 部分支持 | 保守支持 Vue 2 常见自动注册模式，如 `require.context('./components', true, /\.vue$/)`，并读取每个 `.vue` 的 `name`。 |
 | `@/` 别名 import | 支持 | 从最近的 `tsconfig.json` 或 `jsconfig.json` 读取 `compilerOptions.baseUrl` 和 `compilerOptions.paths`；没有配置时不额外猜测别名。 |
+| Vue 2 workspace 门禁 | 支持 | 只有 workspace 的 `package.json` 声明 Vue 2.x `vue` 依赖时，才启用语言 provider 和索引。Vue 3 或非 Vue workspace 除扩展命令外保持不活跃。 |
 | 工作区重建索引 | 支持 | 提供 `Vue Component Navigator: Reindex Workspace` 命令，并维护内存索引用于快速响应 provider。 |
 | 增量更新 | 支持 | `.vue` 编辑/保存会更新索引；相关 `.js`、`.ts` 或全局组件源文件变化时会刷新全局组件映射。 |
 

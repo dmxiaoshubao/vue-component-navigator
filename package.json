@@ -1,7 +1,7 @@
 {
   "name": "vue-component-navigator",
   "displayName": "Vue Component Navigator",
-  "description": "Vue 2 component navigation for refs, emits, and props in local .vue Options API components.",
+  "description": "Vue 2 Options API navigation, references, hover, and completions for refs, emits, props, provide/inject, mixins, and global components.",
   "version": "0.0.2",
   "publisher": "dmxiaoshubao",
   "author": "dmxiaoshubao",
@@ -23,11 +23,13 @@
     "navigation",
     "refs",
     "emit",
-    "props"
+    "props",
+    "provide",
+    "inject",
+    "mixins"
   ],
   "activationEvents": [
-    "onLanguage:vue",
-    "workspaceContains:**/*.vue",
+    "workspaceContains:**/package.json",
     "onCommand:vueComponentNavigator.showStatus",
     "onCommand:vueComponentNavigator.reindexWorkspace"
   ],
