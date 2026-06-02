@@ -2,10 +2,11 @@
   "name": "vue-component-navigator",
   "displayName": "Vue Component Navigator",
   "description": "Vue 2 Options API navigation, references, hover, and completions for refs, emits, props, provide/inject, mixins, and global components.",
-  "version": "0.0.2",
+  "version": "1.0.0",
   "publisher": "dmxiaoshubao",
   "author": "dmxiaoshubao",
   "license": "MIT",
+  "icon": "images/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/dmxiaoshubao/vue-component-navigator.git"
