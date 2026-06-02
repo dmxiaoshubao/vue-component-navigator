@@ -1130,6 +1130,7 @@ export interface RefCompletionContext {
 }
 
 export interface RefRootCompletionContext {
+  accessToken: '' | '.' | '?.'
   partialRefName: string
 }
 
@@ -1166,10 +1167,11 @@ function findRefCompletionContextInSearchableContent(searchableContent: string, 
 
 function findRefRootCompletionContextInSearchableContent(searchableContent: string, offset: number): RefRootCompletionContext | undefined {
   const prefix = searchableContent.slice(Math.max(0, offset - 80), offset)
-  const directMatch = /this\.\$refs(?:\.|\?\.)([A-Za-z_$][\w$]*)?$/.exec(prefix)
+  const directMatch = /this\.\$refs(\.|\?\.)?([A-Za-z_$][\w$]*)?$/.exec(prefix)
   if (directMatch) {
     return {
-      partialRefName: directMatch[1] ?? '',
+      accessToken: (directMatch[1] as '.' | '?.') ?? '',
+      partialRefName: directMatch[2] ?? '',
     }
   }
 
@@ -1179,6 +1181,7 @@ function findRefRootCompletionContextInSearchableContent(searchableContent: stri
   }
 
   return {
+    accessToken: '',
     partialRefName: '',
   }
 }

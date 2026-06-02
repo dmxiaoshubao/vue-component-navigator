@@ -48,20 +48,22 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
       return this.provideKeyCompletions(consumers, injectContext, position)
     }
 
+    const refRootContext = isVueDocument(document) && file
+      ? findRefRootCompletionContextInFile(file, offset)
+      : findRefRootCompletionContext(document.getText(), offset)
+    if (refRootContext) {
+      const consumers = file
+        ? [file]
+        : this.index.hasMixinSource(document.uri.fsPath)
+          ? this.index.findSourceConsumers(document.uri.fsPath)
+          : []
+      return this.refNameCompletions(consumers, refRootContext, position)
+    }
+
     const refContext = isVueDocument(document) && file
       ? findRefCompletionContextInFile(file, offset)
       : findRefCompletionContext(document.getText(), offset)
     if (!refContext) {
-      const refRootContext = isVueDocument(document) && file
-        ? findRefRootCompletionContextInFile(file, offset)
-        : findRefRootCompletionContext(document.getText(), offset)
-      if (!refRootContext || !file) {
-        return undefined
-      }
-      return this.refNameCompletions(file, refRootContext.partialRefName, position)
-    }
-
-    if (!file && !this.index.hasMixinSource(document.uri.fsPath)) {
       return undefined
     }
 
@@ -95,15 +97,15 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
     })
   }
 
-  private refNameCompletions(file: VueFileIndex, partialRefName: string, position: vscode.Position): vscode.CompletionItem[] | undefined {
-    const refNames = uniqueRefNames(file)
+  private refNameCompletions(consumers: VueFileIndex[], context: { accessToken: '' | '.' | '?.', partialRefName: string }, position: vscode.Position): vscode.CompletionItem[] | undefined {
+    const refNames = uniqueRefNames(consumers)
     if (refNames.length === 0) {
       return undefined
     }
 
     const range = new vscode.Range(
       position.line,
-      position.character - partialRefName.length,
+      position.character - context.partialRefName.length - context.accessToken.length,
       position.line,
       position.character,
     )
@@ -112,8 +114,8 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
       const item = new vscode.CompletionItem(refName, vscode.CompletionItemKind.Method)
       item.detail = 'template ref'
       item.range = range
-      item.insertText = refName
-      item.filterText = refName
+      item.insertText = `${context.accessToken}${refName}`
+      item.filterText = `${context.accessToken}${context.partialRefName}${refName}`
       item.sortText = `${HIGH_PRIORITY_SORT_PREFIX}${refName}`
       item.preselect = true
       return item
@@ -192,16 +194,18 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
   }
 }
 
-function uniqueRefNames(file: VueFileIndex): string[] {
+function uniqueRefNames(consumers: VueFileIndex[]): string[] {
   const seen = new Set<string>()
   const results: string[] = []
-  for (const component of file.templateIndex.components) {
-    for (const attr of component.attrs) {
-      if (attr.kind !== 'ref' || seen.has(attr.name)) {
-        continue
+  for (const consumer of consumers) {
+    for (const component of consumer.templateIndex.components) {
+      for (const attr of component.attrs) {
+        if (attr.kind !== 'ref' || seen.has(attr.name)) {
+          continue
+        }
+        seen.add(attr.name)
+        results.push(attr.name)
       }
-      seen.add(attr.name)
-      results.push(attr.name)
     }
   }
   return results
