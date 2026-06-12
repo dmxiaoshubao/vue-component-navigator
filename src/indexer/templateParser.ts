@@ -694,11 +694,11 @@ function parseTemplateExpressionEmits(expression: string, expressionStart: numbe
       index = skipped - 1
       continue
     }
-    if (!expression.startsWith('this.$emit', index) && !expression.startsWith('$emit', index)) {
+    const token = readTemplateEmitToken(expression, index)
+    if (!token) {
       continue
     }
 
-    const token = expression.startsWith('this.$emit', index) ? 'this.$emit' : '$emit'
     const tokenStart = index
     let cursor = skipWhitespace(expression, index + token.length)
     if (expression[cursor] !== '(') {
@@ -717,4 +717,22 @@ function parseTemplateExpressionEmits(expression: string, expressionStart: numbe
     })
   }
   return emits
+}
+
+function readTemplateEmitToken(expression: string, index: number): 'this.$emit' | '$emit' | undefined {
+  if (expression.startsWith('this.$emit', index) && hasEmitTokenBoundary(expression, index)) {
+    return 'this.$emit'
+  }
+
+  if (expression.startsWith('$emit', index) && hasEmitTokenBoundary(expression, index)) {
+    return '$emit'
+  }
+
+  return undefined
+}
+
+function hasEmitTokenBoundary(expression: string, index: number): boolean {
+  const previous = expression[index - 1]
+  // 避免把 $bus.$emit(...) 这类事件总线调用误判为当前组件 emit。
+  return previous === undefined || (!/[\w$]/.test(previous) && previous !== '.')
 }

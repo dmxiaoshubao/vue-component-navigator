@@ -248,6 +248,29 @@ function propDefinitionsHover(definitions: Array<{ child: VueFileIndex, prop: Pr
   return markdownHover(`Definitions:\n\n${links}`)
 }
 
+function methodDefinitionsHover(definitions: Array<{ child: VueFileIndex, method: MethodInfo }>, labels: Map<string, string>): vscode.Hover | undefined {
+  const unique = uniqueDefinitions(definitions.map(({ child, method }) => ({
+    child,
+    method,
+    span: method.span,
+    sourceLocation: method.sourceLocation,
+  })))
+  if (unique.length === 0) {
+    return undefined
+  }
+
+  if (unique.length === 1) {
+    const { child, method } = unique[0]
+    return methodHover(child, method, labelForDefinition(labels, child, method.sourceLocation))
+  }
+
+  const links = unique.map(({ child, method }) => {
+    const label = labelForDefinition(labels, child, method.sourceLocation)
+    return `- ${definitionLink(child, method.span, label, method.sourceLocation)}`
+  }).join('\n')
+  return markdownHover(`Definitions:\n\n${links}`)
+}
+
 function eventDefinitionsHover(definitions: Array<{ child: VueFileIndex, emit: EmitInfo }>, labels: Map<string, string>): vscode.Hover | undefined {
   const unique = uniqueDefinitions(definitions.map(({ child, emit }) => ({
     child,
@@ -334,11 +357,12 @@ export class VueHoverProvider implements vscode.HoverProvider {
 
     const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
-      const child = findResolvedRefComponents(this.index, file, refAccess.refName)
-        .map((childUri) => this.index.getFile(childUri))
-        .find((candidate): candidate is VueFileIndex => Boolean(candidate && findMethod(candidate, refAccess.methodName)))
-      const method = child ? findMethod(child, refAccess.methodName) : undefined
-      return child && method ? methodHover(child, method, labelForDefinition(definitionLabels(), child, method.sourceLocation)) : undefined
+      const definitions = findResolvedRefComponents(this.index, file, refAccess.refName).flatMap((childUri) => {
+        const child = this.index.getFile(childUri)
+        const method = child ? findMethod(child, refAccess.methodName) : undefined
+        return child && method ? [{ child, method }] : []
+      })
+      return methodDefinitionsHover(definitions, definitionLabels())
     }
 
     for (const component of file.templateIndex.components) {
@@ -413,8 +437,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
       })
     })
     if (refDefinitions.length > 0) {
-      const { child, method } = refDefinitions[0]
-      return methodHover(child, method, labelForDefinition(this.definitionLabels(), child, method.sourceLocation))
+      return methodDefinitionsHover(refDefinitions, this.definitionLabels())
     }
 
     const propUsages = this.index.findTemplatePropUsagesFromSource(sourceUri, offset)

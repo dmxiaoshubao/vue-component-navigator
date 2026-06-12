@@ -946,6 +946,64 @@ export default {
     expect(parentHover.contents.isTrusted).toBe(false)
   })
 
+  it('动态 ref 方法悬浮展示所有候选定义', () => {
+    const localIndex = new WorkspaceIndex()
+    const firstPath = path.join(fixtureRoot, 'DynamicRefFirst.vue')
+    const secondPath = path.join(fixtureRoot, 'DynamicRefSecond.vue')
+    const parentPath = path.join(fixtureRoot, 'DynamicRefHost.vue')
+    const firstContent = `
+<template><div /></template>
+<script>
+export default {
+  methods: {
+    open() {},
+  },
+}
+</script>
+`
+    const secondContent = `
+<template><div /></template>
+<script>
+export default {
+  methods: {
+    open() {},
+  },
+}
+</script>
+`
+    const parentContent = `
+<template>
+  <component :is="kind === 'first' ? 'DynamicRefFirst' : 'DynamicRefSecond'" ref="screen" />
+</template>
+<script>
+import DynamicRefFirst from './DynamicRefFirst.vue'
+import DynamicRefSecond from './DynamicRefSecond.vue'
+
+export default {
+  components: { DynamicRefFirst, DynamicRefSecond },
+  methods: {
+    callScreen() {
+      this.$refs.screen.open()
+    },
+  },
+}
+</script>
+`
+    localIndex.indexContent(firstPath, firstContent)
+    localIndex.indexContent(secondPath, secondContent)
+    localIndex.indexContent(parentPath, parentContent)
+    const document = new TestDocument(parentPath, parentContent) as any
+    const hoverProvider = new VueHoverProvider(localIndex)
+
+    const hover = hoverProvider.provideHover(document, positionAt(parentContent, parentContent.indexOf('open()') + 1)) as any
+
+    expect(hoverText(hover)).toContain('Definitions:')
+    expect(hoverText(hover)).toContain('DynamicRefFirst.vue')
+    expect(hoverText(hover)).toContain('DynamicRefSecond.vue')
+    expect(hoverText(hover)).not.toContain('```')
+    expect(hover.contents.isTrusted).toBe(false)
+  })
+
   it('多个消费组件展开同一个 mixin $refs 调用时 hover 使用位置去重', () => {
     const innerContent = readFixture('MixinInner.vue')
     const extraConsumerUri = path.join(fixtureRoot, 'MixinChildClone.vue')

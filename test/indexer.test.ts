@@ -461,6 +461,25 @@ export default {
     expect(index.findTemplateEventUsages(objectChild.uri, 'save')).toHaveLength(2)
   })
 
+  it('template $emit 只索引当前组件 emit 调用', () => {
+    const index = new WorkspaceIndex()
+    const file = index.indexContent(path.join(fixtureRoot, 'TemplateEmitBoundary.vue'), `
+<template>
+  <div>
+    <button @click="$emit('direct')" />
+    <button @click="this.$emit('explicit')" />
+    <button @click="$bus.$emit('bus')" />
+    <button @click="eventBus.$emit('event-bus')" />
+  </div>
+</template>
+<script>
+export default {}
+</script>
+`)
+
+    expect(file.scriptIndex.emits.map((emit) => emit.eventName)).toEqual(['direct', 'explicit'])
+  })
+
   it('忽略动态 mixin 表达式', () => {
     const index = new WorkspaceIndex()
     const file = index.indexContent(path.join(fixtureRoot, 'DynamicMixin.vue'), `
