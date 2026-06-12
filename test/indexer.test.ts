@@ -321,6 +321,146 @@ export default {
     expect(index.findInjectUsages(parent.uri, 'sharedService')[0]?.sourceLocation?.uri).toBe(namedMixinUri)
   })
 
+  it('静态可证明的动态组件参与 mixin prop、emit 和 ref 方法关系', () => {
+    const index = new WorkspaceIndex()
+    const mixinUri = path.join(fixtureRoot, 'mixin-default.js')
+    const normalUri = path.join(fixtureRoot, 'DynamicNormal.vue')
+    const bigUri = path.join(fixtureRoot, 'DynamicBig.vue')
+    const parentUri = path.join(fixtureRoot, 'DynamicHost.vue')
+    const childContent = `
+<template><div /></template>
+<script>
+import baseMixin from './mixin-default'
+export default { mixins: [baseMixin] }
+</script>
+`
+    const parent = index.indexContent(parentUri, `
+<template>
+  <component
+    :is="SCREEN_TYPE[themeType]"
+    ref="screen"
+    :mixed-title="title"
+    @mixed-save="onMixedSave"
+  />
+</template>
+<script>
+import DynamicNormal from './DynamicNormal.vue'
+import DynamicBig from './DynamicBig.vue'
+
+const SCREEN_TYPE = {
+  1: 'DynamicNormal',
+  2: 'DynamicBig',
+}
+
+export default {
+  components: { DynamicNormal, DynamicBig },
+  data() {
+    return { SCREEN_TYPE }
+  },
+  methods: {
+    callScreen() {
+      this.$refs.screen.mixedMethod()
+    },
+  },
+}
+</script>
+`)
+    index.indexContent(normalUri, childContent)
+    index.indexContent(bigUri, childContent)
+
+    const dynamicUsage = parent.templateIndex.components.find((component) => component.tag === 'component')!
+    const emitOffset = readFixture('mixin-default.js').indexOf("'mixed-save'") + 2
+    const propOffset = readFixture('mixin-default.js').indexOf('mixedTitle') + 1
+
+    expect(dynamicUsage.dynamicTags).toEqual(['DynamicNormal', 'DynamicBig'])
+    expect(index.resolveTemplateComponentUris(parent, dynamicUsage).sort()).toEqual([bigUri, normalUri].sort())
+    expect(index.findTemplatePropUsages(normalUri, 'mixedTitle')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(bigUri, 'mixedTitle')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(normalUri, 'mixed-save')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(bigUri, 'mixed-save')).toHaveLength(1)
+    expect(index.findRefMethodUsages(normalUri, 'mixedMethod')).toHaveLength(1)
+    expect(index.findRefMethodUsages(bigUri, 'mixedMethod')).toHaveLength(1)
+    expect(index.findTemplateEventUsagesFromSource(mixinUri, emitOffset)).toHaveLength(1)
+    expect(index.findTemplatePropUsagesFromSource(mixinUri, propOffset)).toHaveLength(1)
+  })
+
+  it('静态可证明的动态组件表达式和 template $emit 参与 event 关系', () => {
+    const index = new WorkspaceIndex()
+    const categoryUri = path.join(fixtureRoot, 'GoodsCategoryTypeList.vue')
+    const channelUri = path.join(fixtureRoot, 'GoodsChannelTypeList.vue')
+    const objectUri = path.join(fixtureRoot, 'ObjectChild.vue')
+    const parentUri = path.join(fixtureRoot, 'StaticDynamicExpressionHost.vue')
+    const category = index.indexContent(categoryUri, `
+<template><button @click="onAddToCart" /></template>
+<script>
+export default {
+  methods: {
+    onAddToCart() {
+      this.$emit('onAddToCart')
+    },
+  },
+}
+</script>
+`)
+    const channel = index.indexContent(channelUri, `
+<template>
+  <div>
+    $emit('fakeText')
+    <ProductItem
+      @onClick="$emit('onAddToCart', item)"
+      :title="'$emit(\\'fakeTitle\\')'"
+      label="$emit('fakeStaticAttr')"
+    />
+  </div>
+</template>
+<script>
+export default {}
+</script>
+`)
+    const objectChild = index.indexContent(objectUri, `
+<script>
+export default {
+  methods: {
+    save() {
+      this.$emit('save')
+    },
+  },
+}
+</script>
+`)
+    const parent = index.indexContent(parentUri, `
+<template>
+  <component :is="isCategoryMode ? 'GoodsCategoryTypeList' : 'GoodsChannelTypeList'" @onAddToCart="addToCartFromCard" />
+  <component :is="COMPONENTS[index]" @save="onSave" />
+  <component :is="isReady && ObjectChild" @save="onSave" />
+</template>
+<script>
+import GoodsCategoryTypeList from './GoodsCategoryTypeList.vue'
+import GoodsChannelTypeList from './GoodsChannelTypeList.vue'
+import ObjectChild from './ObjectChild.vue'
+
+const COMPONENTS = ['ObjectChild']
+
+export default {
+  components: { GoodsCategoryTypeList, GoodsChannelTypeList, ObjectChild },
+  data() {
+    return { COMPONENTS }
+  },
+}
+</script>
+`)
+
+    const dynamicUsages = parent.templateIndex.components.filter((component) => component.tag === 'component')
+
+    expect(dynamicUsages[0].dynamicTags).toEqual(['GoodsCategoryTypeList', 'GoodsChannelTypeList'])
+    expect(dynamicUsages[1].dynamicTags).toEqual(['ObjectChild'])
+    expect(dynamicUsages[2].dynamicTags).toEqual(['ObjectChild'])
+    expect(channel.scriptIndex.emits.map((emit) => emit.eventName)).toEqual(['onAddToCart'])
+    expect(index.findTemplateEventUsages(category.uri, 'onAddToCart')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(channel.uri, 'onAddToCart')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(objectChild.uri, 'save')).toHaveLength(2)
+  })
+
   it('忽略动态 mixin 表达式', () => {
     const index = new WorkspaceIndex()
     const file = index.indexContent(path.join(fixtureRoot, 'DynamicMixin.vue'), `

@@ -13,6 +13,7 @@ import { commonDirectory, relativePath, usagePathLabels } from './utils/pathDisp
 type UsageCommandArgs =
   | { kind?: 'event-listeners', childUri: string, eventName: string }
   | { kind: 'prop-usages', childUri: string, propName: string }
+  | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
   | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'method' | 'event' | 'provide' | 'inject' }
@@ -29,7 +30,7 @@ interface PackageJson {
 function usageLabel(file: VueFileIndex, span: TextSpan, label: string, sourceLocation?: SourceLocation): string {
   const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
   const position = offsetToPosition(location.lineStarts, location.span.start)
-  return `${label}:${position.line + 1}:${position.character + 1}`
+  return `${label}:${position.line + 1}`
 }
 
 function toVsCodeRange(file: VueFileIndex, span: TextSpan, sourceLocation?: SourceLocation): vscode.Range {
@@ -280,6 +281,13 @@ export function activate(context: vscode.ExtensionContext): void {
       return {
         usages: index.findTemplatePropUsages(args.childUri, args.propName),
         placeHolder: `Select ${args.propName} prop usage`,
+      }
+    }
+
+    if (args.kind === 'ref-method-usages') {
+      return {
+        usages: index.findRefMethodUsages(args.childUri, args.methodName),
+        placeHolder: `Select ${args.methodName} ref method usage`,
       }
     }
 

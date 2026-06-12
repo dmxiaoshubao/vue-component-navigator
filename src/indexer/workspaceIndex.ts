@@ -1,7 +1,7 @@
 import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { ComponentRegistration, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from './types'
+import type { ComponentRegistration, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex } from './types'
 import { guessGlobalComponentsFromRequireContext, parseGlobalComponents } from './globalComponentParser'
 import { parseSfc } from './sfcParser'
 import { parseScript } from './scriptParser'
@@ -124,9 +124,19 @@ export class WorkspaceIndex {
     return findRegisteredComponentInFile(parent, tag) ?? this.resolveGlobalComponent(tag, parent.uri)
   }
 
+  resolveTemplateComponentUris(parent: VueFileIndex, component: TemplateComponentUsage): string[] {
+    const tags = component.dynamicTags?.length ? component.dynamicTags : [component.tag]
+    return uniqueStrings(tags.map((tag) => this.resolveComponent(parent, tag)).filter((uri): uri is string => Boolean(uri)))
+  }
+
   resolveRefComponent(parent: VueFileIndex, refName: string): string | undefined {
     const usage = parent.templateIndex.components.find((component) => component.attrs.some((attr) => attr.kind === 'ref' && attr.name === refName))
-    return usage ? this.resolveComponent(parent, usage.tag) : undefined
+    return usage ? this.resolveTemplateComponentUris(parent, usage)[0] : undefined
+  }
+
+  resolveRefComponents(parent: VueFileIndex, refName: string): string[] {
+    const usage = parent.templateIndex.components.find((component) => component.attrs.some((attr) => attr.kind === 'ref' && attr.name === refName))
+    return usage ? this.resolveTemplateComponentUris(parent, usage) : []
   }
 
   indexContent(uri: string, content: string): VueFileIndex {
@@ -141,16 +151,20 @@ export class WorkspaceIndex {
     const sfc = parseSfc(uri, content)
     const ownScriptIndex = sfc.script
       ? parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots)
-      : { imports: [], mixins: [], components: [], props: [], methods: [], emits: [], provides: [], injects: [] }
+      : { imports: [], mixins: [], components: [], staticComponentNames: [], props: [], methods: [], emits: [], provides: [], injects: [] }
     const mixed = this.mergeStaticMixins(uri, ownScriptIndex)
-    const scriptIndex = mixed.scriptIndex
+    let scriptIndex = mixed.scriptIndex
     const registeredTags = [
       ...scriptIndex.components.flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
       ...this.getGlobalComponents().flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
     ]
     const templateIndex = sfc.template
-      ? parseTemplate(sfc.template.content, sfc.template.start, registeredTags)
-      : { components: [] }
+      ? parseTemplate(sfc.template.content, sfc.template.start, registeredTags, scriptIndex.staticComponentNames)
+      : { components: [], emits: [] }
+    scriptIndex = {
+      ...scriptIndex,
+      emits: [...scriptIndex.emits, ...templateIndex.emits],
+    }
     const searchableContent = maskStringsAndComments(sfc.content)
 
     const file: VueFileIndex = {
@@ -328,7 +342,7 @@ export class WorkspaceIndex {
   }
 
   findRefMethodUsages(childUri: string, methodName: string): UsageInfo[] {
-    return [...(this.refMethodUsages.get(usageKey(childUri, methodName)) ?? [])]
+    return dedupeUsages(this.refMethodUsages.get(usageKey(childUri, methodName)) ?? [])
   }
 
   findInjectUsages(providerUri: string, provideKey: string): UsageInfo[] {
@@ -708,25 +722,28 @@ export class WorkspaceIndex {
   private addRelationshipUsages(file: VueFileIndex): Set<string> {
     const relationshipChildren = new Set<string>()
     for (const component of file.templateIndex.components) {
-      const childUri = this.resolveComponent(file, component.tag)
-      if (!childUri) {
+      const childUris = this.resolveTemplateComponentUris(file, component)
+      if (childUris.length === 0) {
         continue
       }
-      addParent(this.parentComponents, childUri, file.uri)
-      relationshipChildren.add(childUri)
+      for (const childUri of childUris) {
+        addParent(this.parentComponents, childUri, file.uri)
+        relationshipChildren.add(childUri)
+      }
 
       for (const attr of component.attrs) {
-        if (attr.kind === 'prop') {
-          addUsage(this.propUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
-        } else if (attr.kind === 'event') {
-          addUsage(this.eventUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
+        for (const childUri of childUris) {
+          if (attr.kind === 'prop') {
+            addUsage(this.propUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
+          } else if (attr.kind === 'event') {
+            addUsage(this.eventUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
+          }
         }
       }
     }
 
     for (const call of file.refMethodCalls) {
-      const childUri = this.resolveRefComponent(file, call.refName)
-      if (childUri) {
+      for (const childUri of this.resolveRefComponents(file, call.refName)) {
         addUsage(this.refMethodUsages, usageKey(childUri, call.methodName), { file, span: call.methodSpan, sourceLocation: call.sourceLocation })
       }
     }
@@ -1202,6 +1219,10 @@ function findRegisteredComponentInFile(parent: VueFileIndex, tag: string): strin
 
 function usageKey(uri: string, name: string): string {
   return `${uri}\0${name}`
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)]
 }
 
 function addUsage(map: Map<string, UsageInfo[]>, key: string, usage: UsageInfo): void {

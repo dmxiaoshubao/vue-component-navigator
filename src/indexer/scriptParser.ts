@@ -1,4 +1,4 @@
-import type { ComponentRegistration, ImportInfo, MixinReference, PropInfo, ProvideInfo, ScriptIndex, TextSpan } from './types'
+import type { ComponentRegistration, ImportInfo, MixinReference, PropInfo, ProvideInfo, ScriptIndex, StaticComponentNameBinding, TextSpan } from './types'
 import { resolveImportPath, resolveImportPathWithExtensions } from './relationResolver'
 import { findCodeToken, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
@@ -662,6 +662,178 @@ function collectStaticComponentAliases(content: string, importSources: Map<strin
   return aliases
 }
 
+function readStaticCandidateValue(content: string, start: number, end: number): string | undefined {
+  const literal = readStringLiteral(content, start)
+  if (literal && skipTrivia(content, literal.end + 1) === end) {
+    return literal.value
+  }
+
+  const identifier = readIdentifier(content, start)
+  if (identifier && skipTrivia(content, identifier.end) === end) {
+    return identifier.value
+  }
+
+  return undefined
+}
+
+function readObjectStaticCandidateValues(content: string, objectStart: number, objectEnd: number): string[] {
+  const values: string[] = []
+  let index = objectStart + 1
+  let depth = 0
+
+  while (index < objectEnd) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped
+      continue
+    }
+
+    const char = content[index]
+    if (char === '{' || char === '[' || char === '(') {
+      depth += 1
+      index += 1
+      continue
+    }
+    if (char === '}' || char === ']' || char === ')') {
+      depth = Math.max(0, depth - 1)
+      index += 1
+      continue
+    }
+    if (depth !== 0 || char !== ':') {
+      index += 1
+      continue
+    }
+
+    const valueStart = skipTrivia(content, index + 1)
+    const valueEnd = findMemberValueEnd(content, valueStart, objectEnd)
+    const value = readStaticCandidateValue(content, valueStart, valueEnd)
+    if (value) {
+      values.push(value)
+      index = valueEnd
+      continue
+    }
+
+    index = valueEnd
+  }
+
+  return [...new Set(values)]
+}
+
+function readArrayStaticCandidateValues(content: string, arrayStart: number, arrayEnd: number): string[] {
+  const values: string[] = []
+  let index = arrayStart + 1
+
+  while (index < arrayEnd) {
+    index = skipTrivia(content, index)
+    if (content[index] === ',') {
+      index += 1
+      continue
+    }
+
+    const entryEnd = findArrayEntryEnd(content, index, arrayEnd)
+    const value = readStaticCandidateValue(content, index, entryEnd)
+    if (value) {
+      values.push(value)
+    }
+    index = entryEnd + 1
+  }
+
+  return [...new Set(values)]
+}
+
+function collectStaticComponentNameBindings(content: string): StaticComponentNameBinding[] {
+  const bindings: StaticComponentNameBinding[] = []
+  let depth = 0
+
+  for (let index = 0; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = content[index]
+    if (char === '{' || char === '[' || char === '(') {
+      depth += 1
+      continue
+    }
+    if (char === '}' || char === ']' || char === ')') {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth !== 0 || (!isCodeTokenAt(content, 'const', index) && !isCodeTokenAt(content, 'let', index) && !isCodeTokenAt(content, 'var', index))) {
+      continue
+    }
+
+    let cursor = skipTrivia(content, index + 3)
+    if (content.startsWith('const', index)) {
+      cursor = skipTrivia(content, index + 'const'.length)
+    }
+
+    while (cursor < content.length) {
+      const name = readIdentifier(content, cursor)
+      if (!name) {
+        break
+      }
+
+      cursor = skipTrivia(content, name.end)
+      const equals = findVariableInitializer(content, cursor)
+      if (equals === undefined) {
+        break
+      }
+
+      const valueStart = skipTrivia(content, equals + 1)
+      const valueEnd = findExpressionEnd(content, valueStart, content.length)
+      const expression = content.slice(valueStart, valueEnd).trim()
+      const literalOrIdentifier = readStaticCandidateValue(content, valueStart, valueEnd)
+
+      if (literalOrIdentifier) {
+        bindings.push({
+          variableName: name.value,
+          tags: [literalOrIdentifier],
+          kind: 'literal',
+          expression,
+        })
+      } else if (content[valueStart] === '{') {
+        const values = readObjectStaticCandidateValues(content, valueStart, findMatchingBracket(content, valueStart))
+        if (values.length > 0) {
+          bindings.push({
+            variableName: name.value,
+            tags: values,
+            kind: 'map',
+            expression,
+          })
+        }
+      } else if (content[valueStart] === '[') {
+        const values = readArrayStaticCandidateValues(content, valueStart, findMatchingBracket(content, valueStart))
+        if (values.length > 0) {
+          bindings.push({
+            variableName: name.value,
+            tags: values,
+            kind: 'array',
+            expression,
+          })
+        }
+      } else if (expression) {
+        bindings.push({
+          variableName: name.value,
+          tags: [],
+          kind: 'expression',
+          expression,
+        })
+      }
+
+      cursor = skipTrivia(content, valueEnd)
+      if (content[cursor] !== ',') {
+        break
+      }
+      cursor = skipTrivia(content, cursor + 1)
+    }
+  }
+
+  return bindings
+}
+
 function resolveStaticComponentAlias(name: string, aliases: Map<string, StaticComponentAlias>, importSources: Map<string, string>): StaticComponentAlias | undefined {
   let current = name
   const visited = new Set<string>()
@@ -1044,9 +1216,10 @@ function readInjectFrom(content: string, member: PropertyValue): { value: string
 
 export function parseScript(uri: string, content: string, scriptStart: number, workspaceRoots: string[] = [], exportName = 'default'): ScriptIndex {
   const imports = parseImports(content)
+  const staticComponentNames = exportName === 'default' ? collectStaticComponentNameBindings(content) : []
   const exportObject = findExportObject(content, exportName)
   if (!exportObject) {
-    return { imports, mixins: [], components: [], props: [], methods: [], emits: exportName === 'default' ? parseEmits(content, scriptStart) : [], provides: [], injects: [] }
+    return { imports, mixins: [], components: [], staticComponentNames, props: [], methods: [], emits: exportName === 'default' ? parseEmits(content, scriptStart) : [], provides: [], injects: [] }
   }
 
   const nameProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'name')
@@ -1062,6 +1235,7 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
     imports,
     mixins: parseMixins(content, mixinsProperty, imports, uri, scriptStart, workspaceRoots),
     components: parseComponents(content, componentsProperty, imports, uri, scriptStart, workspaceRoots),
+    staticComponentNames,
     props: parseProps(content, propsProperty, scriptStart),
     methods: parseMethods(content, methodsProperty, scriptStart),
     emits: parseEmits(content, scriptStart, exportObject.open, exportObject.close),

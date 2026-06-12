@@ -12,7 +12,7 @@
 | `$refs` 名称补全 | 支持 | 在 `this.$refs`、`this.$refs.`、`this.$refs?.` 后补全模板 `ref` 名称；JS/TS mixin 源文件会从静态消费它的 Vue 文件模板里收集 ref。ref 补全项会提高排序优先级。 |
 | `$refs` 方法补全 | 支持 | 基于静态解析到的子组件补全 methods，并提高排序优先级。 |
 | `$refs` 方法悬浮 | 支持 | 展示方法签名、JSDoc 摘要、参数和定义链接。 |
-| `$emit` 到模板监听 | 支持 | 从 `this.$emit('event')` 跳到父组件模板里的事件监听位置。 |
+| `$emit` 到模板监听 | 支持 | 从 `this.$emit('event')` 或 template 表达式里的 `$emit('event')` 跳到父组件模板里的事件监听位置。 |
 | 模板事件到子组件 emit | 支持 | 从 `@event` / `v-on:event` 跳到子组件内匹配的 `this.$emit('event')`。支持 `.once`、`.stop` 等修饰符。 |
 | 模板 prop 到子组件 prop | 支持 | 从 `:prop`、`v-bind:prop`、静态 prop、`.sync` prop 跳到子组件 prop 定义。 |
 | 模板 prop / prop 定义悬浮 | 支持 | 展示 prop 定义片段、JSDoc 摘要、定义链接，并在 prop 定义处展示模板使用概览。 |
@@ -22,6 +22,7 @@
 | `provide` / `inject` 悬浮和引用 | 支持 | 展示 provider / consumer 概览，并为静态 provide key 返回 inject 引用。 |
 | `inject` key 补全 | 支持 | 在 `inject: ['']`、对象形式本地 key、对象形式 `from: ''` 中补全已知静态 `provide` key；范围基于当前组件或静态 mixin 消费组件。 |
 | 局部组件关系 | 支持 | 支持 `components` 中的静态 default import、静态别名，以及 `() => import('./Child.vue')` 或 `resolve => require(['./Child.vue'], resolve)` 这类异步组件注册。局部组件标签名跳转刻意交给 Vue 官方扩展，避免重复定义。 |
+| 静态动态组件使用 | 支持 | 支持 `<component :is="Current">`、`<component :is="cond ? 'A' : 'B'">`、对象/数组映射、组件对象标识符和静态 `is="Child"` 中可证明的有限候选；候选组件会参与 prop、event、`$refs`、mixin 来源跳转、悬浮、引用和补全。 |
 | 静态 mixin 关系 | 支持 | 合并 workspace 内 `.js`、`.ts` 或 `.vue` 文件中静态 import 的 `mixins: [foo]`，支持 `export default { ... }` 和 `export const foo = { ... }` 对象字面量 mixin。mixin 内的 props、methods、emits、provide/inject、局部组件和 `$refs` 调用，会在能找到静态消费组件时参与导航、悬浮、引用和补全。 |
 | 全局组件关系 | 支持 | 支持静态可证明的 `Vue.component(...)` / `app.component(...)` 风格全局注册。全局组件会参与模板 prop、event 和 `$refs` 方法相关 provider。 |
 | `Component.name` 全局注册 | 支持 | 支持 `Vue.component(Component.name, Component)`，会读取被 import 的 `.vue` 组件 `name`。 |
@@ -38,7 +39,7 @@
 | --- | --- | --- |
 | Vue 版本 | Vue 2 Options API | 解析器面向 Vue 2 Options API SFC 做了优化。 |
 | Vue 3 / `<script setup>` | 不支持 | 现代 Vue 场景官方 Vue 工具通常覆盖得更好。 |
-| 动态组件注册 | 不支持 | 无法静态证明的组件注册不做猜测，避免误跳转；静态异步 import 支持。 |
+| 动态组件注册或拼接路径 | 不支持 | 无法静态证明的组件注册和 `import('./' + type + '.vue')` 这类拼接路径不做猜测，避免误跳转；静态动态组件使用和静态异步 import 支持。 |
 | 动态或全局 mixin | 不支持 | 只合并静态 import 的局部 `mixins: [...]`；`Vue.mixin(...)`、spread、条件 mixin 和 package mixin 会被忽略。 |
 | 动态 refs / prop 名 / event 名 | 不支持 | 只索引静态可证明的关系。 |
 | 动态 provide / inject key | 不支持 | 只索引静态字符串/对象 key；不会推断运行时祖先/后代作用域。 |

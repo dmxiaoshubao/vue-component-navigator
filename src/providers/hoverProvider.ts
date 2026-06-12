@@ -1,18 +1,21 @@
 import * as path from 'node:path'
 import * as vscode from 'vscode'
-import type { MethodInfo, PropInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
+import type { EmitInfo, MethodInfo, PropInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedTemplateEventUsages, findInject, findMethod, findProp, findProvideAtOffset, findResolvedComponent, findResolvedRefComponent } from '../indexer/relationResolver'
+import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findInject, findMethod, findProp, findProvideAtOffset, findResolvedRefComponents } from '../indexer/relationResolver'
 import { containsOffsetStrict, createLineStarts, offsetToPosition, positionToOffset } from '../utils/position'
 import { escapeMarkdownText, formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 import { commonDirectory, relativePath, shortestUniquePathLabels } from '../utils/pathDisplay'
 
 export const SHOW_USAGES_COMMAND = 'vueComponentNavigator.showUsages'
 const MAX_VISIBLE_USAGES = 5
+const OPTION_CONTAINERS = new Set(['methods', 'computed', 'watch'])
+const CONTROL_KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'function'])
 
 type UsageCommandArgs =
   | { kind: 'event-listeners', childUri: string, eventName: string }
   | { kind: 'prop-usages', childUri: string, propName: string }
+  | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
   | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'method' | 'event' | 'provide' | 'inject' }
@@ -56,6 +59,25 @@ function propHover(child: VueFileIndex, prop: PropInfo, label: string): vscode.H
   return markdownHover(`${docText}${markdownCodeBlock(formatCodeBlock(prop.detail))}\n\nDefinition: ${definitionLink(child, prop.span, label, prop.sourceLocation)}`)
 }
 
+function definitionKey(file: VueFileIndex, span: TextSpan, sourceLocation?: SourceLocation): string {
+  const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
+  return `${location.uri}\0${location.span.start}\0${location.span.end}`
+}
+
+function uniqueDefinitions<T extends { child: VueFileIndex, span: TextSpan, sourceLocation?: SourceLocation }>(definitions: T[]): T[] {
+  const seen = new Set<string>()
+  const results: T[] = []
+  for (const definition of definitions) {
+    const key = definitionKey(definition.child, definition.span, definition.sourceLocation)
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    results.push(definition)
+  }
+  return results
+}
+
 function labelForDefinition(labels: Map<string, string>, file: VueFileIndex, sourceLocation?: SourceLocation): string {
   const uri = sourceLocation?.uri ?? file.uri
   return labels.get(uri) ?? path.basename(uri)
@@ -74,7 +96,97 @@ function formatUsageLocation(file: VueFileIndex, span: TextSpan, baseDirectory: 
   const directoryText = directory && directory !== '.'
     ? ` - ${escapeMarkdownText(directory)}`
     : ''
-  return `- [${escapeMarkdownText(path.basename(location.uri))}](${target.toString()})${directoryText}`
+  const context = location.uri === file.uri
+    ? optionsApiContext(file, location.span.start)
+    : undefined
+  const contextText = context
+    ? `  \n  ${escapeMarkdownText(context)}`
+    : ''
+  return `- [${escapeMarkdownText(`${path.basename(location.uri)}:${position.line + 1}`)}](${target.toString()})${directoryText}${contextText}`
+}
+
+function optionsApiContext(file: VueFileIndex, offset: number): string | undefined {
+  if (!file.script || offset < file.script.start || offset > file.script.end) {
+    return undefined
+  }
+
+  const usageLine = offsetToPosition(file.lineStarts, offset).line
+  for (let line = usageLine; line >= 0; line -= 1) {
+    const text = lineText(file.content, file.lineStarts, line)
+    const member = optionMemberFromLine(text)
+    if (!member) {
+      continue
+    }
+
+    const container = findOptionContainer(file, line, member.indent)
+    return container ? `${container}.${member.name}` : member.name
+  }
+
+  return undefined
+}
+
+function lineText(content: string, lineStarts: number[], line: number): string {
+  const start = lineStarts[line] ?? 0
+  const end = lineStarts[line + 1] ?? content.length
+  return content.slice(start, end).replace(/\r?\n$/, '')
+}
+
+function indentation(line: string): number {
+  return /^\s*/.exec(line)?.[0].length ?? 0
+}
+
+function normalizePropertyName(name: string): string {
+  return name.replace(/^['"]|['"]$/g, '')
+}
+
+function optionMemberFromLine(line: string): { name: string, indent: number } | undefined {
+  const trimmed = line.trim()
+  if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('*')) {
+    return undefined
+  }
+
+  const shorthand = /^(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/.exec(trimmed)
+  if (shorthand && !CONTROL_KEYWORDS.has(shorthand[1])) {
+    return { name: shorthand[1], indent: indentation(line) }
+  }
+
+  const property = /^((?:[A-Za-z_$][\w$]*)|(?:['"][^'"]+['"]))\s*:\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/.exec(trimmed)
+  if (!property) {
+    return undefined
+  }
+
+  return { name: normalizePropertyName(property[1]), indent: indentation(line) }
+}
+
+function optionContainerFromLine(line: string): { name: string, indent: number } | undefined {
+  const match = /^((?:[A-Za-z_$][\w$]*)|(?:['"][^'"]+['"]))\s*:\s*\{/.exec(line.trim())
+  if (!match) {
+    return undefined
+  }
+
+  return { name: normalizePropertyName(match[1]), indent: indentation(line) }
+}
+
+function findOptionContainer(file: VueFileIndex, memberLine: number, memberIndent: number): string | undefined {
+  let maxIndent = memberIndent
+  for (let line = memberLine - 1; line >= 0; line -= 1) {
+    const text = lineText(file.content, file.lineStarts, line)
+    if (!text.trim()) {
+      continue
+    }
+
+    const container = optionContainerFromLine(text)
+    if (!container || container.indent >= maxIndent) {
+      continue
+    }
+    if (OPTION_CONTAINERS.has(container.name)) {
+      return container.name
+    }
+
+    maxIndent = container.indent
+  }
+
+  return undefined
 }
 
 function commandLink(args: UsageCommandArgs, label: string): string {
@@ -110,21 +222,54 @@ function usageSummary(
 }
 
 function eventHover(child: VueFileIndex, eventName: string, labels: Map<string, string>): vscode.Hover | undefined {
-  const emits = findEmit(child, eventName)
-  if (emits.length === 0) {
+  return eventDefinitionsHover(findEmit(child, eventName).map((emit) => ({ child, emit })), labels)
+}
+
+function propDefinitionsHover(definitions: Array<{ child: VueFileIndex, prop: PropInfo }>, labels: Map<string, string>): vscode.Hover | undefined {
+  const unique = uniqueDefinitions(definitions.map(({ child, prop }) => ({
+    child,
+    prop,
+    span: prop.span,
+    sourceLocation: prop.sourceLocation,
+  })))
+  if (unique.length === 0) {
     return undefined
   }
 
-  if (emits.length === 1) {
-    const label = labelForDefinition(labels, child, emits[0].sourceLocation)
-    return markdownHover(`Definition: ${definitionLink(child, emits[0].eventSpan, label, emits[0].sourceLocation)}`)
+  if (unique.length === 1) {
+    const { child, prop } = unique[0]
+    return propHover(child, prop, labelForDefinition(labels, child, prop.sourceLocation))
   }
 
-  const definitions = emits.map((emit) => {
+  const links = unique.map(({ child, prop }) => {
+    const label = labelForDefinition(labels, child, prop.sourceLocation)
+    return `- ${definitionLink(child, prop.span, label, prop.sourceLocation)}`
+  }).join('\n')
+  return markdownHover(`Definitions:\n\n${links}`)
+}
+
+function eventDefinitionsHover(definitions: Array<{ child: VueFileIndex, emit: EmitInfo }>, labels: Map<string, string>): vscode.Hover | undefined {
+  const unique = uniqueDefinitions(definitions.map(({ child, emit }) => ({
+    child,
+    emit,
+    span: emit.eventSpan,
+    sourceLocation: emit.sourceLocation,
+  })))
+  if (unique.length === 0) {
+    return undefined
+  }
+
+  if (unique.length === 1) {
+    const { child, emit } = unique[0]
+    const label = labelForDefinition(labels, child, emit.sourceLocation)
+    return markdownHover(`Definition: ${definitionLink(child, emit.eventSpan, label, emit.sourceLocation)}`)
+  }
+
+  const links = unique.map(({ child, emit }) => {
     const label = labelForDefinition(labels, child, emit.sourceLocation)
     return `- ${definitionLink(child, emit.eventSpan, label, emit.sourceLocation)}`
   }).join('\n')
-  return markdownHover(`Definitions:\n\n${definitions}`)
+  return markdownHover(`Definitions:\n\n${links}`)
 }
 
 function isVueDocument(document: vscode.TextDocument): boolean {
@@ -143,6 +288,18 @@ function propDefinitionHover(index: WorkspaceIndex, child: VueFileIndex, prop: P
     singular: 'template prop',
     plural: 'template props',
     commandArgs: { kind: 'prop-usages', childUri: child.uri, propName: prop.name },
+  })
+  return markdownHover(summary.text, summary.trusted)
+}
+
+function methodDefinitionHover(index: WorkspaceIndex, child: VueFileIndex, method: MethodInfo, baseDirectory: string): vscode.Hover {
+  const usages = findIndexedRefMethodUsages(index, child.uri, method.name)
+  const summary = usageSummary(usages, baseDirectory, {
+    noneText: 'No ref method usages found.',
+    title: 'Used by',
+    singular: 'ref method',
+    plural: 'ref methods',
+    commandArgs: { kind: 'ref-method-usages', childUri: child.uri, methodName: method.name },
   })
   return markdownHover(summary.text, summary.trusted)
 }
@@ -177,16 +334,18 @@ export class VueHoverProvider implements vscode.HoverProvider {
 
     const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
-      const childUri = findResolvedRefComponent(this.index, file, refAccess.refName)
-      const child = childUri ? this.index.getFile(childUri) : undefined
+      const child = findResolvedRefComponents(this.index, file, refAccess.refName)
+        .map((childUri) => this.index.getFile(childUri))
+        .find((candidate): candidate is VueFileIndex => Boolean(candidate && findMethod(candidate, refAccess.methodName)))
       const method = child ? findMethod(child, refAccess.methodName) : undefined
       return child && method ? methodHover(child, method, labelForDefinition(definitionLabels(), child, method.sourceLocation)) : undefined
     }
 
     for (const component of file.templateIndex.components) {
-      const childUri = findResolvedComponent(this.index, file, component.tag)
-      const child = childUri ? this.index.getFile(childUri) : undefined
-      if (!child) {
+      const children = this.index.resolveTemplateComponentUris(file, component)
+        .map((childUri) => this.index.getFile(childUri))
+        .filter((child): child is VueFileIndex => Boolean(child))
+      if (children.length === 0) {
         continue
       }
 
@@ -195,11 +354,21 @@ export class VueHoverProvider implements vscode.HoverProvider {
           continue
         }
         if (attr.kind === 'prop') {
-          const prop = findProp(child, attr.normalizedName)
-          return prop ? propHover(child, prop, labelForDefinition(definitionLabels(), child, prop.sourceLocation)) : undefined
+          const definitions = children.flatMap((child) => {
+            const prop = findProp(child, attr.normalizedName)
+            return prop ? [{ child, prop }] : []
+          })
+          if (definitions.length === 0) {
+            return undefined
+          }
+          return propDefinitionsHover(definitions, definitionLabels())
         }
         if (attr.kind === 'event') {
-          return eventHover(child, attr.normalizedName, definitionLabels())
+          const definitions = children.flatMap((child) => findEmit(child, attr.normalizedName).map((emit) => ({ child, emit })))
+          if (definitions.length === 0) {
+            return undefined
+          }
+          return eventDefinitionsHover(definitions, definitionLabels())
         }
       }
     }
@@ -207,6 +376,12 @@ export class VueHoverProvider implements vscode.HoverProvider {
     for (const emit of file.scriptIndex.emits) {
       if (containsOffsetStrict(emit.eventSpan, offset)) {
         return this.emitHover(file, emit.eventName)
+      }
+    }
+
+    for (const method of file.scriptIndex.methods) {
+      if (containsOffsetStrict(method.span, offset)) {
+        return methodDefinitionHover(this.index, file, method, this.workspaceBaseDirectory())
       }
     }
 
@@ -231,10 +406,11 @@ export class VueHoverProvider implements vscode.HoverProvider {
 
   private sourceHover(sourceUri: string, offset: number): vscode.Hover | undefined {
     const refDefinitions = this.index.findSourceRefMethodCalls(sourceUri, offset).flatMap(({ file, call }) => {
-      const childUri = findResolvedRefComponent(this.index, file, call.refName)
-      const child = childUri ? this.index.getFile(childUri) : undefined
-      const method = child ? findMethod(child, call.methodName) : undefined
-      return child && method ? [{ child, method }] : []
+      return findResolvedRefComponents(this.index, file, call.refName).flatMap((childUri) => {
+        const child = this.index.getFile(childUri)
+        const method = child ? findMethod(child, call.methodName) : undefined
+        return child && method ? [{ child, method }] : []
+      })
     })
     if (refDefinitions.length > 0) {
       const { child, method } = refDefinitions[0]

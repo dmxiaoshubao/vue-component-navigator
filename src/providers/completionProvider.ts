@@ -1,7 +1,7 @@
 import * as vscode from 'vscode'
 import type { MethodInfo, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefCompletionContext, findRefCompletionContextInFile, findRefRootCompletionContext, findRefRootCompletionContextInFile } from '../indexer/workspaceIndex'
-import { findResolvedRefComponent } from '../indexer/relationResolver'
+import { findResolvedRefComponents } from '../indexer/relationResolver'
 import { formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 import { createLineStarts, positionToOffset } from '../utils/position'
 
@@ -123,9 +123,9 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
   }
 
   private resolveChildren(file: VueFileIndex, refName: string): VueFileIndex[] {
-    const childUri = findResolvedRefComponent(this.index, file, refName)
-    const child = childUri ? this.index.getFile(childUri) : undefined
-    return child ? [child] : []
+    return findResolvedRefComponents(this.index, file, refName)
+      .map((childUri) => this.index.getFile(childUri))
+      .filter((child): child is VueFileIndex => Boolean(child))
   }
 
   private resolveSourceChildren(sourceUri: string, refName: string): VueFileIndex[] {
@@ -134,7 +134,8 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
     }
 
     return this.index.findSourceRefOwners(sourceUri, refName)
-      .map((file) => this.index.getFile(findResolvedRefComponent(this.index, file, refName) ?? ''))
+      .flatMap((file) => findResolvedRefComponents(this.index, file, refName)
+        .map((childUri) => this.index.getFile(childUri)))
       .filter((child): child is VueFileIndex => Boolean(child))
   }
 

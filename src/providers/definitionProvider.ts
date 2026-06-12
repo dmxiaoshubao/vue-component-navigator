@@ -1,7 +1,7 @@
 import * as vscode from 'vscode'
 import type { SourceLocation, TextSpan, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedTemplateEventUsages, findInject, findMethod, findProp, findProvideAtOffset, findResolvedComponent, findResolvedRefComponent, hasRegisteredComponent } from '../indexer/relationResolver'
+import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findIndexedTemplatePropUsages, findInject, findMethod, findProp, findProvideAtOffset, findResolvedRefComponents, hasRegisteredComponent } from '../indexer/relationResolver'
 import { containsOffsetStrict, createLineStarts, positionToOffset, spanToRange } from '../utils/position'
 
 function toRange(file: VueFileIndex, span: TextSpan): vscode.Range {
@@ -18,6 +18,27 @@ function toLocation(file: VueFileIndex, span: TextSpan, sourceLocation?: SourceL
     )
   }
   return new vscode.Location(vscode.Uri.file(file.uri), toRange(file, span))
+}
+
+function uniqueLocations(locations: vscode.Location[]): vscode.Location[] {
+  const seen = new Set<string>()
+  const results: vscode.Location[] = []
+  for (const location of locations) {
+    const key = `${location.uri.toString()}\0${location.range.start.line}\0${location.range.start.character}\0${location.range.end.line}\0${location.range.end.character}`
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    results.push(location)
+  }
+  return results
+}
+
+function locationResult(locations: vscode.Location[]): vscode.Location | vscode.Location[] | undefined {
+  if (locations.length === 0) {
+    return undefined
+  }
+  return locations.length === 1 ? locations[0] : locations
 }
 
 function isVueDocument(document: vscode.TextDocument): boolean {
@@ -54,21 +75,24 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
 
     const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
-      const childUri = findResolvedRefComponent(this.index, file, refAccess.refName)
-      const child = childUri ? this.index.getFile(childUri) : undefined
-      const method = child ? findMethod(child, refAccess.methodName) : undefined
-      return child && method ? toLocation(child, method.span, method.sourceLocation) : undefined
+      const definitions = uniqueLocations(findResolvedRefComponents(this.index, file, refAccess.refName).flatMap((childUri) => {
+        const child = this.index.getFile(childUri)
+        const method = child ? findMethod(child, refAccess.methodName) : undefined
+        return child && method ? [toLocation(child, method.span, method.sourceLocation)] : []
+      }))
+      return locationResult(definitions)
     }
 
     for (const component of file.templateIndex.components) {
-      const childUri = findResolvedComponent(this.index, file, component.tag)
-      const child = childUri ? this.index.getFile(childUri) : undefined
-      if (!child) {
+      const children = this.index.resolveTemplateComponentUris(file, component)
+        .map((childUri) => this.index.getFile(childUri))
+        .filter((child): child is VueFileIndex => Boolean(child))
+      if (children.length === 0) {
         continue
       }
 
       if (containsOffsetStrict(component.span, offset) && !hasRegisteredComponent(file, component.tag)) {
-        return toLocation(child, { start: 0, end: 0 })
+        return locationResult(uniqueLocations(children.map((child) => toLocation(child, { start: 0, end: 0 }))))
       }
 
       for (const attr of component.attrs) {
@@ -76,12 +100,17 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
           continue
         }
         if (attr.kind === 'prop') {
-          const prop = findProp(child, attr.normalizedName)
-          return prop ? toLocation(child, prop.span, prop.sourceLocation) : undefined
+          const definitions = children.flatMap((child) => {
+            const prop = findProp(child, attr.normalizedName)
+            return prop ? [toLocation(child, prop.span, prop.sourceLocation)] : []
+          })
+          return locationResult(uniqueLocations(definitions))
         }
         if (attr.kind === 'event') {
-          const emits = findEmit(child, attr.normalizedName)
-          return emits.map((emit) => toLocation(child, emit.eventSpan, emit.sourceLocation))
+          return uniqueLocations(children.flatMap((child) => {
+            const emits = findEmit(child, attr.normalizedName)
+            return emits.map((emit) => toLocation(child, emit.eventSpan, emit.sourceLocation))
+          }))
         }
       }
     }
@@ -89,6 +118,20 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
     for (const emit of file.scriptIndex.emits) {
       if (containsOffsetStrict(emit.eventSpan, offset)) {
         const usages = findIndexedTemplateEventUsages(this.index, file.uri, emit.eventName)
+        return usages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
+      }
+    }
+
+    for (const method of file.scriptIndex.methods) {
+      if (containsOffsetStrict(method.span, offset)) {
+        const usages = findIndexedRefMethodUsages(this.index, file.uri, method.name)
+        return usages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
+      }
+    }
+
+    for (const prop of file.scriptIndex.props) {
+      if (containsOffsetStrict(prop.span, offset)) {
+        const usages = findIndexedTemplatePropUsages(this.index, file.uri, prop.name)
         return usages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
       }
     }
@@ -107,14 +150,25 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
   }
 
   private provideSourceDefinition(sourceUri: string, offset: number): vscode.Definition | undefined {
-    const refDefinitions = this.index.findSourceRefMethodCalls(sourceUri, offset).flatMap(({ file, call }) => {
-      const childUri = findResolvedRefComponent(this.index, file, call.refName)
-      const child = childUri ? this.index.getFile(childUri) : undefined
-      const method = child ? findMethod(child, call.methodName) : undefined
-      return child && method ? [toLocation(child, method.span, method.sourceLocation)] : []
-    })
+    const refDefinitions = uniqueLocations(this.index.findSourceRefMethodCalls(sourceUri, offset).flatMap(({ file, call }) => {
+      return findResolvedRefComponents(this.index, file, call.refName).flatMap((childUri) => {
+        const child = this.index.getFile(childUri)
+        const method = child ? findMethod(child, call.methodName) : undefined
+        return child && method ? [toLocation(child, method.span, method.sourceLocation)] : []
+      })
+    }))
     if (refDefinitions.length > 0) {
       return refDefinitions
+    }
+
+    const methodUsages = this.index.findRefMethodUsagesFromSource(sourceUri, offset)
+    if (methodUsages.length > 0) {
+      return methodUsages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
+    }
+
+    const propUsages = this.index.findTemplatePropUsagesFromSource(sourceUri, offset)
+    if (propUsages.length > 0) {
+      return propUsages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
     }
 
     const eventUsages = this.index.findTemplateEventUsagesFromSource(sourceUri, offset)

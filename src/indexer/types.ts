@@ -56,6 +56,13 @@ export interface ComponentRegistration {
   nameSpan: TextSpan
 }
 
+export interface StaticComponentNameBinding {
+  variableName: string
+  tags: string[]
+  kind: 'literal' | 'map' | 'array' | 'expression'
+  expression?: string
+}
+
 export interface GlobalComponentRegistration {
   tag: string
   localName: string
@@ -121,6 +128,7 @@ export interface ScriptIndex {
   imports: ImportInfo[]
   mixins: MixinReference[]
   components: ComponentRegistration[]
+  staticComponentNames: StaticComponentNameBinding[]
   props: PropInfo[]
   methods: MethodInfo[]
   emits: EmitInfo[]
@@ -138,12 +146,14 @@ export interface TemplateAttrUsage {
 
 export interface TemplateComponentUsage {
   tag: string
+  dynamicTags?: string[]
   span: TextSpan
   attrs: TemplateAttrUsage[]
 }
 
 export interface TemplateIndex {
   components: TemplateComponentUsage[]
+  emits: EmitInfo[]
 }
 
 export interface VueFileIndex {

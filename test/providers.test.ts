@@ -505,12 +505,11 @@ export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
     const hoverProvider = new VueHoverProvider(index)
     const hover = hoverProvider.provideHover(document, positionAt(childContent, childContent.indexOf("'submit'") + 2)) as any
 
-    expect(hoverText(hover)).toContain('- [index.vue]')
+    expect(hoverText(hover)).toContain('- [index.vue:3]')
     expect(hoverText(hover)).toContain('#L')
     expect(hoverText(hover)).toContain('- pages/admin/marketing/red-packet')
     expect(hoverText(hover)).toContain('- pages/admin/marketing/activity')
     expect(hoverText(hover)).toContain('- pages/admin/marketing/coupon')
-    expect(hoverText(hover)).not.toContain('[index.vue:')
     expect(hoverText(hover)).not.toContain('- [pages/admin/marketing/red-packet/index.vue')
   })
 
@@ -523,9 +522,23 @@ export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
     const hover = hoverProvider.provideHover(document, positionAt(content, propOffset)) as any
 
     expect(hoverText(hover)).toContain('Used by 1 template prop')
-    expect(hoverText(hover)).toContain('- [Parent.vue]')
+    expect(hoverText(hover)).toContain('- [Parent.vue:5]')
     expect(hoverText(hover)).not.toContain('title: String')
-    expect(hoverText(hover)).not.toContain('[Parent.vue:')
+    expect(hover.contents.isTrusted).toBe(false)
+  })
+
+  it('$refs 方法定义悬浮展示静态使用位置', () => {
+    const content = readFixture('Child.vue')
+    const document = new TestDocument(path.join(fixtureRoot, 'Child.vue'), content) as any
+    const hoverProvider = new VueHoverProvider(index)
+    const methodOffset = content.indexOf('open(source)') + 1
+
+    const hover = hoverProvider.provideHover(document, positionAt(content, methodOffset)) as any
+
+    expect(hoverText(hover)).toContain('Used by 2 ref methods')
+    expect(hoverText(hover)).toContain('- [Parent.vue:39]')
+    expect(hoverText(hover)).toContain('methods.callChild')
+    expect(hoverText(hover)).not.toContain('open(source)')
     expect(hover.contents.isTrusted).toBe(false)
   })
 
@@ -575,8 +588,7 @@ export default {
     expect(provideReferences[0].uri.fsPath).toBe(consumerUri)
     expect(hoverText(injectHover)).toContain('Provided by 1 definition')
     expect(hoverText(provideHover)).toContain('Injected by 1 consumer')
-    expect(hoverText(provideHover)).toContain('- [InjectConsumer.vue]')
-    expect(hoverText(provideHover)).not.toContain('[InjectConsumer.vue:')
+    expect(hoverText(provideHover)).toContain('- [InjectConsumer.vue:7]')
   })
 
   it('inject 字符串支持 provide key 补全', () => {
@@ -694,8 +706,8 @@ export default {
 
     expect(hoverText(hover)).toContain('Provided by 6 definitions')
     expect(hoverText(hover)).toContain('Show all 6 definitions')
-    expect(hoverText(hover)).toContain('- [ManyProvider0.vue]')
-    expect(hoverText(hover)).toContain('- [ManyProvider4.vue]')
+    expect(hoverText(hover)).toContain('- [ManyProvider0.vue:8]')
+    expect(hoverText(hover)).toContain('- [ManyProvider4.vue:8]')
     expect(hoverText(hover)).not.toContain('- [ManyProvider5.vue]')
     expect(hover.contents.isTrusted).toEqual({ enabledCommands: ['vueComponentNavigator.showUsages'] })
   })
@@ -791,5 +803,171 @@ export default {
     expect((provider.provideReferences(document, positionAt(content, methodOffset)) as any[])).toHaveLength(2)
     expect((provider.provideReferences(document, positionAt(content, propOffset)) as any[])).toHaveLength(1)
     expect((provider.provideReferences(document, positionAt(content, emitOffset)) as any[])).toHaveLength(2)
+  })
+
+  it('prop 和 $refs 方法定义处支持跳到静态引用点', () => {
+    const content = readFixture('Child.vue')
+    const document = new TestDocument(path.join(fixtureRoot, 'Child.vue'), content) as any
+    const provider = new VueDefinitionProvider(index)
+    const methodOffset = content.indexOf('open(source)') + 1
+    const propOffset = content.indexOf('title: String') + 1
+
+    const methodDefinitions = provider.provideDefinition(document, positionAt(content, methodOffset)) as any[]
+    const propDefinitions = provider.provideDefinition(document, positionAt(content, propOffset)) as any[]
+
+    expect(methodDefinitions.map((item) => item.uri.fsPath)).toContain(path.join(fixtureRoot, 'Parent.vue'))
+    expect(propDefinitions.map((item) => item.uri.fsPath)).toContain(path.join(fixtureRoot, 'Parent.vue'))
+  })
+
+  it('mixin 中的 prop 和 $refs 方法定义处支持跳到静态引用点', () => {
+    const mixinContent = readFixture('MixinVueSource.vue')
+    const mixinDocument = new TestDocument(path.join(fixtureRoot, 'MixinVueSource.vue'), mixinContent) as any
+    const provider = new VueDefinitionProvider(index)
+
+    const methodDefinitions = provider.provideDefinition(mixinDocument, positionAt(mixinContent, mixinContent.indexOf('vueMixedMethod') + 1)) as any[]
+    const propDefinitions = provider.provideDefinition(mixinDocument, positionAt(mixinContent, mixinContent.indexOf('vueMixedTitle') + 1)) as any[]
+
+    expect(methodDefinitions.map((item) => item.uri.fsPath)).toContain(path.join(fixtureRoot, 'MixinVueParent.vue'))
+    expect(propDefinitions.map((item) => item.uri.fsPath)).toContain(path.join(fixtureRoot, 'MixinVueParent.vue'))
+  })
+
+  it('动态组件候选中的 mixin emit 支持跳到父模板监听', () => {
+    const localIndex = new WorkspaceIndex()
+    const mixinPath = path.join(fixtureRoot, 'mixin-default.js')
+    const normalPath = path.join(fixtureRoot, 'ProviderDynamicNormal.vue')
+    const bigPath = path.join(fixtureRoot, 'ProviderDynamicBig.vue')
+    const parentPath = path.join(fixtureRoot, 'ProviderDynamicHost.vue')
+    const childContent = `
+<template><div /></template>
+<script>
+import baseMixin from './mixin-default'
+export default { mixins: [baseMixin] }
+</script>
+`
+    const parentContent = `
+<template>
+  <component :is="SCREEN_TYPE[themeType]" @mixed-save="onMixedSave" />
+</template>
+<script>
+import ProviderDynamicNormal from './ProviderDynamicNormal.vue'
+import ProviderDynamicBig from './ProviderDynamicBig.vue'
+
+const SCREEN_TYPE = {
+  1: 'ProviderDynamicNormal',
+  2: 'ProviderDynamicBig',
+}
+
+export default {
+  components: { ProviderDynamicNormal, ProviderDynamicBig },
+  data() {
+    return { SCREEN_TYPE }
+  },
+}
+</script>
+`
+    localIndex.indexContent(parentPath, parentContent)
+    localIndex.indexContent(normalPath, childContent)
+    localIndex.indexContent(bigPath, childContent)
+
+    const mixinContent = readFixture('mixin-default.js')
+    const mixinDocument = new TestDocument(mixinPath, mixinContent, 'javascript') as any
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const emitOffset = mixinContent.indexOf("'mixed-save'") + 2
+
+    const definitions = definitionProvider.provideDefinition(mixinDocument, positionAt(mixinContent, emitOffset)) as any[]
+    const references = referenceProvider.provideReferences(mixinDocument, positionAt(mixinContent, emitOffset)) as any[]
+    const hover = hoverProvider.provideHover(mixinDocument, positionAt(mixinContent, emitOffset)) as any
+
+    expect(definitions).toHaveLength(1)
+    expect(definitions[0].uri.fsPath).toBe(parentPath)
+    expect(references).toHaveLength(1)
+    expect(references[0].uri.fsPath).toBe(parentPath)
+    expect(hoverText(hover)).toContain('Used by 1 listener')
+    expect(hoverText(hover)).toContain('[ProviderDynamicHost.vue:')
+  })
+
+  it('动态组件候选中的 template $emit 支持跳到父模板监听', () => {
+    const localIndex = new WorkspaceIndex()
+    const categoryPath = path.join(fixtureRoot, 'ProviderCategoryList.vue')
+    const channelPath = path.join(fixtureRoot, 'ProviderChannelList.vue')
+    const parentPath = path.join(fixtureRoot, 'ProviderTernaryDynamicHost.vue')
+    const categoryContent = `
+<template><button @click="$emit('onAddToCart')" /></template>
+<script>
+export default {}
+</script>
+`
+    const channelContent = `
+<template><ProductItem @onClick="$emit('onAddToCart', item)" /></template>
+<script>
+export default {}
+</script>
+`
+    const parentContent = `
+<template>
+  <component :is="isCategoryMode ? 'ProviderCategoryList' : 'ProviderChannelList'" @onAddToCart="addToCartFromCard" />
+</template>
+<script>
+import ProviderCategoryList from './ProviderCategoryList.vue'
+import ProviderChannelList from './ProviderChannelList.vue'
+
+export default {
+  components: { ProviderCategoryList, ProviderChannelList },
+}
+</script>
+`
+    localIndex.indexContent(parentPath, parentContent)
+    localIndex.indexContent(categoryPath, categoryContent)
+    localIndex.indexContent(channelPath, channelContent)
+    const parentDocument = new TestDocument(parentPath, parentContent) as any
+    const channelDocument = new TestDocument(channelPath, channelContent) as any
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const parentEventOffset = parentContent.indexOf('@onAddToCart') + 1
+    const emitOffset = channelContent.indexOf("'onAddToCart'") + 2
+
+    const definitions = definitionProvider.provideDefinition(channelDocument, positionAt(channelContent, emitOffset)) as any[]
+    const references = referenceProvider.provideReferences(channelDocument, positionAt(channelContent, emitOffset)) as any[]
+    const hover = hoverProvider.provideHover(channelDocument, positionAt(channelContent, emitOffset)) as any
+    const parentHover = hoverProvider.provideHover(parentDocument, positionAt(parentContent, parentEventOffset)) as any
+
+    expect(definitions).toHaveLength(1)
+    expect(definitions[0].uri.fsPath).toBe(parentPath)
+    expect(references).toHaveLength(1)
+    expect(references[0].uri.fsPath).toBe(parentPath)
+    expect(hoverText(hover)).toContain('Used by 1 listener')
+    expect(hoverText(hover)).toContain('[ProviderTernaryDynamicHost.vue:')
+    expect(hoverText(parentHover)).toContain('Definitions:')
+    expect(hoverText(parentHover)).toContain('ProviderCategoryList.vue')
+    expect(hoverText(parentHover)).toContain('ProviderChannelList.vue')
+    expect(parentHover.contents.isTrusted).toBe(false)
+  })
+
+  it('多个消费组件展开同一个 mixin $refs 调用时 hover 使用位置去重', () => {
+    const innerContent = readFixture('MixinInner.vue')
+    const extraConsumerUri = path.join(fixtureRoot, 'MixinChildClone.vue')
+    const extraConsumerContent = `
+<template>
+  <MixinInner ref="inner" />
+</template>
+<script>
+import baseMixin from './mixin-default'
+import MixinInner from './MixinInner.vue'
+export default {
+  components: { MixinInner },
+  mixins: [baseMixin],
+}
+</script>`
+    index.indexContent(extraConsumerUri, extraConsumerContent)
+    const document = new TestDocument(path.join(fixtureRoot, 'MixinInner.vue'), innerContent) as any
+    const hoverProvider = new VueHoverProvider(index)
+
+    const hover = hoverProvider.provideHover(document, positionAt(innerContent, innerContent.indexOf('focus') + 1)) as any
+
+    expect(hoverText(hover)).toContain('Used by 1 ref method')
+    expect(hoverText(hover).match(/- \[mixin-default\.js:/g)).toHaveLength(1)
   })
 })

@@ -212,11 +212,16 @@ export function findRefComponent(parent: VueFileIndex, refName: string): string 
   if (!usage) {
     return undefined
   }
-  return findRegisteredComponent(parent, usage.tag)
+  const tags = usage.dynamicTags?.length ? usage.dynamicTags : [usage.tag]
+  return tags.map((tag) => findRegisteredComponent(parent, tag)).find(Boolean)
 }
 
 export function findResolvedRefComponent(index: WorkspaceIndex, parent: VueFileIndex, refName: string): string | undefined {
   return index.resolveRefComponent(parent, refName)
+}
+
+export function findResolvedRefComponents(index: WorkspaceIndex, parent: VueFileIndex, refName: string): string[] {
+  return index.resolveRefComponents(parent, refName)
 }
 
 export function findTemplatePropUsages(files: VueFileIndex[], childUri: string, propName: string) {
@@ -225,7 +230,7 @@ export function findTemplatePropUsages(files: VueFileIndex[], childUri: string, 
 
   for (const file of files) {
     for (const component of file.templateIndex.components) {
-      if (findRegisteredComponent(file, component.tag) !== childUri) {
+      if (!templateComponentMatches(file, component, childUri)) {
         continue
       }
 
@@ -249,7 +254,7 @@ export function findTemplateEventUsages(files: VueFileIndex[], childUri: string,
 
   for (const file of files) {
     for (const component of file.templateIndex.components) {
-      if (findRegisteredComponent(file, component.tag) !== childUri) {
+      if (!templateComponentMatches(file, component, childUri)) {
         continue
       }
 
@@ -266,6 +271,11 @@ export function findTemplateEventUsages(files: VueFileIndex[], childUri: string,
 
 export function findIndexedTemplateEventUsages(index: WorkspaceIndex, childUri: string, eventName: string): UsageInfo[] {
   return index.findTemplateEventUsages(childUri, eventName)
+}
+
+function templateComponentMatches(file: VueFileIndex, component: VueFileIndex['templateIndex']['components'][number], childUri: string): boolean {
+  const tags = component.dynamicTags?.length ? component.dynamicTags : [component.tag]
+  return tags.some((tag) => findRegisteredComponent(file, tag) === childUri)
 }
 
 export function findProvide(file: VueFileIndex, provideKey: string) {
