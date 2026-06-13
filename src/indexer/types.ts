@@ -106,6 +106,24 @@ export interface EmitInfo {
   sourceLocation?: SourceLocation
 }
 
+export type EventBusMethod = '$emit' | '$on' | '$once' | '$off'
+
+export interface EventBusCall {
+  kind: 'emit' | 'listener'
+  method: EventBusMethod
+  busName: string
+  eventName: string
+  eventSpan: TextSpan
+  callSpan: TextSpan
+  sourceLocation?: SourceLocation
+}
+
+export interface EventBusRegistration {
+  propertyName: string
+  nameSpan: TextSpan
+  fileUri: string
+}
+
 export interface ProvideInfo {
   key: string
   keySpan: TextSpan
@@ -132,6 +150,7 @@ export interface ScriptIndex {
   props: PropInfo[]
   methods: MethodInfo[]
   emits: EmitInfo[]
+  eventBusCalls: EventBusCall[]
   provides: ProvideInfo[]
   injects: InjectInfo[]
 }
@@ -154,6 +173,7 @@ export interface TemplateComponentUsage {
 export interface TemplateIndex {
   components: TemplateComponentUsage[]
   emits: EmitInfo[]
+  eventBusCalls: EventBusCall[]
 }
 
 export interface VueFileIndex {
@@ -180,4 +200,8 @@ export interface UsageInfo {
   file: VueFileIndex
   span: TextSpan
   sourceLocation?: SourceLocation
+}
+
+export interface EventBusUsageInfo extends UsageInfo {
+  method: EventBusMethod
 }

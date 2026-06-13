@@ -12,6 +12,8 @@ import { commonDirectory, relativePath, usagePathLabels } from './utils/pathDisp
 
 type UsageCommandArgs =
   | { kind?: 'event-listeners', childUri: string, eventName: string }
+  | { kind: 'event-bus-listeners', busName: string, eventName: string }
+  | { kind: 'event-bus-emits', busName: string, eventName: string }
   | { kind: 'prop-usages', childUri: string, propName: string }
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
@@ -31,6 +33,10 @@ function usageLabel(file: VueFileIndex, span: TextSpan, label: string, sourceLoc
   const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
   const position = offsetToPosition(location.lineStarts, location.span.start)
   return `${label}:${position.line + 1}`
+}
+
+function eventBusMethodSuffix(usage: UsageInfo): string {
+  return 'method' in usage ? ` ${String(usage.method)}` : ''
 }
 
 function toVsCodeRange(file: VueFileIndex, span: TextSpan, sourceLocation?: SourceLocation): vscode.Range {
@@ -152,7 +158,7 @@ export function activate(context: vscode.ExtensionContext): void {
     featuresRegistered = true
     featureDisposables.push(
       vscode.languages.registerDefinitionProvider(selector, new VueDefinitionProvider(index)),
-      vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?'),
+      vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?', '\'', '"'),
       vscode.languages.registerHoverProvider(selector, new VueHoverProvider(index)),
       vscode.languages.registerReferenceProvider(selector, new VueReferenceProvider(index)),
       vscode.workspace.onDidSaveTextDocument((document) => {
@@ -170,14 +176,14 @@ export function activate(context: vscode.ExtensionContext): void {
           scheduleSync(document.uri.fsPath, document.getText())
         }
       }),
-      vscode.workspace.onDidDeleteFiles((event) => {
+      vscode.workspace.onDidDeleteFiles(async (event) => {
         for (const file of event.files) {
           if (file.fsPath.endsWith('.vue')) {
             clearPendingSync(file.fsPath)
             index.remove(file.fsPath)
             void refreshGlobalComponentsForVueFile(file.fsPath)
           } else if (isScriptFile(file.fsPath)) {
-            index.removeGlobalComponentFile(file.fsPath)
+            await index.removeGlobalComponentFile(file.fsPath)
           }
         }
       }),
@@ -199,7 +205,7 @@ export function activate(context: vscode.ExtensionContext): void {
             index.remove(file.oldUri.fsPath)
             await refreshGlobalComponentsForVueFile(file.oldUri.fsPath)
           } else if (isScriptFile(file.oldUri.fsPath)) {
-            index.removeGlobalComponentFile(file.oldUri.fsPath)
+            await index.removeGlobalComponentFile(file.oldUri.fsPath)
           }
           if (file.newUri.fsPath.endsWith('.vue')) {
             clearPendingSync(file.newUri.fsPath)
@@ -284,6 +290,20 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
 
+    if (args.kind === 'event-bus-listeners') {
+      return {
+        usages: index.findEventBusListeners(args.busName, args.eventName),
+        placeHolder: `Select ${args.busName} ${args.eventName} event bus listener`,
+      }
+    }
+
+    if (args.kind === 'event-bus-emits') {
+      return {
+        usages: index.findEventBusEmits(args.busName, args.eventName),
+        placeHolder: `Select ${args.busName} ${args.eventName} event bus emit`,
+      }
+    }
+
     if (args.kind === 'ref-method-usages') {
       return {
         usages: index.findRefMethodUsages(args.childUri, args.methodName),
@@ -343,7 +363,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const baseDirectory = commonDirectory(files.map((file) => file.uri))
       const labels = usagePathLabels(usages.map((usage) => usage.sourceLocation?.uri ?? usage.file.uri), baseDirectory)
       const selected = await vscode.window.showQuickPick(usages.map((usage) => ({
-        label: usageLabel(usage.file, usage.span, labels.get(usage.sourceLocation?.uri ?? usage.file.uri) ?? path.basename(usage.sourceLocation?.uri ?? usage.file.uri), usage.sourceLocation),
+        label: `${usageLabel(usage.file, usage.span, labels.get(usage.sourceLocation?.uri ?? usage.file.uri) ?? path.basename(usage.sourceLocation?.uri ?? usage.file.uri), usage.sourceLocation)}${eventBusMethodSuffix(usage)}`,
         description: relativePath(usage.sourceLocation?.uri ?? usage.file.uri, baseDirectory),
         file: usage.file,
         span: usage.span,

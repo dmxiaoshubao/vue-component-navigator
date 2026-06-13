@@ -1,14 +1,18 @@
 import * as vscode from 'vscode'
-import type { MethodInfo, VueFileIndex } from '../indexer/types'
+import type { EventBusMethod, MethodInfo, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefCompletionContext, findRefCompletionContextInFile, findRefRootCompletionContext, findRefRootCompletionContextInFile } from '../indexer/workspaceIndex'
 import { findResolvedRefComponents } from '../indexer/relationResolver'
 import { formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 import { createLineStarts, positionToOffset } from '../utils/position'
+import { maskStringsAndComments } from '../utils/scriptScan'
 
 const HIGH_PRIORITY_SORT_PREFIX = '\u0000\u0000'
 const OPTIONAL_CHAIN_SORT_PREFIX = `${HIGH_PRIORITY_SORT_PREFIX}\u0000`
 const INJECT_SORT_PREFIX = `${HIGH_PRIORITY_SORT_PREFIX}\u0001`
+const EVENT_BUS_SORT_PREFIX = `${HIGH_PRIORITY_SORT_PREFIX}\u0002`
 const MAX_INJECT_CONTEXT_SCAN = 20000
+const eventBusMethodCompletions: EventBusMethod[] = ['$emit', '$on', '$once', '$off']
+const eventBusCompletionMethods = new Set<EventBusMethod>(eventBusMethodCompletions)
 
 interface StringContext {
   start: number
@@ -16,29 +20,65 @@ interface StringContext {
   text: string
 }
 
+interface EventBusCompletionContext extends StringContext {
+  busName: string
+  method: EventBusMethod
+}
+
+interface EventBusMethodCompletionContext {
+  busName: string
+  accessToken: '.' | '?.'
+  partialMethodName: string
+}
+
 function isVueDocument(document: vscode.TextDocument): boolean {
   return document.languageId === 'vue' || document.uri.fsPath.endsWith('.vue')
 }
 
-function offsetInDocument(document: vscode.TextDocument, position: vscode.Position): number | undefined {
-  return positionToOffset(createLineStarts(document.getText()), { line: position.line, character: position.character })
+function offsetInContent(content: string, position: vscode.Position): number | undefined {
+  return positionToOffset(createLineStarts(content), { line: position.line, character: position.character })
+}
+
+function eventBusCompletionSearchContent(file: VueFileIndex | undefined, content: string, offset: number): string {
+  if (!file) {
+    return maskStringsAndComments(content)
+  }
+
+  if (file.script && offset >= file.script.start && offset <= file.script.end) {
+    return file.searchableContent
+  }
+
+  return content
 }
 
 export class VueCompletionProvider implements vscode.CompletionItemProvider {
   constructor(private readonly index: WorkspaceIndex) {}
 
   provideCompletionItems(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.CompletionItem[]> {
+    const content = document.getText()
     const file = isVueDocument(document)
-      ? this.index.syncContent(document.uri.fsPath, document.getText())
+      ? this.index.syncContent(document.uri.fsPath, content)
       : this.index.getFile(document.uri.fsPath)
     const offset = isVueDocument(document)
       ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
-      : offsetInDocument(document, position)
+      : offsetInContent(content, position)
     if (offset === undefined) {
       return undefined
     }
 
-    const injectContext = findInjectCompletionContext(document.getText(), offset)
+    const eventBusNames = this.index.getEventBusNames()
+    const eventBusSearchContent = eventBusCompletionSearchContent(file, content, offset)
+    const eventBusMethodContext = findEventBusMethodCompletionContext(eventBusSearchContent, offset, eventBusNames)
+    if (eventBusMethodContext) {
+      return this.eventBusMethodCompletions(eventBusMethodContext, position)
+    }
+
+    const eventBusContext = findEventBusCompletionContext(content, eventBusSearchContent, offset, eventBusNames)
+    if (eventBusContext) {
+      return this.eventBusEventCompletions(eventBusContext, position)
+    }
+
+    const injectContext = findInjectCompletionContext(content, offset)
     if (injectContext) {
       const consumers = file
         ? [file]
@@ -50,7 +90,7 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
 
     const refRootContext = isVueDocument(document) && file
       ? findRefRootCompletionContextInFile(file, offset)
-      : findRefRootCompletionContext(document.getText(), offset)
+      : findRefRootCompletionContext(content, offset)
     if (refRootContext) {
       const consumers = file
         ? [file]
@@ -62,7 +102,7 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
 
     const refContext = isVueDocument(document) && file
       ? findRefCompletionContextInFile(file, offset)
-      : findRefCompletionContext(document.getText(), offset)
+      : findRefCompletionContext(content, offset)
     if (!refContext) {
       return undefined
     }
@@ -93,6 +133,50 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
       item.filterText = `${refContext.accessToken}${refContext.partialMethodName}${method.name}`
       item.sortText = `${refContext.accessToken === '?.' ? OPTIONAL_CHAIN_SORT_PREFIX : HIGH_PRIORITY_SORT_PREFIX}${method.name}`
       item.preselect = true
+      return item
+    })
+  }
+
+  private eventBusMethodCompletions(context: EventBusMethodCompletionContext, position: vscode.Position): vscode.CompletionItem[] {
+    const range = new vscode.Range(
+      position.line,
+      position.character - context.partialMethodName.length - context.accessToken.length,
+      position.line,
+      position.character,
+    )
+
+    return eventBusMethodCompletions.map((method) => {
+      const item = new vscode.CompletionItem(method, vscode.CompletionItemKind.Method)
+      item.detail = `${context.busName} event bus method`
+      item.range = range
+      item.insertText = `${context.accessToken}${method}`
+      item.filterText = `${context.accessToken}${context.partialMethodName}${method}`
+      item.sortText = `${EVENT_BUS_SORT_PREFIX}${method}`
+      item.preselect = true
+      return item
+    })
+  }
+
+  private eventBusEventCompletions(context: EventBusCompletionContext, position: vscode.Position): vscode.CompletionItem[] | undefined {
+    const eventNames = this.index.getEventBusEventNames(context.busName)
+    if (eventNames.length === 0) {
+      return undefined
+    }
+
+    const range = new vscode.Range(
+      position.line,
+      position.character - context.text.length,
+      position.line,
+      position.character,
+    )
+
+    return eventNames.map((eventName) => {
+      const item = new vscode.CompletionItem(eventName, vscode.CompletionItemKind.Event)
+      item.detail = `${context.busName}.${context.method} event bus event`
+      item.range = range
+      item.insertText = eventName
+      item.filterText = eventName
+      item.sortText = `${EVENT_BUS_SORT_PREFIX}${eventName}`
       return item
     })
   }
@@ -237,6 +321,113 @@ function findInjectCompletionContext(content: string, offset: number): StringCon
   }
 
   return isInjectFromValue(content, valueStart, injectProperty.valueEnd, stringContext.start) ? stringContext : undefined
+}
+
+function findEventBusMethodCompletionContext(content: string, offset: number, eventBusNames: readonly string[]): EventBusMethodCompletionContext | undefined {
+  const names = new Set(eventBusNames)
+  const partial = readPartialIdentifierBefore(content, offset)
+  const access = skipWhitespaceBackward(content, partial.start - 1)
+  if (content[access] !== '.') {
+    return undefined
+  }
+
+  const accessToken = content[access - 1] === '?' ? '?.' : '.'
+  const rootEnd = accessToken === '?.'
+    ? skipWhitespaceBackward(content, access - 2) + 1
+    : access
+  const busName = readEventBusRootBefore(content, rootEnd, names)
+  if (!busName) {
+    return undefined
+  }
+
+  return {
+    busName,
+    accessToken,
+    partialMethodName: partial.value,
+  }
+}
+
+function findEventBusCompletionContext(rawContent: string, searchableContent: string, offset: number, eventBusNames: readonly string[]): EventBusCompletionContext | undefined {
+  const stringContext = findStringContext(rawContent, offset)
+  if (!stringContext) {
+    return undefined
+  }
+
+  const eventBusCall = readEventBusCallBeforeString(searchableContent, stringContext.start - 1, new Set(eventBusNames))
+  if (!eventBusCall) {
+    return undefined
+  }
+
+  return {
+    ...stringContext,
+    ...eventBusCall,
+  }
+}
+
+function readEventBusCallBeforeString(content: string, quoteIndex: number, eventBusNames: Set<string>): { busName: string, method: EventBusMethod } | undefined {
+  const open = skipWhitespaceBackward(content, quoteIndex - 1)
+  if (content[open] !== '(') {
+    return undefined
+  }
+
+  let methodEnd = skipWhitespaceBackward(content, open - 1)
+  if (content[methodEnd] === '.' && content[methodEnd - 1] === '?') {
+    methodEnd = skipWhitespaceBackward(content, methodEnd - 2)
+  }
+
+  const method = readIdentifierBackward(content, methodEnd + 1)
+  if (!method || !eventBusCompletionMethods.has(method.value as EventBusMethod)) {
+    return undefined
+  }
+
+  const access = skipWhitespaceBackward(content, method.start - 1)
+  if (content[access] !== '.') {
+    return undefined
+  }
+
+  const rootEnd = content[access - 1] === '?'
+    ? skipWhitespaceBackward(content, access - 2) + 1
+    : access
+  const busName = readEventBusRootBefore(content, rootEnd, eventBusNames)
+  return busName ? { busName, method: method.value as EventBusMethod } : undefined
+}
+
+function readPartialIdentifierBefore(content: string, offset: number): { value: string, start: number, end: number } {
+  const identifier = readIdentifierBackward(content, offset)
+  if (identifier && identifier.end === offset) {
+    return identifier
+  }
+  return { value: '', start: offset, end: offset }
+}
+
+function readEventBusRootBefore(content: string, end: number, eventBusNames: Set<string>): string | undefined {
+  const bus = readIdentifierBackward(content, end)
+  if (!bus || !eventBusNames.has(bus.value)) {
+    return undefined
+  }
+
+  const access = skipWhitespaceBackward(content, bus.start - 1)
+  if (content[access] !== '.') {
+    return bus.value
+  }
+
+  const object = readIdentifierBackward(content, access)
+  return object?.value === 'this' ? bus.value : undefined
+}
+
+function readIdentifierBackward(content: string, end: number): { value: string, start: number, end: number } | undefined {
+  let cursor = skipWhitespaceBackward(content, end - 1)
+  const identifierEnd = cursor + 1
+  while (cursor >= 0 && /[\w$]/.test(content[cursor])) {
+    cursor -= 1
+  }
+
+  const start = cursor + 1
+  if (start === identifierEnd || !/[A-Za-z_$]/.test(content[start])) {
+    return undefined
+  }
+
+  return { value: content.slice(start, identifierEnd), start, end: identifierEnd }
 }
 
 function findStringContext(content: string, offset: number): StringContext | undefined {
@@ -425,6 +616,14 @@ function skipWhitespace(content: string, index: number): number {
   let cursor = index
   while (cursor < content.length && /\s/.test(content[cursor])) {
     cursor += 1
+  }
+  return cursor
+}
+
+function skipWhitespaceBackward(content: string, index: number): number {
+  let cursor = index
+  while (cursor >= 0 && /\s/.test(content[cursor])) {
+    cursor -= 1
   }
   return cursor
 }

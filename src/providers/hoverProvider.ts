@@ -1,6 +1,6 @@
 import * as path from 'node:path'
 import * as vscode from 'vscode'
-import type { EmitInfo, MethodInfo, PropInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
+import type { EmitInfo, EventBusCall, MethodInfo, PropInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
 import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findInject, findMethod, findProp, findProvideAtOffset, findResolvedRefComponents } from '../indexer/relationResolver'
 import { containsOffsetStrict, createLineStarts, offsetToPosition, positionToOffset } from '../utils/position'
@@ -14,6 +14,8 @@ const CONTROL_KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'func
 
 type UsageCommandArgs =
   | { kind: 'event-listeners', childUri: string, eventName: string }
+  | { kind: 'event-bus-listeners', busName: string, eventName: string }
+  | { kind: 'event-bus-emits', busName: string, eventName: string }
   | { kind: 'prop-usages', childUri: string, propName: string }
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
@@ -87,7 +89,7 @@ function formatUsage(file: VueFileIndex, offset: number, baseDirectory: string):
   return formatUsageLocation(file, { start: offset, end: offset }, baseDirectory)
 }
 
-function formatUsageLocation(file: VueFileIndex, span: TextSpan, baseDirectory: string, sourceLocation?: SourceLocation): string {
+function formatUsageLocation(file: VueFileIndex, span: TextSpan, baseDirectory: string, sourceLocation?: SourceLocation, includeContext = true): string {
   const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
   const position = offsetToPosition(location.lineStarts, location.span.start)
   const target = vscode.Uri.file(location.uri).with({ fragment: `L${position.line + 1},${position.character + 1}` })
@@ -96,7 +98,7 @@ function formatUsageLocation(file: VueFileIndex, span: TextSpan, baseDirectory: 
   const directoryText = directory && directory !== '.'
     ? ` - ${escapeMarkdownText(directory)}`
     : ''
-  const context = location.uri === file.uri
+  const context = includeContext && location.uri === file.uri
     ? optionsApiContext(file, location.span.start)
     : undefined
   const contextText = context
@@ -203,6 +205,8 @@ function usageSummary(
     singular: string
     plural: string
     commandArgs: UsageCommandArgs
+    formatUsage?: (usage: UsageInfo, baseDirectory: string) => string
+    includeContext?: boolean
   },
 ): { text: string, trusted: boolean } {
   if (usages.length === 0) {
@@ -210,7 +214,9 @@ function usageSummary(
   }
 
   const visibleUsages = usages.slice(0, MAX_VISIBLE_USAGES)
-  const lines = visibleUsages.map((usage) => formatUsageLocation(usage.file, usage.span, baseDirectory, usage.sourceLocation))
+  const lines = visibleUsages.map((usage) => options.formatUsage
+    ? options.formatUsage(usage, baseDirectory)
+    : formatUsageLocation(usage.file, usage.span, baseDirectory, usage.sourceLocation, options.includeContext ?? true))
   const noun = usages.length === 1 ? options.singular : options.plural
   const more = usages.length > visibleUsages.length
     ? `\n\n${commandLink(options.commandArgs, `Show all ${usages.length} ${noun}`)}`
@@ -365,6 +371,12 @@ export class VueHoverProvider implements vscode.HoverProvider {
       return methodDefinitionsHover(definitions, definitionLabels())
     }
 
+    for (const call of file.scriptIndex.eventBusCalls) {
+      if (containsOffsetStrict(call.eventSpan, offset)) {
+        return this.eventBusHover(call)
+      }
+    }
+
     for (const component of file.templateIndex.components) {
       const children = this.index.resolveTemplateComponentUris(file, component)
         .map((childUri) => this.index.getFile(childUri))
@@ -440,6 +452,11 @@ export class VueHoverProvider implements vscode.HoverProvider {
       return methodDefinitionsHover(refDefinitions, this.definitionLabels())
     }
 
+    const eventBusCalls = this.index.findSourceEventBusCalls(sourceUri, offset)
+    if (eventBusCalls.length > 0) {
+      return this.eventBusHover(eventBusCalls[0].call)
+    }
+
     const propUsages = this.index.findTemplatePropUsagesFromSource(sourceUri, offset)
     if (propUsages.length > 0) {
       const summary = usageSummary(propUsages, this.workspaceBaseDirectory(), {
@@ -484,6 +501,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
         singular: 'definition',
         plural: 'definitions',
         commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'inject' },
+        includeContext: false,
       })
       return markdownHover(summary.text, summary.trusted)
     }
@@ -496,6 +514,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
         singular: 'consumer',
         plural: 'consumers',
         commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'provide' },
+        includeContext: false,
       })
       return markdownHover(summary.text, summary.trusted)
     }
@@ -509,6 +528,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
       ...file.scriptIndex.props.map((item) => item.sourceLocation?.uri),
       ...file.scriptIndex.methods.map((item) => item.sourceLocation?.uri),
       ...file.scriptIndex.emits.map((item) => item.sourceLocation?.uri),
+      ...file.scriptIndex.eventBusCalls.map((item) => item.sourceLocation?.uri),
     ]).filter((uri): uri is string => Boolean(uri))
     return shortestUniquePathLabels(uris, commonDirectory(uris))
   }
@@ -525,6 +545,28 @@ export class VueHoverProvider implements vscode.HoverProvider {
     return markdownHover(summary.text, summary.trusted)
   }
 
+  private eventBusHover(call: EventBusCall): vscode.Hover {
+    const listeners = call.kind === 'emit'
+    const usages = listeners
+      ? this.index.findEventBusListeners(call.busName, call.eventName)
+      : this.index.findEventBusEmits(call.busName, call.eventName)
+    const summary = usageSummary(usages, this.workspaceBaseDirectory(), {
+      noneText: listeners ? 'No event bus listeners found.' : 'No event bus emits found.',
+      title: listeners ? 'Listened by' : 'Emitted by',
+      singular: listeners ? 'event bus listener' : 'event bus emit',
+      plural: listeners ? 'event bus listeners' : 'event bus emits',
+      commandArgs: listeners
+        ? { kind: 'event-bus-listeners', busName: call.busName, eventName: call.eventName }
+        : { kind: 'event-bus-emits', busName: call.busName, eventName: call.eventName },
+      formatUsage: (usage, baseDirectory) => {
+        const method = 'method' in usage ? String(usage.method) : ''
+        const methodText = method ? ` - ${escapeMarkdownText(method)}` : ''
+        return `${formatUsageLocation(usage.file, usage.span, baseDirectory, usage.sourceLocation, false)}${methodText}`
+      },
+    })
+    return markdownHover(summary.text, summary.trusted)
+  }
+
   private injectHover(consumer: VueFileIndex, injectKey: string): vscode.Hover {
     const providers = findIndexedProvideDefinitions(this.index, consumer, injectKey)
     if (providers.length === 0) {
@@ -537,6 +579,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
       singular: 'definition',
       plural: 'definitions',
       commandArgs: { kind: 'provide-definitions', consumerUri: consumer.uri, injectKey },
+      includeContext: false,
     })
     return markdownHover(summary.text, summary.trusted)
   }
@@ -553,6 +596,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
       singular: 'consumer',
       plural: 'consumers',
       commandArgs: { kind: 'inject-usages', providerUri: provider.uri, provideKey },
+      includeContext: false,
     })
     return markdownHover(summary.text, summary.trusted)
   }

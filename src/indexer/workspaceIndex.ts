@@ -1,8 +1,10 @@
 import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { ComponentRegistration, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex } from './types'
+import type { ComponentRegistration, EventBusCall, EventBusRegistration, EventBusUsageInfo, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex } from './types'
+import { defaultEventBusNames, parseEventBusRegistrations, parseStaticImportSources } from './eventBusParser'
 import { guessGlobalComponentsFromRequireContext, parseGlobalComponents } from './globalComponentParser'
+import { resolveImportPathWithExtensions } from './relationResolver'
 import { parseSfc } from './sfcParser'
 import { parseScript } from './scriptParser'
 import { parseTemplate } from './templateParser'
@@ -20,8 +22,12 @@ export class WorkspaceIndex {
   private readonly globalComponents = new Map<string, GlobalComponentRegistration[]>()
   private readonly globalComponentRegistrations = new Map<string, GlobalComponentRegistration[]>()
   private readonly globalComponentContexts = new Map<string, GlobalComponentContext[]>()
+  private readonly eventBusRegistrations = new Map<string, EventBusRegistration[]>()
   private readonly propUsages = new Map<string, UsageInfo[]>()
   private readonly eventUsages = new Map<string, UsageInfo[]>()
+  private readonly eventBusEmits = new Map<string, EventBusUsageInfo[]>()
+  private readonly eventBusListeners = new Map<string, EventBusUsageInfo[]>()
+  private readonly eventBusEventNames = new Map<string, Set<string>>()
   private readonly refMethodUsages = new Map<string, UsageInfo[]>()
   private readonly provideDefinitions = new Map<string, UsageInfo[]>()
   private readonly injectUsages = new Map<string, UsageInfo[]>()
@@ -36,6 +42,7 @@ export class WorkspaceIndex {
     this.globalComponents.clear()
     this.globalComponentRegistrations.clear()
     this.globalComponentContexts.clear()
+    this.eventBusRegistrations.clear()
     this.mixinIndexCache.clear()
     this.mixinSourceUris.clear()
     this.clearReverseIndexes()
@@ -59,6 +66,10 @@ export class WorkspaceIndex {
     this.globalComponentContexts.clear()
     for (const [fileUri, contexts] of other.globalComponentContexts) {
       this.globalComponentContexts.set(fileUri, [...contexts])
+    }
+    this.eventBusRegistrations.clear()
+    for (const [fileUri, registrations] of other.eventBusRegistrations) {
+      this.eventBusRegistrations.set(fileUri, [...registrations])
     }
     this.mixinIndexCache.clear()
     this.mixinSourceUris.clear()
@@ -149,9 +160,10 @@ export class WorkspaceIndex {
     }
 
     const sfc = parseSfc(uri, content)
+    const eventBusNames = this.getEventBusNames()
     const ownScriptIndex = sfc.script
-      ? parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots)
-      : { imports: [], mixins: [], components: [], staticComponentNames: [], props: [], methods: [], emits: [], provides: [], injects: [] }
+      ? parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots, 'default', eventBusNames)
+      : { imports: [], mixins: [], components: [], staticComponentNames: [], props: [], methods: [], emits: [], eventBusCalls: [], provides: [], injects: [] }
     const mixed = this.mergeStaticMixins(uri, ownScriptIndex)
     let scriptIndex = mixed.scriptIndex
     const registeredTags = [
@@ -159,11 +171,12 @@ export class WorkspaceIndex {
       ...this.getGlobalComponents().flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
     ]
     const templateIndex = sfc.template
-      ? parseTemplate(sfc.template.content, sfc.template.start, registeredTags, scriptIndex.staticComponentNames)
-      : { components: [], emits: [] }
+      ? parseTemplate(sfc.template.content, sfc.template.start, registeredTags, scriptIndex.staticComponentNames, eventBusNames)
+      : { components: [], emits: [], eventBusCalls: [] }
     scriptIndex = {
       ...scriptIndex,
       emits: [...scriptIndex.emits, ...templateIndex.emits],
+      eventBusCalls: [...scriptIndex.eventBusCalls, ...templateIndex.eventBusCalls],
     }
     const searchableContent = maskStringsAndComments(sfc.content)
 
@@ -189,6 +202,7 @@ export class WorkspaceIndex {
 
     this.addProvideDefinitions(file)
     const relationshipChildren = this.addRelationshipUsages(file)
+    this.addEventBusUsages(file)
     this.addInjectUsages(file)
     if (file.scriptIndex.provides.length > 0 || (previous?.scriptIndex.provides.length ?? 0) > 0 || !sameStringSet(previousRelationshipChildren, relationshipChildren)) {
       this.rebuildReverseIndexes()
@@ -246,6 +260,11 @@ export class WorkspaceIndex {
       return
     }
 
+    await this.refreshEventBusRegistrations(root, token)
+    if (token?.isCancellationRequested) {
+      return
+    }
+
     for (const file of scriptFiles) {
       await this.indexGlobalComponentFile(file)
       if (token?.isCancellationRequested) {
@@ -293,13 +312,15 @@ export class WorkspaceIndex {
   async syncGlobalComponentFile(uri: string): Promise<void> {
     this.clearMixinCacheForFile(uri)
     await this.indexGlobalComponentFile(uri)
+    await this.refreshEventBusRegistrations()
     await this.refreshRequireContextGlobals(this.getIndexedUris())
     this.rebuildIndexedFiles()
   }
 
-  removeGlobalComponentFile(uri: string): void {
+  async removeGlobalComponentFile(uri: string): Promise<void> {
     this.clearMixinCacheForFile(uri)
     this.removeGlobalRegistrationsFromFile(uri)
+    await this.refreshEventBusRegistrations()
     this.rebuildIndexedFiles()
   }
 
@@ -339,6 +360,18 @@ export class WorkspaceIndex {
 
   findTemplateEventUsages(childUri: string, eventName: string): UsageInfo[] {
     return [...(this.eventUsages.get(usageKey(childUri, eventName)) ?? [])]
+  }
+
+  findEventBusEmits(busName: string, eventName: string): EventBusUsageInfo[] {
+    return dedupeUsages(this.eventBusEmits.get(eventBusKey(busName, eventName)) ?? [])
+  }
+
+  findEventBusListeners(busName: string, eventName: string): EventBusUsageInfo[] {
+    return dedupeUsages(this.eventBusListeners.get(eventBusKey(busName, eventName)) ?? [])
+  }
+
+  getEventBusEventNames(busName: string): string[] {
+    return [...(this.eventBusEventNames.get(busName) ?? [])].sort()
   }
 
   findRefMethodUsages(childUri: string, methodName: string): UsageInfo[] {
@@ -395,6 +428,34 @@ export class WorkspaceIndex {
     return this.mixinSourceUris.has(uri) || this.hasMixinCacheForFile(uri)
   }
 
+  async refreshEventBusRegistrations(root?: string, token?: IndexCancellationToken): Promise<void> {
+    const roots = root ? [root] : this.workspaceRoots
+    if (root) {
+      this.removeEventBusRegistrationsInRoot(root)
+    } else {
+      this.eventBusRegistrations.clear()
+    }
+
+    for (const workspaceRoot of roots) {
+      if (token?.isCancellationRequested) {
+        return
+      }
+      const registrations = await this.detectEventBusRegistrations(workspaceRoot, token)
+      for (const registration of registrations) {
+        const current = this.eventBusRegistrations.get(registration.fileUri) ?? []
+        current.push(registration)
+        this.eventBusRegistrations.set(registration.fileUri, current)
+      }
+    }
+  }
+
+  getEventBusNames(): string[] {
+    return [...new Set([
+      ...defaultEventBusNames,
+      ...[...this.eventBusRegistrations.values()].flat().map((registration) => registration.propertyName),
+    ])]
+  }
+
   findTemplatePropUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
     return dedupeUsages(this.findSourceProps(sourceUri, offset)
       .flatMap(({ file, prop }) => this.findTemplatePropUsages(file.uri, prop.name)))
@@ -408,6 +469,18 @@ export class WorkspaceIndex {
   findTemplateEventUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
     return dedupeUsages(this.findSourceEmits(sourceUri, offset)
       .flatMap(({ file, emit }) => this.findTemplateEventUsages(file.uri, emit.eventName)))
+  }
+
+  findEventBusListenersFromSource(sourceUri: string, offset: number): UsageInfo[] {
+    return dedupeUsages(this.findSourceEventBusCalls(sourceUri, offset)
+      .filter(({ call }) => call.kind === 'emit')
+      .flatMap(({ call }) => this.findEventBusListeners(call.busName, call.eventName)))
+  }
+
+  findEventBusEmitsFromSource(sourceUri: string, offset: number): UsageInfo[] {
+    return dedupeUsages(this.findSourceEventBusCalls(sourceUri, offset)
+      .filter(({ call }) => call.kind === 'listener')
+      .flatMap(({ call }) => this.findEventBusEmits(call.busName, call.eventName)))
   }
 
   findInjectUsagesFromProvideSource(sourceUri: string, offset: number): UsageInfo[] {
@@ -424,6 +497,18 @@ export class WorkspaceIndex {
     const results: Array<{ file: VueFileIndex, call: RefMethodAccess }> = []
     for (const file of this.files.values()) {
       for (const call of file.refMethodCalls) {
+        if (containsSourceOffset(call.sourceLocation, sourceUri, offset)) {
+          results.push({ file, call })
+        }
+      }
+    }
+    return results
+  }
+
+  findSourceEventBusCalls(sourceUri: string, offset: number): Array<{ file: VueFileIndex, call: EventBusCall }> {
+    const results: Array<{ file: VueFileIndex, call: EventBusCall }> = []
+    for (const file of this.files.values()) {
+      for (const call of file.scriptIndex.eventBusCalls) {
         if (containsSourceOffset(call.sourceLocation, sourceUri, offset)) {
           results.push({ file, call })
         }
@@ -474,6 +559,48 @@ export class WorkspaceIndex {
     }
 
     return false
+  }
+
+  private async detectEventBusRegistrations(root: string, token?: IndexCancellationToken): Promise<EventBusRegistration[]> {
+    const entryContents: Array<{ uri: string, content: string }> = []
+    const directRegistrations: EventBusRegistration[] = []
+
+    for (const uri of eventBusEntryCandidates(root)) {
+      if (token?.isCancellationRequested) {
+        return []
+      }
+      const content = await readTextIfExists(uri)
+      if (content === undefined) {
+        continue
+      }
+      entryContents.push({ uri, content })
+      directRegistrations.push(...parseEventBusRegistrations(uri, content))
+    }
+
+    if (directRegistrations.length > 0 || entryContents.length === 0) {
+      return directRegistrations
+    }
+
+    // 入口本身没有注册时，只展开入口直接引入的一层文件，避免递归扫描拖慢大项目。
+    const importedUris = uniqueStrings(entryContents.flatMap(({ uri, content }) => {
+      return parseStaticImportSources(content)
+        .map((source) => resolveImportPathWithExtensions(uri, source, this.workspaceRoots, ['.js', '.ts']))
+        .filter((resolved): resolved is string => Boolean(resolved))
+        .filter((resolved) => this.isInsideWorkspace(resolved) && !isInsideNodeModules(resolved))
+    }))
+
+    const importedRegistrations: EventBusRegistration[] = []
+    for (const uri of importedUris) {
+      if (token?.isCancellationRequested) {
+        return []
+      }
+      const content = await readTextIfExists(uri)
+      if (content !== undefined) {
+        importedRegistrations.push(...parseEventBusRegistrations(uri, content))
+      }
+    }
+
+    return importedRegistrations
   }
 
   private findNearestProvideDefinitions(consumer: VueFileIndex, injectKey: string): UsageInfo[] {
@@ -603,6 +730,7 @@ export class WorkspaceIndex {
         props: mergeNamed(own.props, mixinIndexes.flatMap((item) => item.props), (item) => item.name),
         methods: mergeNamed(own.methods, mixinIndexes.flatMap((item) => item.methods), (item) => item.name),
         emits: [...own.emits, ...mixinIndexes.flatMap((item) => item.emits)],
+        eventBusCalls: [...own.eventBusCalls, ...mixinIndexes.flatMap((item) => item.eventBusCalls)],
         provides: mergeNamed(own.provides, mixinIndexes.flatMap((item) => item.provides), (item) => item.key),
         injects: mergeNamed(own.injects, mixinIndexes.flatMap((item) => item.injects), (item) => item.localName),
       },
@@ -685,7 +813,7 @@ export class WorkspaceIndex {
         if (!sfc.script) {
           return undefined
         }
-        const scriptIndex = parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots, exportName)
+        const scriptIndex = parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots, exportName, this.getEventBusNames())
         return {
           scriptIndex: withSourceLocations(scriptIndex, source),
           refMethodCalls: findRefMethodCalls(maskStringsAndComments(sfc.script.content))
@@ -693,7 +821,7 @@ export class WorkspaceIndex {
         }
       }
 
-      const scriptIndex = parseScript(uri, content, 0, this.workspaceRoots, exportName)
+      const scriptIndex = parseScript(uri, content, 0, this.workspaceRoots, exportName, this.getEventBusNames())
       return {
         scriptIndex: withSourceLocations(scriptIndex, source),
         refMethodCalls: findRefMethodCalls(maskStringsAndComments(content))
@@ -707,6 +835,9 @@ export class WorkspaceIndex {
   private clearReverseIndexes(): void {
     this.propUsages.clear()
     this.eventUsages.clear()
+    this.eventBusEmits.clear()
+    this.eventBusListeners.clear()
+    this.eventBusEventNames.clear()
     this.refMethodUsages.clear()
     this.provideDefinitions.clear()
     this.injectUsages.clear()
@@ -749,6 +880,14 @@ export class WorkspaceIndex {
     }
 
     return relationshipChildren
+  }
+
+  private addEventBusUsages(file: VueFileIndex): void {
+    for (const call of file.scriptIndex.eventBusCalls) {
+      const usage = { file, span: call.eventSpan, sourceLocation: call.sourceLocation, method: call.method }
+      addUsage(call.kind === 'emit' ? this.eventBusEmits : this.eventBusListeners, eventBusKey(call.busName, call.eventName), usage)
+      addEventBusEventName(this.eventBusEventNames, call.busName, call.eventName)
+    }
   }
 
   private addInjectUsages(file: VueFileIndex): void {
@@ -794,6 +933,7 @@ export class WorkspaceIndex {
     }
     this.globalComponentContexts.delete(fileUri)
     this.globalComponentRegistrations.delete(fileUri)
+    this.eventBusRegistrations.delete(fileUri)
   }
 
   private removeGlobalComponentsFromContexts(): void {
@@ -863,6 +1003,7 @@ export class WorkspaceIndex {
     }
     for (const file of this.files.values()) {
       this.addRelationshipUsages(file)
+      this.addEventBusUsages(file)
     }
     for (const file of this.files.values()) {
       this.addInjectUsages(file)
@@ -909,7 +1050,7 @@ export class WorkspaceIndex {
       if (!parsed.script) {
         return undefined
       }
-      return parseScript(uri, parsed.script.content, parsed.script.start, this.workspaceRoots).componentName
+      return parseScript(uri, parsed.script.content, parsed.script.start, this.workspaceRoots, 'default', this.getEventBusNames()).componentName
     } catch {
       return undefined
     }
@@ -958,9 +1099,20 @@ export class WorkspaceIndex {
     return this.workspaceRoots.some((root) => uri === root || isInsideDirectory(uri, root))
   }
 
+  private removeEventBusRegistrationsInRoot(root: string): void {
+    for (const uri of [...this.eventBusRegistrations.keys()]) {
+      if (uri === root || isInsideDirectory(uri, root)) {
+        this.eventBusRegistrations.delete(uri)
+      }
+    }
+  }
+
   private removeReverseIndex(file: VueFileIndex): void {
     removeFileUsages(this.propUsages, file)
     removeFileUsages(this.eventUsages, file)
+    removeFileUsages(this.eventBusEmits, file)
+    removeFileUsages(this.eventBusListeners, file)
+    removeEventBusEventNames(this.eventBusEventNames, this.eventBusEmits, this.eventBusListeners, file)
     removeFileUsages(this.refMethodUsages, file)
     removeFileUsages(this.provideDefinitions, file)
     removeFileUsages(this.injectUsages, file)
@@ -1023,6 +1175,7 @@ function withSourceLocations(scriptIndex: ScriptIndex, source: (span: TextSpan) 
     props: scriptIndex.props.map((item) => ({ ...item, sourceLocation: source(item.span) })),
     methods: scriptIndex.methods.map((item) => ({ ...item, sourceLocation: source(item.span) })),
     emits: scriptIndex.emits.map((item) => ({ ...item, sourceLocation: source(item.eventSpan) })),
+    eventBusCalls: scriptIndex.eventBusCalls.map((item) => ({ ...item, sourceLocation: source(item.eventSpan) })),
     provides: scriptIndex.provides.map((item) => ({ ...item, sourceLocation: source(item.keySpan) })),
     injects: scriptIndex.injects.map((item) => ({ ...item, sourceLocation: source(item.keySpan) })),
   }
@@ -1043,9 +1196,9 @@ function containsSourceOffset(sourceLocation: SourceLocation | undefined, source
     && offset < sourceLocation.span.end
 }
 
-function dedupeUsages(usages: UsageInfo[]): UsageInfo[] {
+function dedupeUsages<T extends UsageInfo>(usages: T[]): T[] {
   const seen = new Set<string>()
-  const results: UsageInfo[] = []
+  const results: T[] = []
   for (const usage of usages) {
     const uri = usage.sourceLocation?.uri ?? usage.file.uri
     const span = usage.sourceLocation?.span ?? usage.span
@@ -1063,9 +1216,32 @@ function usesSource(file: VueFileIndex, sourceUri: string): boolean {
   return file.scriptIndex.props.some((item) => item.sourceLocation?.uri === sourceUri)
     || file.scriptIndex.methods.some((item) => item.sourceLocation?.uri === sourceUri)
     || file.scriptIndex.emits.some((item) => item.sourceLocation?.uri === sourceUri)
+    || file.scriptIndex.eventBusCalls.some((item) => item.sourceLocation?.uri === sourceUri)
     || file.scriptIndex.provides.some((item) => item.sourceLocation?.uri === sourceUri)
     || file.scriptIndex.injects.some((item) => item.sourceLocation?.uri === sourceUri)
     || file.refMethodCalls.some((call) => call.sourceLocation?.uri === sourceUri)
+}
+
+function eventBusEntryCandidates(root: string): string[] {
+  const src = path.join(root, 'src')
+  return [
+    path.join(src, 'index.js'),
+    path.join(src, 'main.js'),
+    path.join(src, 'index.ts'),
+    path.join(src, 'main.ts'),
+  ]
+}
+
+async function readTextIfExists(uri: string): Promise<string | undefined> {
+  try {
+    return await fs.readFile(uri, 'utf8')
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'EISDIR') {
+      return undefined
+    }
+    throw error
+  }
 }
 
 async function walkIndexableFiles(root: string, visit: (file: string) => Promise<void>, token?: IndexCancellationToken): Promise<void> {
@@ -1221,16 +1397,29 @@ function usageKey(uri: string, name: string): string {
   return `${uri}\0${name}`
 }
 
+function eventBusKey(busName: string, eventName: string): string {
+  return `${busName}\0${eventName}`
+}
+
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)]
 }
 
-function addUsage(map: Map<string, UsageInfo[]>, key: string, usage: UsageInfo): void {
+function addUsage<T extends UsageInfo>(map: Map<string, T[]>, key: string, usage: T): void {
   const usages = map.get(key)
   if (usages) {
     usages.push(usage)
   } else {
     map.set(key, [usage])
+  }
+}
+
+function addEventBusEventName(map: Map<string, Set<string>>, busName: string, eventName: string): void {
+  const names = map.get(busName)
+  if (names) {
+    names.add(eventName)
+  } else {
+    map.set(busName, new Set([eventName]))
   }
 }
 
@@ -1252,13 +1441,33 @@ function removeParentLinks(map: Map<string, Set<string>>, parentUri: string): vo
   }
 }
 
-function removeFileUsages(map: Map<string, UsageInfo[]>, file: VueFileIndex): void {
+function removeFileUsages<T extends UsageInfo>(map: Map<string, T[]>, file: VueFileIndex): void {
   for (const [key, usages] of map) {
     const kept = usages.filter((usage) => usage.file !== file)
     if (kept.length === 0) {
       map.delete(key)
     } else if (kept.length !== usages.length) {
       map.set(key, kept)
+    }
+  }
+}
+
+function removeEventBusEventNames(
+  namesByBus: Map<string, Set<string>>,
+  emits: Map<string, EventBusUsageInfo[]>,
+  listeners: Map<string, EventBusUsageInfo[]>,
+  file: VueFileIndex,
+): void {
+  for (const call of file.scriptIndex.eventBusCalls) {
+    const key = eventBusKey(call.busName, call.eventName)
+    if ((emits.get(key)?.length ?? 0) > 0 || (listeners.get(key)?.length ?? 0) > 0) {
+      continue
+    }
+
+    const names = namesByBus.get(call.busName)
+    names?.delete(call.eventName)
+    if (names?.size === 0) {
+      namesByBus.delete(call.busName)
     }
   }
 }

@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -22,6 +23,11 @@ function readFixture(name: string): string {
   return fs.readFileSync(path.join(fixtureRoot, name), 'utf8')
 }
 
+function writeText(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  fs.writeFileSync(filePath, content)
+}
+
 function positionAt(content: string, offset: number): any {
   const before = content.slice(0, offset).split('\n')
   return { line: before.length - 1, character: before[before.length - 1].length }
@@ -33,6 +39,10 @@ function markdownText(value: any): string {
 
 function hoverText(hover: any): string {
   return markdownText(hover.contents)
+}
+
+function asArray(value: any): any[] {
+  return Array.isArray(value) ? value : value ? [value] : []
 }
 
 describe('Vue providers', () => {
@@ -267,6 +277,120 @@ export default {
     expect(emitDefinitions[0].uri.fsPath.endsWith('Parent.vue')).toBe(true)
     expect(eventDefinitions).toHaveLength(2)
     expect(eventDefinitions[0].uri.fsPath.endsWith('Child.vue')).toBe(true)
+  })
+
+  it('Event Bus emit 和 listener 支持双向定义、悬浮和引用', async () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-event-bus-'))
+    writeText(path.join(root, 'src/main.js'), `
+import Vue from 'vue'
+Vue.prototype.$eventBus = new Vue()
+`)
+    await localIndex.refreshEventBusRegistrations(root)
+    const emitUri = path.join(root, 'EventBusEmit.vue')
+    const listenerUri = path.join(root, 'EventBusListener.vue')
+    const emitContent = `
+<script>
+export default {
+  methods: {
+    collect() {
+      this.$eventBus.$emit('joinOrDeleteCollect', [{ ...this.item }, true])
+    },
+  },
+}
+</script>
+`
+    const listenerContent = `
+<script>
+export default {
+  mounted() {
+    this.$eventBus.$on('joinOrDeleteCollect', async ([item, isFavorite]) => {})
+    this.$eventBus.$once('joinOrDeleteCollect', () => {})
+    this.$eventBus.$off('joinOrDeleteCollect', this.onCollect)
+  },
+}
+</script>
+`
+    localIndex.indexContent(emitUri, emitContent)
+    localIndex.indexContent(listenerUri, listenerContent)
+    const emitDocument = new TestDocument(emitUri, emitContent) as any
+    const listenerDocument = new TestDocument(listenerUri, listenerContent) as any
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const completionProvider = new VueCompletionProvider(localIndex)
+    const emitOffset = emitContent.indexOf("'joinOrDeleteCollect'") + 2
+    const listenerOffset = listenerContent.indexOf("'joinOrDeleteCollect'") + 2
+    const offOffset = listenerContent.lastIndexOf("'joinOrDeleteCollect'") + 2
+    const completionContent = `
+<script>
+export default {
+  mounted() {
+    this.$eventBus.
+    this.$eventBus?.
+    $eventBus.
+    this.$eventBus.$emit('')
+    this.$eventBus.$on('')
+    this.$eventBus.$once('')
+    this.$eventBus.$off('')
+    // this.$eventBus.
+    const methodText = "this.$eventBus."
+    const eventText = "this.$eventBus.$emit('"
+  },
+}
+</script>
+`
+    const completionDocument = new TestDocument(path.join(root, 'EventBusCompletion.vue'), completionContent) as any
+    const completionResult = (needle: string) => {
+      return completionProvider.provideCompletionItems(completionDocument, positionAt(completionContent, completionContent.indexOf(needle) + needle.length)) as any[] | undefined
+    }
+    const completionLabels = (needle: string) => {
+      return completionResult(needle)?.map((item) => item.label) ?? []
+    }
+    const completionItems = (needle: string) => {
+      return completionResult(needle) ?? []
+    }
+
+    const emitDefinitions = asArray(definitionProvider.provideDefinition(emitDocument, positionAt(emitContent, emitOffset)))
+    const listenerDefinitions = asArray(definitionProvider.provideDefinition(listenerDocument, positionAt(listenerContent, listenerOffset)))
+    const offDefinitions = asArray(definitionProvider.provideDefinition(listenerDocument, positionAt(listenerContent, offOffset)))
+    const emitReferences = referenceProvider.provideReferences(emitDocument, positionAt(emitContent, emitOffset)) as any[]
+    const listenerReferences = referenceProvider.provideReferences(listenerDocument, positionAt(listenerContent, listenerOffset)) as any[]
+    const offReferences = referenceProvider.provideReferences(listenerDocument, positionAt(listenerContent, offOffset)) as any[]
+    const emitHover = hoverProvider.provideHover(emitDocument, positionAt(emitContent, emitOffset)) as any
+    const listenerHover = hoverProvider.provideHover(listenerDocument, positionAt(listenerContent, listenerOffset)) as any
+
+    expect(emitDefinitions[0].uri.fsPath).toBe(listenerUri)
+    expect(emitDefinitions).toHaveLength(3)
+    expect(listenerDefinitions[0].uri.fsPath).toBe(emitUri)
+    expect(offDefinitions[0].uri.fsPath).toBe(emitUri)
+    expect(emitReferences[0].uri.fsPath).toBe(listenerUri)
+    expect(emitReferences).toHaveLength(3)
+    expect(listenerReferences[0].uri.fsPath).toBe(emitUri)
+    expect(offReferences[0].uri.fsPath).toBe(emitUri)
+    expect(hoverText(emitHover)).toContain('Listened by 3 event bus listeners')
+    expect(hoverText(emitHover)).toContain('[EventBusListener.vue:')
+    expect(hoverText(emitHover)).toContain('$on')
+    expect(hoverText(emitHover)).toContain('$once')
+    expect(hoverText(emitHover)).toContain('$off')
+    expect(hoverText(listenerHover)).toContain('Emitted by 1 event bus emit')
+    expect(hoverText(listenerHover)).toContain('[EventBusEmit.vue:')
+    expect(hoverText(listenerHover)).toContain('$emit')
+    expect(hoverText(emitHover)).not.toContain('\n  $on')
+    expect(completionLabels('this.$eventBus.')).toEqual(['$emit', '$on', '$once', '$off'])
+    expect(completionLabels('this.$eventBus?.')).toEqual(['$emit', '$on', '$once', '$off'])
+    expect(completionLabels('$eventBus.')).toEqual(['$emit', '$on', '$once', '$off'])
+    expect(completionItems('this.$eventBus.').find((item) => item.label === '$emit')?.insertText).toBe('.$emit')
+    expect(completionItems('this.$eventBus?.').find((item) => item.label === '$emit')?.insertText).toBe('?.$emit')
+    expect(completionLabels("this.$eventBus.$emit('")).toContain('joinOrDeleteCollect')
+    expect(completionLabels("this.$eventBus.$on('")).toContain('joinOrDeleteCollect')
+    expect(completionLabels("this.$eventBus.$once('")).toContain('joinOrDeleteCollect')
+    expect(completionLabels("this.$eventBus.$off('")).toContain('joinOrDeleteCollect')
+    expect(completionResult('// this.$eventBus.')).toBeUndefined()
+    expect(completionResult('"this.$eventBus.')).toBeUndefined()
+    expect(completionResult('"this.$eventBus.$emit(\'')).toBeUndefined()
+    expect(emitHover.contents.isTrusted).toBe(false)
+    expect(listenerHover.contents.isTrusted).toBe(false)
   })
 
   it('带修饰符的 template 事件也能跳到子组件 emits', () => {
@@ -551,6 +675,9 @@ export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
 import InjectConsumer from './InjectConsumer.vue'
 export default {
   components: { InjectConsumer },
+  methods: {
+    getValue() {},
+  },
   provide: {
     service: this.service,
   },
@@ -561,6 +688,9 @@ export default {
 <template><div /></template>
 <script>
 export default {
+  methods: {
+    getValue() {},
+  },
   inject: {
     localService: {
       from: 'service',
@@ -588,7 +718,10 @@ export default {
     expect(provideReferences[0].uri.fsPath).toBe(consumerUri)
     expect(hoverText(injectHover)).toContain('Provided by 1 definition')
     expect(hoverText(provideHover)).toContain('Injected by 1 consumer')
-    expect(hoverText(provideHover)).toContain('- [InjectConsumer.vue:7]')
+    expect(hoverText(provideHover)).toContain('- [InjectConsumer.vue:')
+    expect(hoverText(injectHover)).not.toContain('getValue')
+    expect(hoverText(provideHover)).not.toContain('getValue')
+    expect(hoverText(provideHover)).not.toContain('localService')
   })
 
   it('inject 字符串支持 provide key 补全', () => {

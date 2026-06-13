@@ -1,5 +1,6 @@
 import type { ComponentRegistration, ImportInfo, MixinReference, PropInfo, ProvideInfo, ScriptIndex, StaticComponentNameBinding, TextSpan } from './types'
 import { resolveImportPath, resolveImportPathWithExtensions } from './relationResolver'
+import { parseEventBusCalls } from './eventBusParser'
 import { findCodeToken, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
 interface PropertyValue {
@@ -1214,12 +1215,23 @@ function readInjectFrom(content: string, member: PropertyValue): { value: string
   return result
 }
 
-export function parseScript(uri: string, content: string, scriptStart: number, workspaceRoots: string[] = [], exportName = 'default'): ScriptIndex {
+export function parseScript(uri: string, content: string, scriptStart: number, workspaceRoots: string[] = [], exportName = 'default', eventBusNames: readonly string[] = []): ScriptIndex {
   const imports = parseImports(content)
   const staticComponentNames = exportName === 'default' ? collectStaticComponentNameBindings(content) : []
   const exportObject = findExportObject(content, exportName)
   if (!exportObject) {
-    return { imports, mixins: [], components: [], staticComponentNames, props: [], methods: [], emits: exportName === 'default' ? parseEmits(content, scriptStart) : [], provides: [], injects: [] }
+    return {
+      imports,
+      mixins: [],
+      components: [],
+      staticComponentNames,
+      props: [],
+      methods: [],
+      emits: exportName === 'default' ? parseEmits(content, scriptStart) : [],
+      eventBusCalls: exportName === 'default' ? parseEventBusCalls(content, scriptStart, eventBusNames) : [],
+      provides: [],
+      injects: [],
+    }
   }
 
   const nameProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'name')
@@ -1239,6 +1251,7 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
     props: parseProps(content, propsProperty, scriptStart),
     methods: parseMethods(content, methodsProperty, scriptStart),
     emits: parseEmits(content, scriptStart, exportObject.open, exportObject.close),
+    eventBusCalls: parseEventBusCalls(content, scriptStart, eventBusNames, exportObject.open, exportObject.close),
     provides: parseProvides(content, provideProperty, scriptStart),
     injects: parseInjects(content, injectProperty, scriptStart),
   }

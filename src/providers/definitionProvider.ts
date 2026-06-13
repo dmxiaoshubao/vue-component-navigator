@@ -83,6 +83,15 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
       return locationResult(definitions)
     }
 
+    for (const call of file.scriptIndex.eventBusCalls) {
+      if (containsOffsetStrict(call.eventSpan, offset)) {
+        const usages = call.kind === 'emit'
+          ? this.index.findEventBusListeners(call.busName, call.eventName)
+          : this.index.findEventBusEmits(call.busName, call.eventName)
+        return locationResult(uniqueLocations(usages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))))
+      }
+    }
+
     for (const component of file.templateIndex.components) {
       const children = this.index.resolveTemplateComponentUris(file, component)
         .map((childUri) => this.index.getFile(childUri))
@@ -174,6 +183,16 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
     const eventUsages = this.index.findTemplateEventUsagesFromSource(sourceUri, offset)
     if (eventUsages.length > 0) {
       return eventUsages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
+    }
+
+    const eventBusListeners = this.index.findEventBusListenersFromSource(sourceUri, offset)
+    if (eventBusListeners.length > 0) {
+      return eventBusListeners.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
+    }
+
+    const eventBusEmits = this.index.findEventBusEmitsFromSource(sourceUri, offset)
+    if (eventBusEmits.length > 0) {
+      return eventBusEmits.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
     }
 
     const provideDefinitions = this.index.findProvideDefinitionsFromInjectSource(sourceUri, offset)

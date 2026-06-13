@@ -40,6 +40,7 @@ export class Location {
 
 export enum CompletionItemKind {
   Method = 1,
+  Event = 2,
 }
 
 export class CompletionItem {

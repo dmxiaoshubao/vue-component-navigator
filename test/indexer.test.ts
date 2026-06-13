@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { WorkspaceIndex, findRefMethodAccess } from '../src/indexer/workspaceIndex'
@@ -8,6 +9,11 @@ const fixtureRoot = path.resolve(__dirname, '../test-fixtures/vue2-basic')
 
 function readFixture(name: string): string {
   return fs.readFileSync(path.join(fixtureRoot, name), 'utf8')
+}
+
+function writeText(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  fs.writeFileSync(filePath, content)
 }
 
 async function buildIndex(): Promise<WorkspaceIndex> {
@@ -478,6 +484,168 @@ export default {}
 `)
 
     expect(file.scriptIndex.emits.map((emit) => emit.eventName)).toEqual(['direct', 'explicit'])
+  })
+
+  it('解析 Vue 2 Event Bus 的静态 emit 和 listener 调用', () => {
+    const index = new WorkspaceIndex()
+    const uri = path.join(fixtureRoot, 'EventBusUsage.vue')
+    const file = index.indexContent(uri, `
+<template>
+  <div>
+    <button @click="this.$bus.$emit('fromTemplate')" />
+    <button @click="$bus.$on('templateListen', noop)" />
+  </div>
+</template>
+<script>
+export default {
+  mounted() {
+    this.$bus.$on('joinOrDeleteCollect', async ([item, isFavorite]) => {})
+    this.$bus?.$emit('cancelCollect', item)
+    this.$bus.$once('refreshExchangeList', () => {})
+    this.$bus.$off('cancelCollect', this.onCancelCollect)
+    this.$emit('local')
+  },
+}
+</script>
+`)
+
+    expect(file.scriptIndex.eventBusCalls.map((call) => [call.method, call.kind, call.eventName])).toEqual([
+      ['$on', 'listener', 'joinOrDeleteCollect'],
+      ['$emit', 'emit', 'cancelCollect'],
+      ['$once', 'listener', 'refreshExchangeList'],
+      ['$off', 'listener', 'cancelCollect'],
+      ['$emit', 'emit', 'fromTemplate'],
+      ['$on', 'listener', 'templateListen'],
+    ])
+    expect(file.scriptIndex.emits.map((emit) => emit.eventName)).toEqual(['local'])
+    expect(file.scriptIndex.eventBusCalls.every((call) => call.busName === '$bus')).toBe(true)
+    expect(index.findEventBusListeners('$bus', 'joinOrDeleteCollect')).toHaveLength(1)
+    expect(index.findEventBusListeners('$bus', 'cancelCollect').map((usage) => usage.method)).toEqual(['$off'])
+    expect(index.findEventBusEmits('$bus', 'cancelCollect')).toHaveLength(1)
+    expect(index.findEventBusEmits('$bus', 'local')).toHaveLength(0)
+    expect(index.getEventBusEventNames('$bus')).toEqual(['cancelCollect', 'fromTemplate', 'joinOrDeleteCollect', 'refreshExchangeList', 'templateListen'])
+
+    index.syncContent(uri, `
+<script>
+export default {
+  mounted() {
+    this.$bus.$emit('nextEvent')
+  },
+}
+</script>
+`)
+    expect(index.getEventBusEventNames('$bus')).toEqual(['nextEvent'])
+  })
+
+  it('通过 Vue.prototype 注册入口识别非 $bus 的 Event Bus 名称', async () => {
+    const index = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-event-bus-entry-'))
+    writeText(path.join(root, 'src/index.js'), `
+import Vue from 'vue'
+Vue.prototype.$eventBus = new Vue()
+`)
+    await index.refreshEventBusRegistrations(root)
+    const file = index.indexContent(path.join(root, 'CustomEventBusUsage.vue'), `
+<script>
+export default {
+  mounted() {
+    this.$eventBus.$on('refreshExchangeList', () => {})
+    this.$eventBus.$emit('refreshExchangeList')
+    this.$unknownBus.$emit('refreshExchangeList')
+  },
+}
+</script>
+`)
+
+    expect(index.getEventBusNames()).toContain('$eventBus')
+    expect(file.scriptIndex.eventBusCalls.map((call) => [call.busName, call.kind, call.eventName])).toEqual([
+      ['$eventBus', 'listener', 'refreshExchangeList'],
+      ['$eventBus', 'emit', 'refreshExchangeList'],
+    ])
+    expect(index.findEventBusListeners('$eventBus', 'refreshExchangeList')).toHaveLength(1)
+    expect(index.findEventBusEmits('$eventBus', 'refreshExchangeList')).toHaveLength(1)
+    expect(index.findEventBusEmits('$unknownBus', 'refreshExchangeList')).toHaveLength(0)
+  })
+
+  it('Event Bus 入口探测只查 src/index|main 和一层 import', async () => {
+    const oneLevelRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-event-bus-one-level-'))
+    writeText(path.join(oneLevelRoot, 'src/main.js'), `
+import './plugins/event-bus'
+import('./plugins/dynamic-event-bus')
+require('./plugins/require-event-bus')
+import('./plugins/deep-entry')
+`)
+    writeText(path.join(oneLevelRoot, 'src/plugins/event-bus.js'), `
+import Vue from 'vue'
+const bus = new Vue()
+Vue.prototype.$eventBus = bus
+`)
+    writeText(path.join(oneLevelRoot, 'src/plugins/dynamic-event-bus.js'), `
+import Vue from 'vue'
+Vue.prototype.$dynamicBus = new Vue()
+`)
+    writeText(path.join(oneLevelRoot, 'src/plugins/require-event-bus.js'), `
+import Vue from 'vue'
+Vue.prototype.$requireBus = new Vue()
+`)
+    writeText(path.join(oneLevelRoot, 'src/plugins/deep-entry.js'), `
+import './deep-event-bus'
+`)
+    writeText(path.join(oneLevelRoot, 'src/plugins/deep-event-bus.js'), `
+import Vue from 'vue'
+Vue.prototype.$deepImportedBus = new Vue()
+`)
+
+    const oneLevelIndex = new WorkspaceIndex()
+    await oneLevelIndex.refreshEventBusRegistrations(oneLevelRoot)
+    expect(oneLevelIndex.getEventBusNames()).toContain('$eventBus')
+    expect(oneLevelIndex.getEventBusNames()).toContain('$dynamicBus')
+    expect(oneLevelIndex.getEventBusNames()).toContain('$requireBus')
+    expect(oneLevelIndex.getEventBusNames()).not.toContain('$deepImportedBus')
+
+    const deepRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-event-bus-deep-'))
+    writeText(path.join(deepRoot, 'src/index.js'), `
+import './bootstrap'
+`)
+    writeText(path.join(deepRoot, 'src/bootstrap.js'), `
+import './plugins/event-bus'
+`)
+    writeText(path.join(deepRoot, 'src/plugins/event-bus.js'), `
+import Vue from 'vue'
+Vue.prototype.$deepBus = new Vue()
+`)
+
+    const deepIndex = new WorkspaceIndex()
+    await deepIndex.refreshEventBusRegistrations(deepRoot)
+    expect(deepIndex.getEventBusNames()).not.toContain('$deepBus')
+  })
+
+  it('Event Bus 入口探测会检查 index 直接动态 import 的每个文件', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-event-bus-index-imports-'))
+    writeText(path.join(root, 'src/index.js'), `
+import('./bootstrap')
+import('./entry')
+`)
+    writeText(path.join(root, 'src/bootstrap.js'), `
+import './plugins/nested-event-bus'
+import Vue from 'vue'
+Vue.prototype.$bootstrapBus = new Vue()
+`)
+    writeText(path.join(root, 'src/entry.js'), `
+import Vue from 'vue'
+Vue.prototype.$entryBus = new Vue()
+`)
+    writeText(path.join(root, 'src/plugins/nested-event-bus.js'), `
+import Vue from 'vue'
+Vue.prototype.$nestedBus = new Vue()
+`)
+
+    const index = new WorkspaceIndex()
+    await index.refreshEventBusRegistrations(root)
+
+    expect(index.getEventBusNames()).toContain('$bootstrapBus')
+    expect(index.getEventBusNames()).toContain('$entryBus')
+    expect(index.getEventBusNames()).not.toContain('$nestedBus')
   })
 
   it('忽略动态 mixin 表达式', () => {

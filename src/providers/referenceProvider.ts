@@ -52,6 +52,15 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
       return []
     }
 
+    for (const call of file.scriptIndex.eventBusCalls) {
+      if (containsOffsetStrict(call.eventSpan, offset)) {
+        const usages = call.kind === 'emit'
+          ? this.index.findEventBusListeners(call.busName, call.eventName)
+          : this.index.findEventBusEmits(call.busName, call.eventName)
+        return usages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
+      }
+    }
+
     for (const method of file.scriptIndex.methods) {
       if (containsOffsetStrict(method.span, offset)) {
         return findIndexedRefMethodUsages(this.index, file.uri, method.name).map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
@@ -84,6 +93,8 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
       ...this.index.findRefMethodUsagesFromSource(sourceUri, offset),
       ...this.index.findTemplatePropUsagesFromSource(sourceUri, offset),
       ...this.index.findTemplateEventUsagesFromSource(sourceUri, offset),
+      ...this.index.findEventBusListenersFromSource(sourceUri, offset),
+      ...this.index.findEventBusEmitsFromSource(sourceUri, offset),
       ...this.index.findInjectUsagesFromProvideSource(sourceUri, offset),
     ].map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
   }

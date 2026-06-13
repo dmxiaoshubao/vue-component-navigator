@@ -1,4 +1,5 @@
-import type { EmitInfo, StaticComponentNameBinding, TemplateAttrUsage, TemplateComponentUsage, TemplateIndex } from './types'
+import type { EmitInfo, EventBusCall, StaticComponentNameBinding, TemplateAttrUsage, TemplateComponentUsage, TemplateIndex } from './types'
+import { parseEventBusCalls } from './eventBusParser'
 import { toCamelCase, toKebabCase } from '../utils/casing'
 import { readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
@@ -211,10 +212,11 @@ function findOpenTagEnd(template: string, openStart: number): number {
   return template.length
 }
 
-export function parseTemplate(content: string, templateStart: number, registeredTags: string[], staticComponentNames: StaticComponentNameBinding[] = []): TemplateIndex {
+export function parseTemplate(content: string, templateStart: number, registeredTags: string[], staticComponentNames: StaticComponentNameBinding[] = [], eventBusNames: readonly string[] = []): TemplateIndex {
   const uniqueTags = new Set(registeredTags.map((tag) => toKebabCase(tag)))
   const components: TemplateComponentUsage[] = []
   const emits: EmitInfo[] = []
+  const eventBusCalls: EventBusCall[] = []
 
   const pattern = /<([A-Za-z][\w-]*)(?=\s|>|\/)/g
   let match: RegExpExecArray | null
@@ -234,6 +236,7 @@ export function parseTemplate(content: string, templateStart: number, registered
     const openEnd = findOpenTagEnd(content, match.index)
     const openTag = content.slice(match.index, openEnd)
     emits.push(...parseTemplateEmits(openTag, templateStart + match.index))
+    eventBusCalls.push(...parseTemplateEventBusCalls(openTag, templateStart + match.index, eventBusNames))
     const dynamicTags = isDynamicComponentTag(rawTag)
       ? resolveDynamicComponentTags(extractDynamicIsExpression(openTag), staticComponentNames, uniqueTags)
       : undefined
@@ -255,7 +258,7 @@ export function parseTemplate(content: string, templateStart: number, registered
   }
 
   components.sort((a, b) => a.span.start - b.span.start)
-  return { components, emits }
+  return { components, emits, eventBusCalls }
 }
 
 function isDynamicComponentTag(tag: string): boolean {
@@ -684,6 +687,14 @@ function parseTemplateEmits(openTag: string, openStart: number): EmitInfo[] {
     emits.push(...parseTemplateExpressionEmits(attr.value, attr.start))
   }
   return emits
+}
+
+function parseTemplateEventBusCalls(openTag: string, openStart: number, eventBusNames: readonly string[]): EventBusCall[] {
+  const calls: EventBusCall[] = []
+  for (const attr of extractExpressionAttrValues(openTag, openStart)) {
+    calls.push(...parseEventBusCalls(attr.value, attr.start, eventBusNames))
+  }
+  return calls
 }
 
 function parseTemplateExpressionEmits(expression: string, expressionStart: number): EmitInfo[] {

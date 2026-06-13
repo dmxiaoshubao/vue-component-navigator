@@ -14,6 +14,7 @@
 | `$refs` 方法悬浮 | 支持 | 展示方法签名、JSDoc 摘要、参数和定义链接。 |
 | `$emit` 到模板监听 | 支持 | 从 `this.$emit('event')` 或 template 表达式里的 `$emit('event')` 跳到父组件模板里的事件监听位置。 |
 | 模板事件到子组件 emit | 支持 | 从 `@event` / `v-on:event` 跳到子组件内匹配的 `this.$emit('event')`。支持 `.once`、`.stop` 等修饰符。 |
+| Vue 2 Event Bus | 支持 | 支持静态 `this.$bus.$emit('event')`、`this.$bus.$on('event', ...)`、`this.$bus.$once('event', ...)`、`this.$bus.$off('event', ...)` 的跳转、悬浮概览、引用查询、方法补全和事件名补全。悬浮概览会标注匹配位置来自 `$emit`、`$on`、`$once` 还是 `$off`。默认支持 `$bus`；额外名称会异步从 `src/index.js`、`src/main.js`、对应 TypeScript 文件或它们一层字面量 `import`、`import()`、`require()` 目标中识别，例如 `Vue.prototype.$eventBus = new Vue()`。Event Bus 关系会和组件 `$emit` 关系分开索引。 |
 | 模板 prop 到子组件 prop | 支持 | 从 `:prop`、`v-bind:prop`、静态 prop、`.sync` prop 跳到子组件 prop 定义。 |
 | 模板 prop / prop 定义悬浮 | 支持 | 展示 prop 定义片段、JSDoc 摘要、定义链接，并在 prop 定义处展示模板使用概览。 |
 | 模板事件悬浮 | 支持 | 在模板监听处展示 emit 定义，在 emit 位置展示引用概览。 |
@@ -42,6 +43,7 @@
 | 动态组件注册或拼接路径 | 不支持 | 无法静态证明的组件注册和 `import('./' + type + '.vue')` 这类拼接路径不做猜测，避免误跳转；静态动态组件使用和静态异步 import 支持。 |
 | 动态或全局 mixin | 不支持 | 只合并静态 import 的局部 `mixins: [...]`；`Vue.mixin(...)`、spread、条件 mixin 和 package mixin 会被忽略。 |
 | 动态 refs / prop 名 / event 名 | 不支持 | 只索引静态可证明的关系。 |
+| 动态 Event Bus 名称 | 不支持 | 只索引 `$bus.$emit`、`$bus.$on`、`$bus.$once`、`$bus.$off` 等已知 Event Bus 根对象中的静态字符串事件名；额外根对象名称需要能通过 `src/index.*`、`src/main.*` 或它们一层字面量 `import`、`import()`、`require()` 目标中的 `Vue.prototype.$xxx = new Vue()` 识别。 |
 | 动态 provide / inject key | 不支持 | 只索引静态字符串/对象 key；不会推断运行时祖先/后代作用域。 |
 | 局部组件标签名定义跳转 | 刻意不处理 | 避免和 Vue 官方扩展产生重复定义；局部组件的 prop、event、ref 关系仍支持。 |
 | 第三方 package 组件 | 忽略 | 解析到 `node_modules` 的组件会被过滤，即使它通过 Element UI 这类插件全局注册。 |

@@ -273,6 +273,14 @@ export function findIndexedTemplateEventUsages(index: WorkspaceIndex, childUri: 
   return index.findTemplateEventUsages(childUri, eventName)
 }
 
+export function findIndexedEventBusEmits(index: WorkspaceIndex, busName: string, eventName: string): UsageInfo[] {
+  return index.findEventBusEmits(busName, eventName)
+}
+
+export function findIndexedEventBusListeners(index: WorkspaceIndex, busName: string, eventName: string): UsageInfo[] {
+  return index.findEventBusListeners(busName, eventName)
+}
+
 function templateComponentMatches(file: VueFileIndex, component: VueFileIndex['templateIndex']['components'][number], childUri: string): boolean {
   const tags = component.dynamicTags?.length ? component.dynamicTags : [component.tag]
   return tags.some((tag) => findRegisteredComponent(file, tag) === childUri)
