@@ -12,27 +12,30 @@
 
 ### `$refs` 跳转
 
-![$refs 跳转](docs/gifs/refs-navigation.gif)
-
 展示从 `this.$refs.child.open()` 跳到子组件方法，并展示方法补全和 hover。
+
+##### ![$refs 跳转](docs/gifs/refs-navigation.gif)
+
 
 ### Props 和 Events
 
-![Props 和 Events](docs/gifs/props-events.gif)
-
 展示模板 prop 到子组件 prop 定义、模板事件到 `this.$emit(...)`、hover 概览和反向引用。
+
+##### ![Props 和 Events](docs/gifs/props-events.gif)
 
 ### Event Bus
 
-![Event Bus](docs/gifs/event-bus.gif)
-
 展示 `$emit`、`$on`、`$once`、`$off` 的跳转、事件名补全、方法补全，以及 hover 中的方法标记。
+
+##### ![Event Bus](docs/gifs/event-bus.gif)
+
 
 ### `provide` / `inject`
 
-![provide inject](docs/gifs/provide-inject.gif)
-
 展示静态 `inject` key 跳到最近的静态 provider，以及 provider 反查 consumer。
+
+##### ![provide inject](docs/gifs/provide-inject.gif)
+
 
 ## 支持的场景
 
@@ -49,9 +52,10 @@
 
 ## Event Bus 入口
 
-`$bus` 默认支持。其他 Event Bus 名称需要能从 Vue prototype 注册中识别，例如：
+Event Bus 名称需要能从 Vue prototype 注册中识别，例如：
 
 ```js
+Vue.prototype.$bus = new Vue()
 Vue.prototype.$eventBus = new Vue()
 ```
 
@@ -81,6 +85,8 @@ Vue.prototype.$eventBus = new Vue()
 入口路径支持 workspace 相对路径，也支持 `jsconfig.json` / `tsconfig.json` 中 `compilerOptions.baseUrl` 和 `compilerOptions.paths` 定义的别名。
 
 扫描范围只包括入口文件本身，以及入口直接字面量 `import`、`import()`、`require()` 的一层文件。不会继续递归扫整个项目。
+
+只有在这些入口文件中识别到的 bus 名称才会参与 Event Bus 分析。`$bus` 不再有内置兜底。
 
 ## 命令
 

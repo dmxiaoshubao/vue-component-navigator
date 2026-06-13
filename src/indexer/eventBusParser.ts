@@ -1,7 +1,6 @@
 import type { EventBusCall, EventBusRegistration, TextSpan } from './types'
 import { readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
-export const defaultEventBusNames = ['$bus'] as const
 const eventBusMethods = {
   $emit: 'emit',
   $on: 'listener',
@@ -80,7 +79,7 @@ function readCallOpen(content: string, index: number): number | undefined {
 }
 
 function normalizeEventBusNames(names: readonly string[]): string[] {
-  return [...new Set([...defaultEventBusNames, ...names].filter(Boolean))]
+  return [...new Set(names.filter(Boolean))]
 }
 
 function eventBusRoots(names: readonly string[]): EventBusRoot[] {

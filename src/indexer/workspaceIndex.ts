@@ -2,7 +2,7 @@ import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import type { ComponentRegistration, EventBusCall, EventBusRegistration, EventBusUsageInfo, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex } from './types'
-import { defaultEventBusNames, parseEventBusRegistrations, parseStaticImportSources } from './eventBusParser'
+import { parseEventBusRegistrations, parseStaticImportSources } from './eventBusParser'
 import { resolveExternalRefComponent } from './externalComponentResolver'
 import { guessGlobalComponentsFromRequireContext, parseGlobalComponents } from './globalComponentParser'
 import { resolveImportPathWithExtensions, resolveProjectPathWithExtensions } from './relationResolver'
@@ -491,7 +491,6 @@ export class WorkspaceIndex {
 
   getEventBusNames(): string[] {
     return [...new Set([
-      ...defaultEventBusNames,
       ...[...this.eventBusRegistrations.values()].flat().map((registration) => registration.propertyName),
     ])]
   }

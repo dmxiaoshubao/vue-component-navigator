@@ -1,0 +1,10 @@
+{
+  "name": "vue-component-navigator-demo",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "element-ui": "^2.15.14",
+    "vant": "^2.12.54",
+    "vue": "^2.7.16"
+  }
+}

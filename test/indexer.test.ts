@@ -5,7 +5,8 @@ import { describe, expect, it } from 'vitest'
 import { WorkspaceIndex, findRefMethodAccess } from '../src/indexer/workspaceIndex'
 import { clearTsConfigCache, findEmit, findMethod, findProp, findRefComponent, findRefMethodUsages, findRegisteredComponent, findTemplateEventUsages, findTemplatePropUsages, resolveProjectPathWithExtensions } from '../src/indexer/relationResolver'
 
-const fixtureRoot = path.resolve(__dirname, '../test-fixtures/vue2-basic')
+const fixtureRoot = path.resolve(__dirname, './fixtures/vue2-basic')
+const demoFixtureRoot = path.resolve(__dirname, '../test-fixtures/vue2-demo')
 
 function readFixture(name: string): string {
   return fs.readFileSync(path.join(fixtureRoot, name), 'utf8')
@@ -96,7 +97,34 @@ async function buildIndex(): Promise<WorkspaceIndex> {
   return index
 }
 
+async function buildDemoIndex(): Promise<WorkspaceIndex> {
+  const index = new WorkspaceIndex()
+  await index.indexWorkspace(demoFixtureRoot)
+  return index
+}
+
 describe('Vue2 indexer', () => {
+  it('demo fixture 覆盖录屏用的核心导航关系', async () => {
+    const index = await buildDemoIndex()
+    const workspace = index.getFile(path.join(demoFixtureRoot, 'src/DemoWorkspace.vue'))!
+    const panel = index.getFile(path.join(demoFixtureRoot, 'src/DemoPanel.vue'))!
+    const listener = index.getFile(path.join(demoFixtureRoot, 'src/DemoBusListener.vue'))!
+    const dynamicUsage = workspace.templateIndex.components.find((component) => component.tag === 'component')!
+
+    expect(index.getEventBusNames()).toContain('$bus')
+    expect(index.resolveRefComponent(workspace, 'panel')).toBe(panel.uri)
+    expect(index.resolveRefComponent(workspace, 'globalPanel')).toBe(panel.uri)
+    expect(dynamicUsage.dynamicTags).toEqual(['DemoPanel'])
+    expect(index.findTemplatePropUsages(panel.uri, 'title')).toHaveLength(3)
+    expect(index.findTemplateEventUsages(panel.uri, 'save')).toHaveLength(3)
+    expect(index.findRefMethodUsages(panel.uri, 'open')).toHaveLength(1)
+    expect(index.findEventBusListeners('$bus', 'demo:refresh').map((usage) => usage.method).sort()).toEqual(['$off', '$on'])
+    expect(index.findEventBusListeners('$bus', 'demo:refresh-once').map((usage) => usage.method).sort()).toEqual(['$off', '$once'])
+    expect(index.findEventBusEmits('$bus', 'demo:refresh')).toHaveLength(2)
+    expect(panel.scriptIndex.injects.map((inject) => inject.key)).toContain('demoService')
+    expect(listener.scriptIndex.methods.map((method) => method.name)).toEqual(['handleRefresh', 'handleRefreshOnce'])
+  })
+
   it('解析 SFC、imports、components、props、methods 和 emits', async () => {
     const index = await buildIndex()
     const parent = index.getFile(path.join(fixtureRoot, 'Parent.vue'))!
@@ -558,11 +586,18 @@ export default {}
 `)
 
     expect(file.scriptIndex.emits.map((emit) => emit.eventName)).toEqual(['direct', 'explicit'])
+    expect(file.scriptIndex.eventBusCalls).toHaveLength(0)
   })
 
-  it('解析 Vue 2 Event Bus 的静态 emit 和 listener 调用', () => {
+  it('解析入口注册后的 Vue 2 Event Bus 静态 emit 和 listener 调用', async () => {
     const index = new WorkspaceIndex()
-    const uri = path.join(fixtureRoot, 'EventBusUsage.vue')
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-event-bus-usage-'))
+    writeText(path.join(root, 'src/main.js'), `
+import Vue from 'vue'
+Vue.prototype.$bus = new Vue()
+`)
+    await index.refreshEventBusRegistrations(root)
+    const uri = path.join(root, 'EventBusUsage.vue')
     const file = index.indexContent(uri, `
 <template>
   <div>

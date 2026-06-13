@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('vscode', () => import('./vscodeMock'))
 
-const fixtureRoot = path.resolve(__dirname, '../test-fixtures/vue2-basic')
+const fixtureRoot = path.resolve(__dirname, './fixtures/vue2-basic')
 
 class TestDocument {
   uri: { fsPath: string }
@@ -351,6 +351,32 @@ export default {
     expect(emitDefinitions[0].uri.fsPath.endsWith('Parent.vue')).toBe(true)
     expect(eventDefinitions).toHaveLength(2)
     expect(eventDefinitions[0].uri.fsPath.endsWith('Child.vue')).toBe(true)
+  })
+
+  it('未从入口注册的 $bus 不提供 Event Bus 能力', () => {
+    const localIndex = new WorkspaceIndex()
+    const uri = path.join(fixtureRoot, 'UnregisteredBus.vue')
+    const content = `
+<script>
+export default {
+  mounted() {
+    this.$bus.$emit('hiddenEvent')
+    this.$bus.
+  },
+}
+</script>
+`
+    localIndex.indexContent(uri, content)
+    const document = new TestDocument(uri, content) as any
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const completionProvider = new VueCompletionProvider(localIndex)
+    const eventOffset = content.indexOf("'hiddenEvent'") + 2
+    const completionOffset = content.indexOf('this.$bus.') + 'this.$bus.'.length
+
+    expect(definitionProvider.provideDefinition(document, positionAt(content, eventOffset))).toBeUndefined()
+    expect(hoverProvider.provideHover(document, positionAt(content, eventOffset))).toBeUndefined()
+    expect(completionProvider.provideCompletionItems(document, positionAt(content, completionOffset))).toBeUndefined()
   })
 
   it('Event Bus emit 和 listener 支持双向定义、悬浮和引用', async () => {

@@ -12,27 +12,29 @@ It does not try to replace the official Vue tooling. Local component tag definit
 
 ### `$refs` Navigation
 
-![refs navigation](docs/gifs/refs-navigation.gif)
-
 Shows jumping from `this.$refs.child.open()` to the child component method, with method completion and hover.
+
+##### ![refs navigation](docs/gifs/refs-navigation.gif)
+
 
 ### Props And Events
 
-![props and events](docs/gifs/props-events.gif)
-
 Shows template prop definition lookup, component `$emit` lookup, hover summaries, and reverse references.
+
+##### ![props and events](docs/gifs/props-events.gif)
 
 ### Event Bus
 
-![event bus](docs/gifs/event-bus.gif)
-
 Shows `$emit`, `$on`, `$once`, and `$off` navigation, event-name completion, method completion, and hover labels.
+
+##### ![event bus](docs/gifs/event-bus.gif)
 
 ### `provide` / `inject`
 
-![provide inject](docs/gifs/provide-inject.gif)
-
 Shows jumping from static `inject` keys to the nearest static provider, and from providers back to consumers.
+
+##### ![provide inject](docs/gifs/provide-inject.gif)
+
 
 ## What It Handles
 
@@ -49,9 +51,10 @@ Shows jumping from static `inject` keys to the nearest static provider, and from
 
 ## Event Bus Entry
 
-`$bus` works out of the box. Other Event Bus names are detected from Vue prototype registrations such as:
+Event Bus names are detected from Vue prototype registrations such as:
 
 ```js
+Vue.prototype.$bus = new Vue()
 Vue.prototype.$eventBus = new Vue()
 ```
 
@@ -81,6 +84,8 @@ Multiple entries are also supported:
 Configured entries support workspace-relative paths and aliases from `compilerOptions.baseUrl` / `compilerOptions.paths` in `jsconfig.json` or `tsconfig.json`.
 
 The scanner only checks the entry file and one layer of literal `import`, `import()`, or `require()` targets. It does not recursively crawl the whole project.
+
+Event Bus usage is ignored until the bus name is found from these entry files. There is no built-in fallback for `$bus`.
 
 ## Commands
 
