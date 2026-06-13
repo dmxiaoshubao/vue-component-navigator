@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { MethodInfo, SourceLocation, TextSpan, VueFileIndex } from './types'
 import { createLineStarts } from '../utils/position'
+import { skipStringCommentOrRegex } from '../utils/scriptScan'
 
 interface ComponentTypeLibrary {
   packageName: string
@@ -23,6 +24,7 @@ const componentTypeLibraries: ComponentTypeLibrary[] = [
     typesDir: 'types',
   },
 ]
+const MAX_TYPE_FILE_BYTES = 512 * 1024
 
 export function resolveExternalRefComponent(root: string, tag: string): VueFileIndex | undefined {
   for (const library of componentTypeLibraries) {
@@ -43,11 +45,11 @@ function resolveComponentFromLibrary(root: string, tag: string, library: Compone
   const componentPart = tag.slice(library.tagPrefix.length)
   const componentName = `${library.classNamePrefix ?? ''}${toPascalCase(componentPart)}`
   const typeUri = path.join(root, 'node_modules', library.packageName, library.typesDir, `${componentPart}.d.ts`)
-  if (!fs.existsSync(typeUri)) {
-    return undefined
-  }
-
   try {
+    const stat = fs.statSync(typeUri)
+    if (!stat.isFile() || stat.size > MAX_TYPE_FILE_BYTES) {
+      return undefined
+    }
     return parseDtsComponent(typeUri, componentName)
   } catch {
     return undefined
@@ -102,6 +104,12 @@ function findClassBody(content: string, className: string): TextSpan | undefined
 
   let depth = 0
   for (let index = open; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
     const char = content[index]
     if (char === '{') {
       depth += 1
@@ -120,20 +128,36 @@ function findClassBody(content: string, className: string): TextSpan | undefined
 }
 
 function parseClassMethods(content: string, body: TextSpan, lineStarts: number[], uri: string): MethodInfo[] {
-  const methods: MethodInfo[] = []
+  const candidates: Array<{ name: string, params: string, returnType: string, fullText: string, declarationStart: number }> = []
   const seen = new Set<string>()
   const bodyContent = content.slice(body.start, body.end)
-  const pattern = /^\s*([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*:\s*([^;\r\n]+)/gm
-  let match: RegExpExecArray | null
+  const patterns = [
+    /^\s*([A-Za-z_$][\w$]*)\??\s*(?:<[^;\r\n({]*>)?\s*\(([^)]*)\)\s*:\s*([^;\r\n]+)/gm,
+    /^\s*([A-Za-z_$][\w$]*)\??\s*:\s*\(([^)]*)\)\s*=>\s*([^;\r\n]+)/gm,
+  ]
 
-  while ((match = pattern.exec(bodyContent))) {
-    const [fullText, name, params, returnType] = match
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null
+    while ((match = pattern.exec(bodyContent))) {
+      const [fullText, name, params, returnType] = match
+      candidates.push({
+        name,
+        params,
+        returnType,
+        fullText,
+        declarationStart: body.start + match.index,
+      })
+    }
+  }
+
+  const methods: MethodInfo[] = []
+  for (const candidate of candidates.sort((left, right) => left.declarationStart - right.declarationStart)) {
+    const { fullText, name, params, returnType, declarationStart } = candidate
     if (seen.has(name)) {
       continue
     }
     seen.add(name)
 
-    const declarationStart = body.start + match.index
     const nameStart = declarationStart + fullText.indexOf(name)
     const span: TextSpan = { start: nameStart, end: nameStart + name.length }
     const signature = `${name}(${params.trim()}): ${returnType.trim()}`

@@ -60,6 +60,19 @@ export function resolveProjectPathWithExtensions(root: string, source: string, w
   return resolveFromTsConfig(path.join(root, '__entry__.js'), normalized, workspaceRoots.length > 0 ? workspaceRoots : [root], extensions)
 }
 
+export function clearTsConfigCache(root?: string): void {
+  if (!root) {
+    tsConfigCache.clear()
+    return
+  }
+
+  for (const directory of [...tsConfigCache.keys()]) {
+    if (directory === root || isInsideDirectory(directory, root)) {
+      tsConfigCache.delete(directory)
+    }
+  }
+}
+
 function resolveFromTsConfig(fromUri: string, source: string, workspaceRoots: string[], extensions: string[]): string | undefined {
   const config = findNearestTsConfig(path.dirname(fromUri), workspaceRoots)
   if (!config) {

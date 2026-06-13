@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { WorkspaceIndex, findRefMethodAccess } from '../src/indexer/workspaceIndex'
-import { findEmit, findMethod, findProp, findRefComponent, findRefMethodUsages, findRegisteredComponent, findTemplateEventUsages, findTemplatePropUsages } from '../src/indexer/relationResolver'
+import { clearTsConfigCache, findEmit, findMethod, findProp, findRefComponent, findRefMethodUsages, findRegisteredComponent, findTemplateEventUsages, findTemplatePropUsages, resolveProjectPathWithExtensions } from '../src/indexer/relationResolver'
 
 const fixtureRoot = path.resolve(__dirname, '../test-fixtures/vue2-basic')
 
@@ -659,6 +659,27 @@ Vue.prototype.$configuredBus = new Vue()
     expect(index.getEventBusNames()).not.toContain('$defaultBus')
   })
 
+  it('Event Bus 多入口会分别检查没有直接注册的一层 import', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-event-bus-multi-entry-'))
+    writeText(path.join(root, 'src/direct.js'), `
+import Vue from 'vue'
+Vue.prototype.$directBus = new Vue()
+`)
+    writeText(path.join(root, 'src/indirect.js'), `
+import './plugins/event-bus'
+`)
+    writeText(path.join(root, 'src/plugins/event-bus.js'), `
+import Vue from 'vue'
+Vue.prototype.$indirectBus = new Vue()
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, ['src/direct', 'src/indirect'])
+
+    expect(index.getEventBusNames()).toContain('$directBus')
+    expect(index.getEventBusNames()).toContain('$indirectBus')
+  })
+
   it('Event Bus 入口配置和一层 import 支持 jsconfig 别名', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-event-bus-alias-entry-'))
     writeText(path.join(root, 'jsconfig.json'), JSON.stringify({
@@ -681,6 +702,34 @@ Vue.prototype.$aliasBus = new Vue()
     await index.indexWorkspace(root, undefined, '@/entry')
 
     expect(index.getEventBusNames()).toContain('$aliasBus')
+  })
+
+  it('清理 jsconfig/tsconfig 缓存后会重新读取别名配置', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-alias-cache-'))
+    writeText(path.join(root, 'jsconfig.json'), JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          '@/*': ['src/*'],
+        },
+      },
+    }))
+    writeText(path.join(root, 'src/entry.js'), 'export default {}')
+    writeText(path.join(root, 'app/entry.js'), 'export default {}')
+
+    expect(resolveProjectPathWithExtensions(root, '@/entry', [root], ['.js'])).toBe(path.join(root, 'src/entry.js'))
+
+    writeText(path.join(root, 'jsconfig.json'), JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          '@/*': ['app/*'],
+        },
+      },
+    }))
+    clearTsConfigCache(root)
+
+    expect(resolveProjectPathWithExtensions(root, '@/entry', [root], ['.js'])).toBe(path.join(root, 'app/entry.js'))
   })
 
   it('Event Bus 入口探测只查 src/index|main 和一层 import', async () => {
@@ -1171,6 +1220,45 @@ export default {
     expect(index.getFile(formTypeUri)?.scriptIndex.methods.map((method) => method.name)).toEqual(['submit', 'validate', 'resetValidation', 'scrollToField'])
     expect(index.findRefMethodUsages(fieldTypeUri, 'focus')).toHaveLength(1)
     expect(index.findRefMethodUsages(formTypeUri, 'validate')).toHaveLength(1)
+  })
+
+  it('$refs 读取外部类型时忽略注释括号并支持属性函数方法', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-external-ref-boundary-'))
+    writeText(path.join(root, 'node_modules/element-ui/types/input.d.ts'), `
+import Vue from 'vue'
+
+export declare class ElInput extends Vue {
+  /** comment with a closing brace } should not end the class */
+  focus: () => void
+
+  /** optional method */
+  blur?(): void
+}
+`)
+    const parentUri = path.join(root, 'src/Parent.vue')
+    writeText(parentUri, `
+<template>
+  <el-input ref="input" />
+</template>
+<script>
+export default {
+  mounted() {
+    this.$refs.input.focus()
+    this.$refs.input.blur()
+  },
+}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root)
+    const parent = index.getFile(parentUri)!
+    const inputTypeUri = path.join(root, 'node_modules/element-ui/types/input.d.ts')
+
+    expect(index.resolveRefComponent(parent, 'input')).toBe(inputTypeUri)
+    expect(index.getFile(inputTypeUri)?.scriptIndex.methods.map((method) => method.name)).toEqual(['focus', 'blur'])
+    expect(index.findRefMethodUsages(inputTypeUri, 'focus')).toHaveLength(1)
+    expect(index.findRefMethodUsages(inputTypeUri, 'blur')).toHaveLength(1)
   })
 
   it('全局注册文件与组件 name 变化后会刷新索引', async () => {

@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as vscode from 'vscode'
 import type { SourceLocation, TextSpan, UsageInfo, VueFileIndex } from './indexer/types'
+import { clearTsConfigCache } from './indexer/relationResolver'
 import { WorkspaceIndex } from './indexer/workspaceIndex'
 import { VueCompletionProvider } from './providers/completionProvider'
 import { VueDefinitionProvider } from './providers/definitionProvider'
@@ -134,6 +135,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     indexStatus = 'indexing'
     try {
+      clearTsConfigCache()
       const indexed = await vscode.window.withProgress({
         location: vscode.ProgressLocation.Window,
         title,
@@ -164,6 +166,27 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  async function refreshForAliasConfigChange(configPath: string): Promise<void> {
+    clearTsConfigCache(path.dirname(configPath))
+    if (await ensureVue2Workspace(false)) {
+      await indexWorkspaceFolders('Indexing Vue files...', false)
+    }
+  }
+
+  async function refreshForAliasConfigChanges(filePaths: string[]): Promise<void> {
+    const configPaths = filePaths.filter(isAliasConfigFile)
+    if (configPaths.length === 0) {
+      return
+    }
+
+    for (const configPath of configPaths) {
+      clearTsConfigCache(path.dirname(configPath))
+    }
+    if (await ensureVue2Workspace(false)) {
+      await indexWorkspaceFolders('Indexing Vue files...', false)
+    }
+  }
+
   function registerWorkspaceFeatures(): void {
     if (featuresRegistered) {
       return
@@ -181,6 +204,8 @@ export function activate(context: vscode.ExtensionContext): void {
           void refreshGlobalComponentsForVueFile(document.uri.fsPath)
         } else if (isScriptFile(document.uri.fsPath) && document.uri.scheme === 'file') {
           void syncGlobalComponentFile(document.uri.fsPath)
+        } else if (isAliasConfigFile(document.uri.fsPath) && document.uri.scheme === 'file') {
+          return refreshForAliasConfigChange(document.uri.fsPath)
         }
       }),
       vscode.workspace.onDidChangeTextDocument((event) => {
@@ -190,6 +215,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       }),
       vscode.workspace.onDidDeleteFiles(async (event) => {
+        await refreshForAliasConfigChanges(event.files.map((file) => file.fsPath))
         for (const file of event.files) {
           if (file.fsPath.endsWith('.vue')) {
             clearPendingSync(file.fsPath)
@@ -201,6 +227,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       }),
       vscode.workspace.onDidCreateFiles(async (event) => {
+        await refreshForAliasConfigChanges(event.files.map((file) => file.fsPath))
         await Promise.all(event.files.map((file) => {
           if (file.fsPath.endsWith('.vue')) {
             return indexVueFile(file.fsPath).then(refreshGlobalComponentsFromVueFiles)
@@ -212,6 +239,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }))
       }),
       vscode.workspace.onDidRenameFiles(async (event) => {
+        await refreshForAliasConfigChanges(event.files.flatMap((file) => [file.oldUri.fsPath, file.newUri.fsPath]))
         for (const file of event.files) {
           if (file.oldUri.fsPath.endsWith('.vue')) {
             clearPendingSync(file.oldUri.fsPath)
@@ -418,6 +446,11 @@ export function deactivate(): void {}
 
 function isScriptFile(filePath: string): boolean {
   return filePath.endsWith('.js') || filePath.endsWith('.ts')
+}
+
+function isAliasConfigFile(filePath: string): boolean {
+  const fileName = path.basename(filePath)
+  return fileName === 'jsconfig.json' || fileName === 'tsconfig.json'
 }
 
 async function hasVue2Workspace(): Promise<boolean> {

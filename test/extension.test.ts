@@ -145,6 +145,79 @@ export default { components: { Child } }
     expect(vscode.shownDocuments.at(-1)?.uri.fsPath).toBe(parentFile)
   })
 
+  it('保存 jsconfig 后会清理别名缓存并重建入口索引', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-jsconfig-refresh-'))
+    const jsconfigPath = path.join(root, 'jsconfig.json')
+    const listenerFile = path.join(root, 'Listener.vue')
+    const emitterFile = path.join(root, 'Emitter.vue')
+    writePackageJson(root)
+    vscode.configurationValues.set('vueComponentNavigator.entry', '@/entry')
+    writeText(jsconfigPath, JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          '@/*': ['src/*'],
+        },
+      },
+    }))
+    writeText(path.join(root, 'src/entry.js'), `
+import Vue from 'vue'
+Vue.prototype.$oldBus = new Vue()
+`)
+    writeText(path.join(root, 'app/entry.js'), `
+import Vue from 'vue'
+Vue.prototype.$newBus = new Vue()
+`)
+    writeText(listenerFile, `
+<script>
+export default {
+  mounted() {
+    this.$newBus.$on('refresh', () => {})
+  },
+}
+</script>
+`)
+    writeText(emitterFile, `
+<script>
+export default {
+  mounted() {
+    this.$newBus.$emit('refresh')
+  },
+}
+</script>
+`)
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+    await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+
+    writeText(jsconfigPath, JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          '@/*': ['app/*'],
+        },
+      },
+    }))
+    const configDocument = new TestDocument(jsconfigPath, fs.readFileSync(jsconfigPath, 'utf8'))
+    configDocument.languageId = 'json'
+    await vscode.saveListeners[0](configDocument)
+
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'event-bus-listeners',
+      busName: '$newBus',
+      eventName: 'refresh',
+    })
+
+    expect(vscode.quickPickCalls.at(-1)?.items[0].label).toContain('Listener.vue')
+    expect(vscode.shownDocuments.at(-1)?.uri.fsPath).toBe(listenerFile)
+  })
+
   it('非 Vue 2 workspace 不注册 provider 且不索引', async () => {
     const vscode = await import('vscode') as any
     vscode.resetMockState()

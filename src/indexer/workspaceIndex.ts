@@ -18,6 +18,7 @@ export interface IndexCancellationToken {
 }
 
 type EventBusEntryConfig = string | readonly string[]
+type TrackedUsageMap = Map<string, UsageInfo[]>
 
 export class WorkspaceIndex {
   private readonly files = new Map<string, VueFileIndex>()
@@ -40,6 +41,9 @@ export class WorkspaceIndex {
   private readonly parentComponents = new Map<string, Set<string>>()
   private readonly mixinIndexCache = new Map<string, { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } | undefined>()
   private readonly mixinSourceUris = new Set<string>()
+  private usageKeysByFile = new WeakMap<VueFileIndex, Map<TrackedUsageMap, Set<string>>>()
+  private injectUsageKeysByProvider = new WeakMap<VueFileIndex, Set<string>>()
+  private parentLinksByFile = new WeakMap<VueFileIndex, Set<string>>()
   private isBulkIndexing = false
 
   clear(): void {
@@ -598,8 +602,8 @@ export class WorkspaceIndex {
   }
 
   private async detectEventBusRegistrations(root: string, token?: IndexCancellationToken): Promise<EventBusRegistration[]> {
-    const entryContents: Array<{ uri: string, content: string }> = []
-    const directRegistrations: EventBusRegistration[] = []
+    const registrations: EventBusRegistration[] = []
+    const importedUris: string[] = []
 
     for (const uri of this.eventBusEntryCandidates(root)) {
       if (token?.isCancellationRequested) {
@@ -609,34 +613,30 @@ export class WorkspaceIndex {
       if (content === undefined) {
         continue
       }
-      entryContents.push({ uri, content })
-      directRegistrations.push(...parseEventBusRegistrations(uri, content))
-    }
+      const directRegistrations = parseEventBusRegistrations(uri, content)
+      if (directRegistrations.length > 0) {
+        registrations.push(...directRegistrations)
+        continue
+      }
 
-    if (directRegistrations.length > 0 || entryContents.length === 0) {
-      return directRegistrations
-    }
-
-    // 入口本身没有注册时，只展开入口直接引入的一层文件，避免递归扫描拖慢大项目。
-    const importedUris = uniqueStrings(entryContents.flatMap(({ uri, content }) => {
-      return parseStaticImportSources(content)
+      // 入口本身没有注册时，只展开该入口直接引入的一层文件，避免递归扫描拖慢大项目。
+      importedUris.push(...parseStaticImportSources(content)
         .map((source) => resolveImportPathWithExtensions(uri, source, this.workspaceRootsFor(root), ['.js', '.ts']))
         .filter((resolved): resolved is string => Boolean(resolved))
-        .filter((resolved) => this.isInsideWorkspace(resolved) && !isInsideNodeModules(resolved))
-    }))
+        .filter((resolved) => this.isInsideWorkspace(resolved) && !isInsideNodeModules(resolved)))
+    }
 
-    const importedRegistrations: EventBusRegistration[] = []
-    for (const uri of importedUris) {
+    for (const uri of uniqueStrings(importedUris)) {
       if (token?.isCancellationRequested) {
         return []
       }
       const content = await readTextIfExists(uri)
       if (content !== undefined) {
-        importedRegistrations.push(...parseEventBusRegistrations(uri, content))
+        registrations.push(...parseEventBusRegistrations(uri, content))
       }
     }
 
-    return importedRegistrations
+    return registrations
   }
 
   private eventBusEntryCandidates(root: string): string[] {
@@ -890,11 +890,102 @@ export class WorkspaceIndex {
     this.provideDefinitions.clear()
     this.injectUsages.clear()
     this.parentComponents.clear()
+    this.usageKeysByFile = new WeakMap()
+    this.injectUsageKeysByProvider = new WeakMap()
+    this.parentLinksByFile = new WeakMap()
+  }
+
+  private addUsage<T extends UsageInfo>(map: Map<string, T[]>, key: string, usage: T): void {
+    addUsage(map, key, usage)
+    const trackedMap = map as unknown as TrackedUsageMap
+    const usageMaps = this.usageKeysByFile.get(usage.file) ?? new Map<TrackedUsageMap, Set<string>>()
+    const keys = usageMaps.get(trackedMap) ?? new Set<string>()
+    keys.add(key)
+    usageMaps.set(trackedMap, keys)
+    this.usageKeysByFile.set(usage.file, usageMaps)
+  }
+
+  private addInjectUsageProvider(provider: VueFileIndex, key: string): void {
+    const keys = this.injectUsageKeysByProvider.get(provider) ?? new Set<string>()
+    keys.add(key)
+    this.injectUsageKeysByProvider.set(provider, keys)
+  }
+
+  private addParentLink(parent: VueFileIndex, childUri: string): void {
+    addParent(this.parentComponents, childUri, parent.uri)
+    const children = this.parentLinksByFile.get(parent) ?? new Set<string>()
+    children.add(childUri)
+    this.parentLinksByFile.set(parent, children)
+  }
+
+  private removeTrackedFileUsages(file: VueFileIndex): void {
+    const usageMaps = this.usageKeysByFile.get(file)
+    if (!usageMaps) {
+      return
+    }
+
+    for (const [map, keys] of usageMaps) {
+      for (const key of keys) {
+        removeFileUsageAtKey(map, key, file)
+      }
+    }
+    this.usageKeysByFile.delete(file)
+  }
+
+  private removeTrackedProviderUsages(file: VueFileIndex): void {
+    const keys = this.injectUsageKeysByProvider.get(file)
+    if (!keys) {
+      return
+    }
+
+    for (const key of keys) {
+      const usages = this.injectUsages.get(key) ?? []
+      for (const usage of usages) {
+        this.removeTrackedUsageKey(usage.file, this.injectUsages, key)
+      }
+      this.injectUsages.delete(key)
+    }
+    this.injectUsageKeysByProvider.delete(file)
+  }
+
+  private removeTrackedUsageKey<T extends UsageInfo>(file: VueFileIndex, map: Map<string, T[]>, key: string): void {
+    const usageMaps = this.usageKeysByFile.get(file)
+    const trackedMap = map as unknown as TrackedUsageMap
+    const keys = usageMaps?.get(trackedMap)
+    if (!keys) {
+      return
+    }
+    keys.delete(key)
+    if (keys.size === 0) {
+      usageMaps?.delete(trackedMap)
+    }
+    if (usageMaps?.size === 0) {
+      this.usageKeysByFile.delete(file)
+    }
+  }
+
+  private removeTrackedParentLinks(file: VueFileIndex): void {
+    const children = this.parentLinksByFile.get(file)
+    if (!children) {
+      return
+    }
+
+    for (const childUri of children) {
+      const parents = this.parentComponents.get(childUri)
+      if (!parents) {
+        continue
+      }
+      parents.delete(file.uri)
+      if (parents.size === 0) {
+        this.parentComponents.delete(childUri)
+      }
+    }
+    this.parentLinksByFile.delete(file)
   }
 
   private addProvideDefinitions(file: VueFileIndex): void {
     for (const provide of file.scriptIndex.provides) {
-      addUsage(this.provideDefinitions, provide.key, { file, span: provide.keySpan, sourceLocation: provide.sourceLocation })
+      this.addUsage(this.provideDefinitions, provide.key, { file, span: provide.keySpan, sourceLocation: provide.sourceLocation })
     }
   }
 
@@ -906,16 +997,16 @@ export class WorkspaceIndex {
         continue
       }
       for (const childUri of childUris) {
-        addParent(this.parentComponents, childUri, file.uri)
+        this.addParentLink(file, childUri)
         relationshipChildren.add(childUri)
       }
 
       for (const attr of component.attrs) {
         for (const childUri of childUris) {
           if (attr.kind === 'prop') {
-            addUsage(this.propUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
+            this.addUsage(this.propUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
           } else if (attr.kind === 'event') {
-            addUsage(this.eventUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
+            this.addUsage(this.eventUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
           }
         }
       }
@@ -923,7 +1014,7 @@ export class WorkspaceIndex {
 
     for (const call of file.refMethodCalls) {
       for (const childUri of this.resolveRefComponents(file, call.refName)) {
-        addUsage(this.refMethodUsages, usageKey(childUri, call.methodName), { file, span: call.methodSpan, sourceLocation: call.sourceLocation })
+        this.addUsage(this.refMethodUsages, usageKey(childUri, call.methodName), { file, span: call.methodSpan, sourceLocation: call.sourceLocation })
       }
     }
 
@@ -933,7 +1024,7 @@ export class WorkspaceIndex {
   private addEventBusUsages(file: VueFileIndex): void {
     for (const call of file.scriptIndex.eventBusCalls) {
       const usage = { file, span: call.eventSpan, sourceLocation: call.sourceLocation, method: call.method }
-      addUsage(call.kind === 'emit' ? this.eventBusEmits : this.eventBusListeners, eventBusKey(call.busName, call.eventName), usage)
+      this.addUsage(call.kind === 'emit' ? this.eventBusEmits : this.eventBusListeners, eventBusKey(call.busName, call.eventName), usage)
       addEventBusEventName(this.eventBusEventNames, call.busName, call.eventName)
     }
   }
@@ -941,7 +1032,9 @@ export class WorkspaceIndex {
   private addInjectUsages(file: VueFileIndex): void {
     for (const inject of file.scriptIndex.injects) {
       for (const provider of this.findProvideDefinitions(file, inject.key)) {
-        addUsage(this.injectUsages, usageKey(provider.file.uri, inject.key), { file, span: inject.keySpan, sourceLocation: inject.sourceLocation })
+        const key = usageKey(provider.file.uri, inject.key)
+        this.addUsage(this.injectUsages, key, { file, span: inject.keySpan, sourceLocation: inject.sourceLocation })
+        this.addInjectUsageProvider(provider.file, key)
       }
     }
   }
@@ -1182,16 +1275,10 @@ export class WorkspaceIndex {
   }
 
   private removeReverseIndex(file: VueFileIndex): void {
-    removeFileUsages(this.propUsages, file)
-    removeFileUsages(this.eventUsages, file)
-    removeFileUsages(this.eventBusEmits, file)
-    removeFileUsages(this.eventBusListeners, file)
+    this.removeTrackedFileUsages(file)
     removeEventBusEventNames(this.eventBusEventNames, this.eventBusEmits, this.eventBusListeners, file)
-    removeFileUsages(this.refMethodUsages, file)
-    removeFileUsages(this.provideDefinitions, file)
-    removeFileUsages(this.injectUsages, file)
-    removeProviderUsages(this.injectUsages, file)
-    removeParentLinks(this.parentComponents, file.uri)
+    this.removeTrackedProviderUsages(file)
+    this.removeTrackedParentLinks(file)
   }
 
   private relationshipChildren(file: VueFileIndex): Set<string> {
@@ -1506,23 +1593,16 @@ function addParent(map: Map<string, Set<string>>, childUri: string, parentUri: s
   }
 }
 
-function removeParentLinks(map: Map<string, Set<string>>, parentUri: string): void {
-  for (const [childUri, parents] of map) {
-    parents.delete(parentUri)
-    if (parents.size === 0) {
-      map.delete(childUri)
-    }
+function removeFileUsageAtKey<T extends UsageInfo>(map: Map<string, T[]>, key: string, file: VueFileIndex): void {
+  const usages = map.get(key)
+  if (!usages) {
+    return
   }
-}
-
-function removeFileUsages<T extends UsageInfo>(map: Map<string, T[]>, file: VueFileIndex): void {
-  for (const [key, usages] of map) {
-    const kept = usages.filter((usage) => usage.file !== file)
-    if (kept.length === 0) {
-      map.delete(key)
-    } else if (kept.length !== usages.length) {
-      map.set(key, kept)
-    }
+  const kept = usages.filter((usage) => usage.file !== file)
+  if (kept.length === 0) {
+    map.delete(key)
+  } else if (kept.length !== usages.length) {
+    map.set(key, kept)
   }
 }
 
@@ -1557,14 +1637,6 @@ function sameStringSet(left: Set<string>, right: Set<string>): boolean {
     }
   }
   return true
-}
-
-function removeProviderUsages(map: Map<string, UsageInfo[]>, file: VueFileIndex): void {
-  for (const key of [...map.keys()]) {
-    if (key.startsWith(`${file.uri}\0`)) {
-      map.delete(key)
-    }
-  }
 }
 
 function isScriptFile(file: string): boolean {
