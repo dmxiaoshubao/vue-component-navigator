@@ -168,7 +168,7 @@ export default { components: { Child } }
   })
 
   it('Vue 2 package 版本识别只接受 2.x 范围', async () => {
-    const { isVue2Version, packageHasVue2 } = await import('../src/extension')
+    const { isVue2Version, normalizeEntryConfig, packageHasVue2 } = await import('../src/extension')
 
     expect(isVue2Version('^2.7.16')).toBe(true)
     expect(isVue2Version('2.x')).toBe(true)
@@ -176,5 +176,7 @@ export default { components: { Child } }
     expect(isVue2Version('^3.4.0')).toBe(false)
     expect(isVue2Version('latest')).toBe(false)
     expect(packageHasVue2({ devDependencies: { vue: '~2.6.14' } })).toBe(true)
+    expect(normalizeEntryConfig(' src/entry.js ')).toEqual(['src/entry.js'])
+    expect(normalizeEntryConfig(['src/main.js', '', 'src/main.js', '@/bootstrap'])).toEqual(['src/main.js', '@/bootstrap'])
   })
 })

@@ -74,11 +74,13 @@ export const deleteListeners: Array<(event: any) => any> = []
 export const createListeners: Array<(event: any) => any> = []
 export const renameListeners: Array<(event: any) => any> = []
 export const workspaceFolderListeners: Array<(event: any) => any> = []
+export const configurationListeners: Array<(event: any) => any> = []
 export const informationMessages: string[] = []
 export const warningMessages: string[] = []
 export const quickPickCalls: Array<{ items: any[], options?: any }> = []
 export const shownDocuments: Array<{ uri: Uri, options?: any }> = []
 export const providerRegistrations: string[] = []
+export const configurationValues = new Map<string, any>()
 
 function disposable(): Disposable {
   return { dispose() {} }
@@ -92,11 +94,13 @@ export function resetMockState(): void {
   createListeners.length = 0
   renameListeners.length = 0
   workspaceFolderListeners.length = 0
+  configurationListeners.length = 0
   informationMessages.length = 0
   warningMessages.length = 0
   quickPickCalls.length = 0
   shownDocuments.length = 0
   providerRegistrations.length = 0
+  configurationValues.clear()
   workspace.workspaceFolders = []
   window.activeTextEditor = undefined
 }
@@ -174,4 +178,14 @@ export const workspace = {
     workspaceFolderListeners.push(listener)
     return disposable()
   },
+  onDidChangeConfiguration: (listener: (event: any) => any) => {
+    configurationListeners.push(listener)
+    return disposable()
+  },
+  getConfiguration: (section?: string) => ({
+    get: (key: string) => {
+      const scopedKey = section ? `${section}.${key}` : key
+      return configurationValues.get(scopedKey)
+    },
+  }),
 }

@@ -16,6 +16,80 @@ function writeText(filePath: string, content: string): void {
   fs.writeFileSync(filePath, content)
 }
 
+function writeElementUiTypes(root: string): void {
+  writeText(path.join(root, 'node_modules/element-ui/types/component.d.ts'), `
+import Vue from 'vue'
+export declare class ElementUIComponent extends Vue {}
+`)
+  writeText(path.join(root, 'node_modules/element-ui/types/form.d.ts'), `
+import { ElementUIComponent } from './component'
+
+/** Form Component */
+export declare class ElForm extends ElementUIComponent {
+  /**
+   * Validate the whole form
+   */
+  validate (): Promise<boolean>
+
+  /** reset all the fields and remove validation result */
+  resetFields (): void
+
+  /** clear validation message for certain fields */
+  clearValidate (props?: string | string[]): void
+}
+`)
+  writeText(path.join(root, 'node_modules/element-ui/types/input.d.ts'), `
+import { ElementUIComponent } from './component'
+
+/** Input Component */
+export declare class ElInput extends ElementUIComponent {
+  /**
+   * Focus the Input component
+   */
+  focus (): void
+
+  /**
+   * Blur the Input component
+   */
+  blur (): void
+
+  /**
+   * Select the text in input element
+   */
+  select (): void
+}
+`)
+}
+
+function writeVantTypes(root: string): void {
+  writeText(path.join(root, 'node_modules/vant/types/component.d.ts'), `
+import Vue from 'vue';
+export class VanComponent extends Vue {}
+`)
+  writeText(path.join(root, 'node_modules/vant/types/field.d.ts'), `
+import { VanComponent } from './component';
+
+export class Field extends VanComponent {
+  focus(): void;
+
+  blur(): void;
+}
+`)
+  writeText(path.join(root, 'node_modules/vant/types/form.d.ts'), `
+import { VanComponent } from './component';
+
+export class Form extends VanComponent {
+  submit(): void;
+
+  validate(name?: string | string[]): Promise<void>;
+
+  resetValidation(name?: string | string[]): void;
+
+  scrollToField(name: string, options?: boolean | ScrollIntoViewOptions): void;
+}
+`)
+}
+
 async function buildIndex(): Promise<WorkspaceIndex> {
   const index = new WorkspaceIndex()
   await index.indexWorkspace(fixtureRoot)
@@ -567,6 +641,48 @@ export default {
     expect(index.findEventBusEmits('$unknownBus', 'refreshExchangeList')).toHaveLength(0)
   })
 
+  it('Event Bus 入口配置优先于默认入口', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-event-bus-config-entry-'))
+    writeText(path.join(root, 'src/main.js'), `
+import Vue from 'vue'
+Vue.prototype.$defaultBus = new Vue()
+`)
+    writeText(path.join(root, 'custom/start.js'), `
+import Vue from 'vue'
+Vue.prototype.$configuredBus = new Vue()
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, ['custom/start'])
+
+    expect(index.getEventBusNames()).toContain('$configuredBus')
+    expect(index.getEventBusNames()).not.toContain('$defaultBus')
+  })
+
+  it('Event Bus 入口配置和一层 import 支持 jsconfig 别名', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-event-bus-alias-entry-'))
+    writeText(path.join(root, 'jsconfig.json'), JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          '@/*': ['src/*'],
+        },
+      },
+    }))
+    writeText(path.join(root, 'src/entry.js'), `
+import '@/plugins/event-bus'
+`)
+    writeText(path.join(root, 'src/plugins/event-bus.js'), `
+import Vue from 'vue'
+Vue.prototype.$aliasBus = new Vue()
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, '@/entry')
+
+    expect(index.getEventBusNames()).toContain('$aliasBus')
+  })
+
   it('Event Bus 入口探测只查 src/index|main 和一层 import', async () => {
     const oneLevelRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-event-bus-one-level-'))
     writeText(path.join(oneLevelRoot, 'src/main.js'), `
@@ -982,6 +1098,79 @@ export default {}
     expect(index.resolveComponent(index.getFile(parentUri)!, 'ElForm')).toBeUndefined()
     expect(index.findTemplatePropUsages(thirdPartyUri, 'model')).toHaveLength(0)
     expect(index.findTemplateEventUsages(thirdPartyUri, 'validate')).toHaveLength(0)
+  })
+
+  it('$refs 支持按需读取 Element UI 组件类型方法', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-element-ui-ref-'))
+    writeElementUiTypes(root)
+    const parentUri = path.join(root, 'src/Parent.vue')
+    writeText(parentUri, `
+<template>
+  <div>
+    <el-form ref="form" />
+    <el-input ref="input" />
+  </div>
+</template>
+<script>
+export default {
+  mounted() {
+    this.$refs.form.validate()
+    this.$refs.form?.resetFields()
+    this.$refs?.input?.focus()
+  },
+}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root)
+    const parent = index.getFile(parentUri)!
+    const formTypeUri = path.join(root, 'node_modules/element-ui/types/form.d.ts')
+    const inputTypeUri = path.join(root, 'node_modules/element-ui/types/input.d.ts')
+
+    expect(index.resolveRefComponent(parent, 'form')).toBe(formTypeUri)
+    expect(index.resolveRefComponent(parent, 'input')).toBe(inputTypeUri)
+    expect(index.getFile(formTypeUri)?.scriptIndex.methods.map((method) => method.name)).toEqual(['validate', 'resetFields', 'clearValidate'])
+    expect(index.getFile(inputTypeUri)?.scriptIndex.methods.map((method) => method.name)).toEqual(['focus', 'blur', 'select'])
+    expect(index.findRefMethodUsages(formTypeUri, 'validate')).toHaveLength(1)
+    expect(index.findRefMethodUsages(formTypeUri, 'resetFields')).toHaveLength(1)
+    expect(index.findRefMethodUsages(inputTypeUri, 'focus')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(formTypeUri, 'model')).toHaveLength(0)
+  })
+
+  it('$refs 支持按需读取 Vant 组件类型方法', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vant-ref-'))
+    writeVantTypes(root)
+    const parentUri = path.join(root, 'src/Parent.vue')
+    writeText(parentUri, `
+<template>
+  <div>
+    <van-field ref="field" />
+    <van-form ref="form" />
+  </div>
+</template>
+<script>
+export default {
+  mounted() {
+    this.$refs.field.focus()
+    this.$refs.form?.validate()
+  },
+}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root)
+    const parent = index.getFile(parentUri)!
+    const fieldTypeUri = path.join(root, 'node_modules/vant/types/field.d.ts')
+    const formTypeUri = path.join(root, 'node_modules/vant/types/form.d.ts')
+
+    expect(index.resolveRefComponent(parent, 'field')).toBe(fieldTypeUri)
+    expect(index.resolveRefComponent(parent, 'form')).toBe(formTypeUri)
+    expect(index.getFile(fieldTypeUri)?.scriptIndex.methods.map((method) => method.name)).toEqual(['focus', 'blur'])
+    expect(index.getFile(formTypeUri)?.scriptIndex.methods.map((method) => method.name)).toEqual(['submit', 'validate', 'resetValidation', 'scrollToField'])
+    expect(index.findRefMethodUsages(fieldTypeUri, 'focus')).toHaveLength(1)
+    expect(index.findRefMethodUsages(formTypeUri, 'validate')).toHaveLength(1)
   })
 
   it('全局注册文件与组件 name 变化后会刷新索引', async () => {

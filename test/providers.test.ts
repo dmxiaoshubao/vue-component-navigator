@@ -28,6 +28,80 @@ function writeText(filePath: string, content: string): void {
   fs.writeFileSync(filePath, content)
 }
 
+function writeElementUiTypes(root: string): void {
+  writeText(path.join(root, 'node_modules/element-ui/types/component.d.ts'), `
+import Vue from 'vue'
+export declare class ElementUIComponent extends Vue {}
+`)
+  writeText(path.join(root, 'node_modules/element-ui/types/form.d.ts'), `
+import { ElementUIComponent } from './component'
+
+/** Form Component */
+export declare class ElForm extends ElementUIComponent {
+  /**
+   * Validate the whole form
+   */
+  validate (): Promise<boolean>
+
+  /** reset all the fields and remove validation result */
+  resetFields (): void
+
+  /** clear validation message for certain fields */
+  clearValidate (props?: string | string[]): void
+}
+`)
+  writeText(path.join(root, 'node_modules/element-ui/types/input.d.ts'), `
+import { ElementUIComponent } from './component'
+
+/** Input Component */
+export declare class ElInput extends ElementUIComponent {
+  /**
+   * Focus the Input component
+   */
+  focus (): void
+
+  /**
+   * Blur the Input component
+   */
+  blur (): void
+
+  /**
+   * Select the text in input element
+   */
+  select (): void
+}
+`)
+}
+
+function writeVantTypes(root: string): void {
+  writeText(path.join(root, 'node_modules/vant/types/component.d.ts'), `
+import Vue from 'vue';
+export class VanComponent extends Vue {}
+`)
+  writeText(path.join(root, 'node_modules/vant/types/field.d.ts'), `
+import { VanComponent } from './component';
+
+export class Field extends VanComponent {
+  focus(): void;
+
+  blur(): void;
+}
+`)
+  writeText(path.join(root, 'node_modules/vant/types/form.d.ts'), `
+import { VanComponent } from './component';
+
+export class Form extends VanComponent {
+  submit(): void;
+
+  validate(name?: string | string[]): Promise<void>;
+
+  resetValidation(name?: string | string[]): void;
+
+  scrollToField(name: string, options?: boolean | ScrollIntoViewOptions): void;
+}
+`)
+}
+
 function positionAt(content: string, offset: number): any {
   const before = content.slice(0, offset).split('\n')
   return { line: before.length - 1, character: before[before.length - 1].length }
@@ -445,6 +519,91 @@ export default {
     expect(propReferences).toHaveLength(1)
     expect(hoverText(hover)).toContain('label: String')
     expect(completions.map((item) => item.label)).toContain('focus')
+  })
+
+  it('Element UI ref 方法定义、补全和悬浮可用', async () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-element-ui-ref-'))
+    writeElementUiTypes(root)
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const parentContent = `
+<template>
+  <div>
+    <el-form ref="form" />
+    <el-input ref="input" />
+  </div>
+</template>
+<script>
+export default {
+  mounted() {
+    this.$refs.form.validate()
+    this.$refs.form.
+    this.$refs?.input?.focus()
+  },
+}
+</script>
+`
+    writeText(parentUri, parentContent)
+    await localIndex.indexWorkspace(root)
+    const document = new TestDocument(parentUri, parentContent) as any
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const completionProvider = new VueCompletionProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const formTypeUri = path.join(root, 'node_modules/element-ui/types/form.d.ts')
+    const inputTypeUri = path.join(root, 'node_modules/element-ui/types/input.d.ts')
+    const validateOffset = parentContent.indexOf('validate()') + 1
+    const focusOffset = parentContent.indexOf('focus()') + 1
+    const completionOffset = parentContent.indexOf('this.$refs.form.') + 'this.$refs.form.'.length
+
+    const validateDefinition = definitionProvider.provideDefinition(document, positionAt(parentContent, validateOffset)) as any
+    const focusDefinition = definitionProvider.provideDefinition(document, positionAt(parentContent, focusOffset)) as any
+    const completions = completionProvider.provideCompletionItems(document, positionAt(parentContent, completionOffset)) as any[]
+    const hover = hoverProvider.provideHover(document, positionAt(parentContent, focusOffset)) as any
+
+    expect(validateDefinition.uri.fsPath).toBe(formTypeUri)
+    expect(focusDefinition.uri.fsPath).toBe(inputTypeUri)
+    expect(completions.map((item) => item.label)).toEqual(['validate', 'resetFields', 'clearValidate'])
+    expect(completions.find((item) => item.label === 'validate')?.detail).toBe('ElForm.methods.validate')
+    expect(hoverText(hover)).toContain('Focus the Input component')
+    expect(hoverText(hover)).toContain('Definition: [input.d.ts]')
+  })
+
+  it('Vant ref 方法定义和补全可用', async () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-vant-ref-'))
+    writeVantTypes(root)
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const parentContent = `
+<template>
+  <div>
+    <van-field ref="field" />
+    <van-form ref="form" />
+  </div>
+</template>
+<script>
+export default {
+  mounted() {
+    this.$refs.field.focus()
+    this.$refs.form.
+  },
+}
+</script>
+`
+    writeText(parentUri, parentContent)
+    await localIndex.indexWorkspace(root)
+    const document = new TestDocument(parentUri, parentContent) as any
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const completionProvider = new VueCompletionProvider(localIndex)
+    const fieldTypeUri = path.join(root, 'node_modules/vant/types/field.d.ts')
+    const focusOffset = parentContent.indexOf('focus()') + 1
+    const completionOffset = parentContent.indexOf('this.$refs.form.') + 'this.$refs.form.'.length
+
+    const definition = definitionProvider.provideDefinition(document, positionAt(parentContent, focusOffset)) as any
+    const completions = completionProvider.provideCompletionItems(document, positionAt(parentContent, completionOffset)) as any[]
+
+    expect(definition.uri.fsPath).toBe(fieldTypeUri)
+    expect(completions.map((item) => item.label)).toEqual(['submit', 'validate', 'resetValidation', 'scrollToField'])
+    expect(completions.find((item) => item.label === 'validate')?.detail).toBe('Form.methods.validate')
   })
 
   it('全局组件晚于父组件索引时仍能从 prop 跳转', async () => {

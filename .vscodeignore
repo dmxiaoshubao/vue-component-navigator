@@ -6,6 +6,7 @@ test-fixtures/**
 scripts/**
 coverage/**
 .vscode-test/**
+docs/gifs/**
 node_modules/**
 *.vsix
 .gitignore

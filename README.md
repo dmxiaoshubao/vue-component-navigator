@@ -1,65 +1,108 @@
 # vue-component-navigator
 
-A VS Code extension that improves Vue 2 Options API component navigation, references, hover, and completions for statically provable component relationships.
+VS Code navigation helpers for Vue 2 projects that still use the Options API.
 
 > 中文文档: [README.zh-CN.md](./README.zh-CN.md)
 
-## Feature Coverage
+This extension focuses on relationships that are easy to miss in older Vue 2 codebases: `$refs`, component props and events, `provide` / `inject`, mixins, global components, and common Event Bus usage.
 
-| Area | Supported | Notes |
-| --- | --- | --- |
-| `$refs` method definition | Yes | Navigate from `this.$refs.child.method()` to the child component method. Optional chaining like `this.$refs.child?.method()` and `this.$refs?.child?.method()` is supported. |
-| `$refs` name completion | Yes | Completes template `ref` names after `this.$refs`, `this.$refs.`, and `this.$refs?.`, including refs from Vue files that statically consume the current mixin source. Ref completion items are prioritized in the suggestion list. |
-| `$refs` method completion | Yes | Completes methods from the statically resolved child component and gives them higher sort priority. |
-| `$refs` method hover | Yes | Shows method signature, JSDoc summary, params, and definition link when available. |
-| `$emit` to template listeners | Yes | Navigate from `this.$emit('event')` or `$emit('event')` inside template expressions to parent template listeners. Multiple listeners are returned when found. |
-| Template event to child emits | Yes | Navigate from `@event` / `v-on:event` to matching `this.$emit('event')` calls in the child component. Event modifiers like `.once` and `.stop` are supported. |
-| Vue 2 Event Bus | Yes | Supports static `this.$bus.$emit('event')`, `this.$bus.$on('event', ...)`, `this.$bus.$once('event', ...)`, and `this.$bus.$off('event', ...)` navigation, hover summaries, references, method completions, and event-name completions. Hover summaries label whether matches come from `$emit`, `$on`, `$once`, or `$off`. `$bus` is supported by default. Additional names are detected asynchronously from `src/index.js`, `src/main.js`, their TypeScript equivalents, or one layer of their literal `import`, `import()`, and `require()` targets when they contain entries like `Vue.prototype.$eventBus = new Vue()`. Event Bus relationships are indexed separately from component `$emit` relationships. |
-| Template prop to child prop | Yes | Navigate from `:prop`, `v-bind:prop`, static props, and `.sync` props to the child prop definition. |
-| Template prop / prop definition hover | Yes | Shows prop definition detail, JSDoc summary, definition links, and template usage summaries for prop definitions. |
-| Template event hover | Yes | Shows emit definition links for template listeners and usage summaries for emit sites. |
-| Prop / event / ref reverse references | Yes | Finds parent template prop usages, event listeners, and `$refs` method calls through the indexed relationship graph. |
-| `provide` / `inject` navigation | Yes | Navigate from static `inject` keys to matching `provide` keys, and from `provide` keys back to static inject consumers. Matching is scoped to the statically known parent chain and prefers the nearest provider per chain. |
-| `provide` / `inject` hover and references | Yes | Shows provider/consumer summaries and returns inject references for static provide keys. |
-| `inject` key completion | Yes | Completes known static `provide` keys inside `inject: ['']`, object-form local keys, and object-form `from: ''` values, scoped by the current component or static mixin consumers. |
-| Local component relationships | Yes | Resolves static default imports, static aliases, and async component registrations such as `() => import('./Child.vue')` or `resolve => require(['./Child.vue'], resolve)` in the `components` option. Component tag definition jumps for local components are intentionally left to the official Vue tooling to avoid duplicate definitions. |
-| Static dynamic component usage | Yes | Supports finite statically provable candidates in `<component :is="Current">`, `<component :is="cond ? 'A' : 'B'">`, object/array maps, component-object identifiers, and static `is="Child"`. Candidate components participate in prop, event, `$refs`, mixin-source navigation, hover, references, and completions. |
-| Static mixin relationships | Yes | Merges statically imported `mixins: [foo]` from workspace `.js`, `.ts`, or `.vue` files, including `export default { ... }` and `export const foo = { ... }` object-literal mixins. Mixin props, methods, emits, provide/inject, local components, and `$refs` calls participate in navigation, hover, references, and completions where a static consumer can be found. |
-| Global component relationships | Yes | Resolves static `Vue.component(...)` / `app.component(...)` style registrations when the tag and imported component can be proven statically. Global components participate in template prop, event, and `$refs` method providers. |
-| `Component.name` global registration | Yes | Supports `Vue.component(Component.name, Component)` by reading the imported `.vue` component `name`. |
-| Constant tag global registration | Yes | Supports patterns like `const name = 'MyComponent'; Vue.component(name, MyComponent)`. |
-| `require.context` global registration | Partial | Supports conservative Vue 2 auto-registration patterns like `require.context('./components', true, /\.vue$/)` and reads each `.vue` component `name`. |
-| `@/` alias imports | Yes | Resolves aliases from the nearest `tsconfig.json` or `jsconfig.json` using `compilerOptions.baseUrl` and `compilerOptions.paths`. No alias is guessed without config. |
-| Vue 2 workspace gating | Yes | Language providers and indexing are enabled only when a workspace `package.json` declares a Vue 2.x `vue` dependency. Vue 3 or non-Vue workspaces stay inactive except for extension commands. |
-| Workspace reindexing | Yes | Provides a `Vue Component Navigator: Reindex Workspace` command and keeps an in-memory index for fast provider responses. |
-| Incremental updates | Yes | Updates `.vue` file indexes on edit/save and refreshes global component mappings when related `.js`, `.ts`, or global component source files change. |
+It does not try to replace the official Vue tooling. Local component tag definitions are intentionally left alone to avoid duplicate results.
 
-## Scope And Limits
+## Demos
 
-| Area | Status | Reason |
-| --- | --- | --- |
-| Vue version | Vue 2 Options API | The parser is optimized for Vue 2 Options API SFCs. |
-| Vue 3 / `<script setup>` | Not supported | Official Vue tooling already covers most modern Vue navigation better. |
-| Dynamic component registrations or composed paths | Not supported | Component registrations and paths like `import('./' + type + '.vue')` that cannot be proven statically are skipped instead of guessed. Static dynamic component usage and static async imports are supported. |
-| Dynamic or global mixins | Not supported | Only statically imported local `mixins: [...]` entries are merged. `Vue.mixin(...)`, spread, conditional mixins, and package mixins are ignored. |
-| Dynamic refs / prop names / event names | Not supported | Only static relationships are indexed. |
-| Dynamic Event Bus names | Not supported | Only static string event names in known Event Bus roots such as `$bus.$emit`, `$bus.$on`, `$bus.$once`, and `$bus.$off` are indexed. Additional root names must be statically registered through `Vue.prototype.$xxx = new Vue()` in `src/index.*`, `src/main.*`, or one layer of their literal `import`, `import()`, and `require()` targets. |
-| Dynamic provide / inject keys | Not supported | Only static string/object keys are indexed; runtime ancestor/descendant scope is not inferred. |
-| Local component tag definition jump | Intentionally not handled | Avoids duplicate definitions with the official Vue extension. Other relationships for local components are still supported. |
-| Third-party package components | Ignored | Components resolved to `node_modules` are filtered out, even when globally registered by a plugin such as Element UI. |
-| External component source outside workspace | Ignored | Keeps indexing safe and bounded to the workspace. |
-| Complex JavaScript parsing | Best effort | Uses lightweight static parsing. Unsupported syntax is ignored rather than guessed. |
+### `$refs` Navigation
+
+![refs navigation](docs/gifs/refs-navigation.gif)
+
+Shows jumping from `this.$refs.child.open()` to the child component method, with method completion and hover.
+
+### Props And Events
+
+![props and events](docs/gifs/props-events.gif)
+
+Shows template prop definition lookup, component `$emit` lookup, hover summaries, and reverse references.
+
+### Event Bus
+
+![event bus](docs/gifs/event-bus.gif)
+
+Shows `$emit`, `$on`, `$once`, and `$off` navigation, event-name completion, method completion, and hover labels.
+
+### `provide` / `inject`
+
+![provide inject](docs/gifs/provide-inject.gif)
+
+Shows jumping from static `inject` keys to the nearest static provider, and from providers back to consumers.
+
+## What It Handles
+
+- `$refs` method navigation, completion, hover, and references.
+- Component prop navigation from template usage to child prop definitions.
+- Component event navigation between template listeners and `this.$emit(...)`.
+- Vue 2 Event Bus navigation for static string event names.
+- Static `provide` / `inject` key navigation and completion.
+- Static local component imports, async component imports, and simple aliases.
+- Static mixins imported from workspace `.js`, `.ts`, or `.vue` files.
+- Static global component registrations such as `Vue.component(...)`.
+- Third-party `$refs` methods for supported libraries, such as Element UI `el-form.validate()` and Vant `van-field.focus()`.
+- `@/` style aliases from the nearest `jsconfig.json` or `tsconfig.json`.
+
+## Event Bus Entry
+
+`$bus` works out of the box. Other Event Bus names are detected from Vue prototype registrations such as:
+
+```js
+Vue.prototype.$eventBus = new Vue()
+```
+
+By default, the extension checks these entry files:
+
+- `src/main.js`
+- `src/index.js`
+- `src/main.ts`
+- `src/index.ts`
+
+If your project uses a different bootstrap file, configure it explicitly:
+
+```json
+{
+  "vueComponentNavigator.entry": "src/bootstrap.js"
+}
+```
+
+Multiple entries are also supported:
+
+```json
+{
+  "vueComponentNavigator.entry": ["src/bootstrap.js", "@/entry"]
+}
+```
+
+Configured entries support workspace-relative paths and aliases from `compilerOptions.baseUrl` / `compilerOptions.paths` in `jsconfig.json` or `tsconfig.json`.
+
+The scanner only checks the entry file and one layer of literal `import`, `import()`, or `require()` targets. It does not recursively crawl the whole project.
 
 ## Commands
 
 | Command | Description |
 | --- | --- |
-| `Vue Component Navigator: Show Status` | Shows index status and current file coverage. |
-| `Vue Component Navigator: Reindex Workspace` | Rebuilds the workspace index manually. Use this after large refactors or when opening an already-running extension host. |
+| `Vue Component Navigator: Show Status` | Shows index status and whether the active file is indexed. |
+| `Vue Component Navigator: Reindex Workspace` | Rebuilds the workspace index. Use it after large refactors or config changes. |
 
-## Design Principles
+## Configuration
 
-- Prefer static proof over guessing.
-- Avoid duplicating official Vue tooling, especially for local component tag definitions.
-- Keep indexing lightweight enough for large Vue 2 workspaces.
-- Keep unsafe or ambiguous dynamic patterns out of the result set.
+| Setting | Description |
+| --- | --- |
+| `vueComponentNavigator.entry` | Event Bus registration entry file or files. Accepts a string or string array. |
+
+## Boundaries
+
+- Vue 2 Options API only.
+- Vue 3 and `<script setup>` are not targeted.
+- Dynamic names and composed paths are skipped, for example `import('./' + type + '.vue')`.
+- Dynamic refs, prop names, event names, Event Bus names, and `provide` / `inject` keys are skipped.
+- Global mixins, spread mixins, conditional mixins, and package mixins are skipped.
+- Template prop/event relationships for package components in `node_modules` are ignored. `$refs` method support reads only known, directly mapped component type files for supported libraries such as Element UI and Vant.
+- Files outside the workspace are ignored.
+
+The parser is deliberately conservative. When a relationship cannot be proven statically, the extension avoids returning a misleading result.

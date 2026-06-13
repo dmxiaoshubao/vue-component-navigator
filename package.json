@@ -46,6 +46,27 @@
         "title": "Vue Component Navigator: Reindex Workspace"
       }
     ],
+    "configuration": {
+      "title": "Vue Component Navigator",
+      "properties": {
+        "vueComponentNavigator.entry": {
+          "scope": "resource",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "default": [],
+          "markdownDescription": "Event Bus registration entry file or files. Supports workspace-relative paths and aliases defined in `jsconfig.json` or `tsconfig.json`, such as `src/main.js` or `@/bootstrap`. When set, only these entries are used before checking one layer of their literal imports."
+        }
+      }
+    },
     "languages": [
       {
         "id": "vue",
@@ -66,7 +87,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "vscode:prepublish": "npm run typecheck && npm run compile",
-    "package:vsix": "vsce package"
+    "package:vsix": "vsce package --baseImagesUrl https://raw.githubusercontent.com/dmxiaoshubao/vue-component-navigator/main"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

@@ -10,6 +10,7 @@ const tsConfigCache = new Map<string, TsConfigAlias | undefined>()
 interface TsConfigAlias {
   configDir: string
   baseUrl: string
+  hasBaseUrl: boolean
   paths: Record<string, string[]>
 }
 
@@ -36,12 +37,36 @@ export function resolveImportPathWithExtensions(fromUri: string, source: string,
   return withDefaultExtensions(resolved, extensions)
 }
 
+export function resolveProjectPathWithExtensions(root: string, source: string, workspaceRoots: string[] = [], extensions: string[] = ['.js', '.ts']): string | undefined {
+  const normalized = source.trim()
+  if (!normalized) {
+    return undefined
+  }
+
+  if (path.isAbsolute(normalized)) {
+    return withDefaultExtensions(normalized, extensions)
+  }
+
+  const resolvedFromRoot = path.resolve(root, normalized)
+  const existingRootPath = withExistingDefaultExtensions(resolvedFromRoot, extensions)
+  if (existingRootPath) {
+    return existingRootPath
+  }
+
+  if (normalized.startsWith('.')) {
+    return withDefaultExtensions(resolvedFromRoot, extensions)
+  }
+
+  return resolveFromTsConfig(path.join(root, '__entry__.js'), normalized, workspaceRoots.length > 0 ? workspaceRoots : [root], extensions)
+}
+
 function resolveFromTsConfig(fromUri: string, source: string, workspaceRoots: string[], extensions: string[]): string | undefined {
   const config = findNearestTsConfig(path.dirname(fromUri), workspaceRoots)
   if (!config) {
     return undefined
   }
 
+  const fallbacks: string[] = []
   for (const [alias, targets] of Object.entries(config.paths)) {
     const wildcard = matchPathAlias(alias, source)
     if (wildcard === undefined) {
@@ -50,11 +75,23 @@ function resolveFromTsConfig(fromUri: string, source: string, workspaceRoots: st
 
     for (const target of targets) {
       const resolved = path.resolve(config.configDir, config.baseUrl, target.replace('*', wildcard))
-      return withDefaultExtensions(resolved, extensions)
+      const existing = withExistingDefaultExtensions(resolved, extensions)
+      if (existing) {
+        return existing
+      }
+      fallbacks.push(withDefaultExtensions(resolved, extensions))
     }
   }
 
-  return undefined
+  if (fallbacks.length > 0) {
+    return fallbacks[0]
+  }
+
+  if (!config.hasBaseUrl) {
+    return undefined
+  }
+
+  return withExistingDefaultExtensions(path.resolve(config.configDir, config.baseUrl, source), extensions)
 }
 
 function findNearestTsConfig(startDir: string, workspaceRoots: string[]): TsConfigAlias | undefined {
@@ -111,13 +148,15 @@ function readTsConfigAlias(directory: string): TsConfigAlias | undefined {
         paths?: Record<string, string[]>
       }
     }
-    const paths = config.compilerOptions?.paths
-    if (!paths) {
+    const paths = config.compilerOptions?.paths ?? {}
+    const hasBaseUrl = typeof config.compilerOptions?.baseUrl === 'string'
+    if (!hasBaseUrl && Object.keys(paths).length === 0) {
       return undefined
     }
     return {
       configDir: directory,
       baseUrl: config.compilerOptions?.baseUrl ?? '.',
+      hasBaseUrl,
       paths,
     }
   } catch {
@@ -157,6 +196,28 @@ function withDefaultExtensions(resolved: string, extensions: string[]): string {
   }
 
   return `${resolved}${extensions[0]}`
+}
+
+function withExistingDefaultExtensions(resolved: string, extensions: string[]): string | undefined {
+  if (path.extname(resolved)) {
+    return fs.existsSync(resolved) ? resolved : undefined
+  }
+
+  for (const extension of extensions) {
+    const candidate = `${resolved}${extension}`
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  for (const extension of extensions) {
+    const candidate = path.join(resolved, `index${extension}`)
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  return undefined
 }
 
 function stripJsonComments(content: string): string {

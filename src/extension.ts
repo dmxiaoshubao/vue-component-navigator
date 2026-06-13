@@ -21,6 +21,7 @@ type UsageCommandArgs =
   | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'method' | 'event' | 'provide' | 'inject' }
 
 type PackageDependencies = Record<string, string | undefined> | undefined
+type EntryConfig = string | readonly string[] | undefined
 
 interface PackageJson {
   dependencies?: PackageDependencies
@@ -37,6 +38,18 @@ function usageLabel(file: VueFileIndex, span: TextSpan, label: string, sourceLoc
 
 function eventBusMethodSuffix(usage: UsageInfo): string {
   return 'method' in usage ? ` ${String(usage.method)}` : ''
+}
+
+export function normalizeEntryConfig(value: EntryConfig): string[] {
+  const entries = Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string')
+    : typeof value === 'string' ? [value] : []
+  return [...new Set(entries.map((entry) => entry.trim()).filter(Boolean))]
+}
+
+function getWorkspaceEntryConfig(folder: vscode.WorkspaceFolder): string[] {
+  const value = vscode.workspace.getConfiguration('vueComponentNavigator', folder.uri).get<EntryConfig>('entry')
+  return normalizeEntryConfig(value)
 }
 
 function toVsCodeRange(file: VueFileIndex, span: TextSpan, sourceLocation?: SourceLocation): vscode.Range {
@@ -131,7 +144,7 @@ export function activate(context: vscode.ExtensionContext): void {
           if (token.isCancellationRequested) {
             return false
           }
-          await nextIndex.indexWorkspace(folder.uri.fsPath, token)
+          await nextIndex.indexWorkspace(folder.uri.fsPath, token, getWorkspaceEntryConfig(folder))
         }
         if (token.isCancellationRequested) {
           return false
@@ -217,6 +230,14 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       }),
       vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+        if (await ensureVue2Workspace(false)) {
+          await indexWorkspaceFolders('Indexing Vue files...', false)
+        }
+      }),
+      vscode.workspace.onDidChangeConfiguration(async (event) => {
+        if (!event.affectsConfiguration('vueComponentNavigator.entry')) {
+          return
+        }
         if (await ensureVue2Workspace(false)) {
           await indexWorkspaceFolders('Indexing Vue files...', false)
         }

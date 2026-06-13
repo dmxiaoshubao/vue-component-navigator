@@ -3,8 +3,9 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import type { ComponentRegistration, EventBusCall, EventBusRegistration, EventBusUsageInfo, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex } from './types'
 import { defaultEventBusNames, parseEventBusRegistrations, parseStaticImportSources } from './eventBusParser'
+import { resolveExternalRefComponent } from './externalComponentResolver'
 import { guessGlobalComponentsFromRequireContext, parseGlobalComponents } from './globalComponentParser'
-import { resolveImportPathWithExtensions } from './relationResolver'
+import { resolveImportPathWithExtensions, resolveProjectPathWithExtensions } from './relationResolver'
 import { parseSfc } from './sfcParser'
 import { parseScript } from './scriptParser'
 import { parseTemplate } from './templateParser'
@@ -16,9 +17,14 @@ export interface IndexCancellationToken {
   readonly isCancellationRequested: boolean
 }
 
+type EventBusEntryConfig = string | readonly string[]
+
 export class WorkspaceIndex {
   private readonly files = new Map<string, VueFileIndex>()
   private readonly workspaceRoots: string[] = []
+  private readonly eventBusEntriesByRoot = new Map<string, string[]>()
+  private readonly externalRefComponents = new Map<string, VueFileIndex | undefined>()
+  private readonly externalRefComponentUris = new Map<string, VueFileIndex>()
   private readonly globalComponents = new Map<string, GlobalComponentRegistration[]>()
   private readonly globalComponentRegistrations = new Map<string, GlobalComponentRegistration[]>()
   private readonly globalComponentContexts = new Map<string, GlobalComponentContext[]>()
@@ -39,6 +45,9 @@ export class WorkspaceIndex {
   clear(): void {
     this.files.clear()
     this.workspaceRoots.length = 0
+    this.eventBusEntriesByRoot.clear()
+    this.externalRefComponents.clear()
+    this.externalRefComponentUris.clear()
     this.globalComponents.clear()
     this.globalComponentRegistrations.clear()
     this.globalComponentContexts.clear()
@@ -55,6 +64,12 @@ export class WorkspaceIndex {
     }
     this.workspaceRoots.length = 0
     this.workspaceRoots.push(...other.workspaceRoots)
+    this.eventBusEntriesByRoot.clear()
+    for (const [root, entries] of other.eventBusEntriesByRoot) {
+      this.eventBusEntriesByRoot.set(root, [...entries])
+    }
+    this.externalRefComponents.clear()
+    this.externalRefComponentUris.clear()
     this.globalComponents.clear()
     for (const [name, components] of other.globalComponents) {
       this.globalComponents.set(name, [...components])
@@ -83,6 +98,16 @@ export class WorkspaceIndex {
     return [...this.workspaceRoots]
   }
 
+  setEventBusEntries(root: string, entries: EventBusEntryConfig): void {
+    const values = Array.isArray(entries) ? entries : [entries]
+    const normalized = uniqueStrings(values.map((entry) => entry.trim()).filter(Boolean))
+    if (normalized.length === 0) {
+      this.eventBusEntriesByRoot.delete(root)
+      return
+    }
+    this.eventBusEntriesByRoot.set(root, normalized)
+  }
+
   getFileCount(): number {
     return this.files.size
   }
@@ -92,7 +117,7 @@ export class WorkspaceIndex {
   }
 
   getFile(uri: string): VueFileIndex | undefined {
-    return this.files.get(uri)
+    return this.files.get(uri) ?? this.externalRefComponentUris.get(uri)
   }
 
   getAllFiles(): VueFileIndex[] {
@@ -141,13 +166,18 @@ export class WorkspaceIndex {
   }
 
   resolveRefComponent(parent: VueFileIndex, refName: string): string | undefined {
-    const usage = parent.templateIndex.components.find((component) => component.attrs.some((attr) => attr.kind === 'ref' && attr.name === refName))
-    return usage ? this.resolveTemplateComponentUris(parent, usage)[0] : undefined
+    return this.resolveRefComponents(parent, refName)[0]
   }
 
   resolveRefComponents(parent: VueFileIndex, refName: string): string[] {
     const usage = parent.templateIndex.components.find((component) => component.attrs.some((attr) => attr.kind === 'ref' && attr.name === refName))
-    return usage ? this.resolveTemplateComponentUris(parent, usage) : []
+    if (!usage) {
+      return []
+    }
+    const tags = usage.dynamicTags?.length ? usage.dynamicTags : [usage.tag]
+    return uniqueStrings(tags
+      .map((tag) => this.resolveComponent(parent, tag) ?? this.resolveExternalRefComponent(parent.uri, tag))
+      .filter((uri): uri is string => Boolean(uri)))
   }
 
   indexContent(uri: string, content: string): VueFileIndex {
@@ -243,9 +273,12 @@ export class WorkspaceIndex {
     return this.indexContent(uri, await fs.readFile(uri, 'utf8'))
   }
 
-  async indexWorkspace(root: string, token?: IndexCancellationToken): Promise<void> {
+  async indexWorkspace(root: string, token?: IndexCancellationToken, eventBusEntries?: EventBusEntryConfig): Promise<void> {
     if (!this.workspaceRoots.includes(root)) {
       this.workspaceRoots.push(root)
+    }
+    if (eventBusEntries !== undefined) {
+      this.setEventBusEntries(root, eventBusEntries)
     }
     const vueFiles: string[] = []
     const scriptFiles: string[] = []
@@ -260,11 +293,6 @@ export class WorkspaceIndex {
       return
     }
 
-    await this.refreshEventBusRegistrations(root, token)
-    if (token?.isCancellationRequested) {
-      return
-    }
-
     for (const file of scriptFiles) {
       await this.indexGlobalComponentFile(file)
       if (token?.isCancellationRequested) {
@@ -273,6 +301,11 @@ export class WorkspaceIndex {
     }
 
     await this.expandRequireContextGlobals(vueFiles)
+    if (token?.isCancellationRequested) {
+      return
+    }
+
+    await this.refreshEventBusRegistrations(root, token)
     if (token?.isCancellationRequested) {
       return
     }
@@ -430,6 +463,9 @@ export class WorkspaceIndex {
 
   async refreshEventBusRegistrations(root?: string, token?: IndexCancellationToken): Promise<void> {
     const roots = root ? [root] : this.workspaceRoots
+    if (root && !this.workspaceRoots.includes(root)) {
+      this.workspaceRoots.push(root)
+    }
     if (root) {
       this.removeEventBusRegistrationsInRoot(root)
     } else {
@@ -565,7 +601,7 @@ export class WorkspaceIndex {
     const entryContents: Array<{ uri: string, content: string }> = []
     const directRegistrations: EventBusRegistration[] = []
 
-    for (const uri of eventBusEntryCandidates(root)) {
+    for (const uri of this.eventBusEntryCandidates(root)) {
       if (token?.isCancellationRequested) {
         return []
       }
@@ -584,7 +620,7 @@ export class WorkspaceIndex {
     // 入口本身没有注册时，只展开入口直接引入的一层文件，避免递归扫描拖慢大项目。
     const importedUris = uniqueStrings(entryContents.flatMap(({ uri, content }) => {
       return parseStaticImportSources(content)
-        .map((source) => resolveImportPathWithExtensions(uri, source, this.workspaceRoots, ['.js', '.ts']))
+        .map((source) => resolveImportPathWithExtensions(uri, source, this.workspaceRootsFor(root), ['.js', '.ts']))
         .filter((resolved): resolved is string => Boolean(resolved))
         .filter((resolved) => this.isInsideWorkspace(resolved) && !isInsideNodeModules(resolved))
     }))
@@ -601,6 +637,18 @@ export class WorkspaceIndex {
     }
 
     return importedRegistrations
+  }
+
+  private eventBusEntryCandidates(root: string): string[] {
+    const configuredEntries = this.eventBusEntriesByRoot.get(root)
+    if (configuredEntries && configuredEntries.length > 0) {
+      return uniqueStrings(configuredEntries
+        .map((entry) => resolveProjectPathWithExtensions(root, entry, this.workspaceRootsFor(root), ['.js', '.ts']))
+        .filter((resolved): resolved is string => Boolean(resolved))
+        .filter((resolved) => this.isInsideWorkspace(resolved) && !isInsideNodeModules(resolved)))
+    }
+
+    return defaultEventBusEntryCandidates(root)
   }
 
   private findNearestProvideDefinitions(consumer: VueFileIndex, injectKey: string): UsageInfo[] {
@@ -1099,6 +1147,32 @@ export class WorkspaceIndex {
     return this.workspaceRoots.some((root) => uri === root || isInsideDirectory(uri, root))
   }
 
+  private workspaceRootsFor(root: string): string[] {
+    return this.workspaceRoots.includes(root) ? this.workspaceRoots : [...this.workspaceRoots, root]
+  }
+
+  private resolveExternalRefComponent(fromUri: string, tag: string): string | undefined {
+    const root = this.workspaceRootFor(fromUri)
+    if (!root) {
+      return undefined
+    }
+
+    const key = `${root}\0${tag}`
+    if (!this.externalRefComponents.has(key)) {
+      const component = resolveExternalRefComponent(root, tag)
+      this.externalRefComponents.set(key, component)
+      if (component) {
+        this.externalRefComponentUris.set(component.uri, component)
+      }
+    }
+
+    return this.externalRefComponents.get(key)?.uri
+  }
+
+  private workspaceRootFor(uri: string): string | undefined {
+    return this.workspaceRoots.find((root) => uri === root || isInsideDirectory(uri, root))
+  }
+
   private removeEventBusRegistrationsInRoot(root: string): void {
     for (const uri of [...this.eventBusRegistrations.keys()]) {
       if (uri === root || isInsideDirectory(uri, root)) {
@@ -1222,13 +1296,13 @@ function usesSource(file: VueFileIndex, sourceUri: string): boolean {
     || file.refMethodCalls.some((call) => call.sourceLocation?.uri === sourceUri)
 }
 
-function eventBusEntryCandidates(root: string): string[] {
+function defaultEventBusEntryCandidates(root: string): string[] {
   const src = path.join(root, 'src')
   return [
-    path.join(src, 'index.js'),
     path.join(src, 'main.js'),
-    path.join(src, 'index.ts'),
+    path.join(src, 'index.js'),
     path.join(src, 'main.ts'),
+    path.join(src, 'index.ts'),
   ]
 }
 
