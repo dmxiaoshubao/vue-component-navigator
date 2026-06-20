@@ -1346,4 +1346,252 @@ export default {
     expect(hoverText(hover)).toContain('Used by 1 ref method')
     expect(hoverText(hover).match(/- \[mixin-default\.js:/g)).toHaveLength(1)
   })
+
+  it('Vue3 props 类型、内部使用和 emits 的 provider 关系可用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-providers-'))
+    const typeUri = path.join(root, 'src/components/confirm-dialog/type.ts')
+    const childUri = path.join(root, 'src/components/confirm-dialog/index.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const typeContent = `
+export type ConfirmDialogProps = {
+  show: boolean
+  /** 确认之前的回调 */
+  beforeConfirm?: () => Promise<boolean> | boolean | void
+  title?: string
+}
+`
+    const childContent = `
+<template>
+  <div>{{ title }} {{ props.beforeConfirm }}</div>
+</template>
+<script setup lang="ts">
+import type { ConfirmDialogProps } from './type'
+
+const props = defineProps<ConfirmDialogProps>()
+const emit = defineEmits<{
+  confirm: []
+}>()
+
+const submit = async () => {
+  if (props.beforeConfirm) {
+    await props.beforeConfirm()
+  }
+  emit('confirm')
+}
+</script>
+`
+    const parentContent = `
+<template>
+  <ConfirmDialog :beforeConfirm="beforeConfirm" @confirm="onConfirm" />
+</template>
+<script setup lang="ts">
+import ConfirmDialog from './components/confirm-dialog/index.vue'
+const beforeConfirm = () => true
+const onConfirm = () => {}
+</script>
+`
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.4.0' } }))
+    writeText(typeUri, typeContent)
+    writeText(childUri, childContent)
+    writeText(parentUri, parentContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const childDocument = new TestDocument(childUri, childContent) as any
+    const parentDocument = new TestDocument(parentUri, parentContent) as any
+    const typeDocument = new TestDocument(typeUri, typeContent, 'typescript') as any
+
+    const propDefinition = definitionProvider.provideDefinition(childDocument, positionAt(childContent, childContent.indexOf('beforeConfirm') + 1)) as any
+    const propReferences = referenceProvider.provideReferences(typeDocument, positionAt(typeContent, typeContent.indexOf('beforeConfirm') + 1)) as any[]
+    const propHover = hoverProvider.provideHover(typeDocument, positionAt(typeContent, typeContent.indexOf('beforeConfirm') + 1)) as any
+    const typeDefinition = definitionProvider.provideDefinition(childDocument, positionAt(childContent, childContent.lastIndexOf('ConfirmDialogProps') + 1)) as any
+    const eventDefinition = asArray(definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('@confirm') + 1)) as any)
+
+    expect(propDefinition.uri.fsPath).toBe(typeUri)
+    expect(propDefinition.range.start.line).toBeGreaterThan(0)
+    expect(propReferences.map((location) => location.uri.fsPath)).toEqual([childUri, childUri, childUri])
+    expect(hoverText(propHover)).toContain('Used by 3 prop usages')
+    expect(typeDefinition.uri.fsPath).toBe(typeUri)
+    expect(eventDefinition.map((location) => location.uri.fsPath)).toEqual([childUri])
+  })
+
+  it('Vue3 provide/inject 支持带泛型的静态字符串 key', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-provide-inject-'))
+    const providerUri = path.join(root, 'src/pages/components/member-login/index.vue')
+    const positiveUri = path.join(root, 'src/pages/components/member-login/components/positive-scan.vue')
+    const readCardUri = path.join(root, 'src/pages/components/member-login/components/read-card.vue')
+    const providerContent = `
+<template>
+  <ReadCard />
+  <PositiveScan />
+</template>
+<script setup lang="ts">
+import PositiveScan from './components/positive-scan.vue'
+import ReadCard from './components/read-card.vue'
+import { provide } from 'vue'
+
+const handleFetchStart = (type: string) => {
+  return type
+}
+
+provide('handleFetchStart', handleFetchStart)
+</script>
+`
+    const positiveContent = `
+<template><button /></template>
+<script setup lang="ts">
+import { inject } from 'vue'
+
+const handleFetchStart =
+  inject<(type: string) => void>('handleFetchStart')
+
+handleFetchStart?.('positive')
+</script>
+`
+    const readCardContent = `
+<template><button /></template>
+<script setup lang="ts">
+import { inject } from 'vue'
+
+const handleFetchStart =
+  inject<(type: string) => void>('handleFetchStart')
+
+handleFetchStart?.('read')
+</script>
+`
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(providerUri, providerContent)
+    writeText(positiveUri, positiveContent)
+    writeText(readCardUri, readCardContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const providerDocument = new TestDocument(providerUri, providerContent) as any
+    const positiveDocument = new TestDocument(positiveUri, positiveContent) as any
+    const readCardDocument = new TestDocument(readCardUri, readCardContent) as any
+    const providerFile = localIndex.getFile(providerUri)!
+    const positiveFile = localIndex.getFile(positiveUri)!
+    const readCardFile = localIndex.getFile(readCardUri)!
+
+    const localDefinition = definitionProvider.provideDefinition(readCardDocument, positionAt(readCardContent, readCardContent.indexOf('handleFetchStart') + 1)) as any[]
+    const keyDefinitions = asArray(definitionProvider.provideDefinition(providerDocument, positionAt(providerContent, providerContent.indexOf("'handleFetchStart'") + 2)) as any)
+    const keyReferences = referenceProvider.provideReferences(providerDocument, positionAt(providerContent, providerContent.indexOf("'handleFetchStart'") + 2)) as any[]
+    const providerHover = hoverProvider.provideHover(providerDocument, positionAt(providerContent, providerContent.indexOf("'handleFetchStart'") + 2)) as any
+    const injectHover = hoverProvider.provideHover(positiveDocument, positionAt(positiveContent, positiveContent.indexOf("'handleFetchStart'") + 2)) as any
+
+    expect(providerFile.scriptIndex.provides.map((provide) => provide.key)).toEqual(['handleFetchStart'])
+    expect(positiveFile.scriptIndex.injects.map((inject) => [inject.localName, inject.key])).toEqual([['handleFetchStart', 'handleFetchStart']])
+    expect(readCardFile.scriptIndex.injects.map((inject) => [inject.localName, inject.key])).toEqual([['handleFetchStart', 'handleFetchStart']])
+    expect(localIndex.findInjectUsages(providerUri, 'handleFetchStart').map((usage) => usage.file.uri).sort()).toEqual([positiveUri, readCardUri].sort())
+    expect(localDefinition.map((location) => location.uri.fsPath)).toEqual([providerUri])
+    expect(keyDefinitions.map((location) => location.uri.fsPath).sort()).toEqual([positiveUri, readCardUri].sort())
+    expect(keyReferences.map((location) => location.uri.fsPath).sort()).toEqual([positiveUri, readCardUri].sort())
+    expect(hoverText(providerHover)).toContain('Injected by 2 consumers')
+    expect(hoverText(injectHover)).toContain('Provided by 1 definition')
+  })
+
+  it('Vue3 v-model 事件声明和 InjectionKey 的 provider 关系可用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-provider-static-features-'))
+    const keyUri = path.join(root, 'src/keys.ts')
+    const childUri = path.join(root, 'src/Child.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const providerUri = path.join(root, 'src/Provider.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+    const keyContent = `
+import type { InjectionKey } from 'vue'
+
+interface Service {
+  ready: boolean
+}
+
+export const serviceKey: InjectionKey<Service> = Symbol('service')
+`
+    const childContent = `
+<template>
+  <button>{{ props.inlineTitle }}</button>
+</template>
+<script setup lang="ts">
+const props = defineProps<{
+  inlineTitle?: string
+  show: boolean
+}>()
+
+const emit = defineEmits<{
+  declared: []
+  'update:show': [value: boolean]
+}>()
+
+function close() {
+  emit('update:show', false)
+}
+</script>
+`
+    const parentContent = `
+<template>
+  <Child v-model:show="show" inline-title="hello" @declared="onDeclared" />
+</template>
+<script setup lang="ts">
+import Child from './Child.vue'
+
+const show = ref(false)
+const onDeclared = () => {}
+</script>
+`
+    const providerContent = `
+<template><Consumer /></template>
+<script setup lang="ts">
+import Consumer from './Consumer.vue'
+import { serviceKey } from './keys'
+
+provide(serviceKey, { ready: true })
+</script>
+`
+    const consumerContent = `
+<template><div /></template>
+<script setup lang="ts">
+import { serviceKey as injectedServiceKey } from './keys'
+
+const service = inject(injectedServiceKey)
+</script>
+`
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(keyUri, keyContent)
+    writeText(childUri, childContent)
+    writeText(parentUri, parentContent)
+    writeText(providerUri, providerContent)
+    writeText(consumerUri, consumerContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const parentDocument = new TestDocument(parentUri, parentContent) as any
+    const childDocument = new TestDocument(childUri, childContent) as any
+    const providerDocument = new TestDocument(providerUri, providerContent) as any
+    const consumerDocument = new TestDocument(consumerUri, consumerContent) as any
+    const keyDocument = new TestDocument(keyUri, keyContent, 'typescript') as any
+
+    const modelDefinition = asArray(definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('v-model:show') + 'v-model:'.length + 1)) as any)
+    const declaredDefinition = asArray(definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('@declared') + 2)) as any)
+    const updateDefinitions = asArray(definitionProvider.provideDefinition(childDocument, positionAt(childContent, childContent.lastIndexOf("'update:show'") + 2)) as any)
+    const injectDefinitions = asArray(definitionProvider.provideDefinition(consumerDocument, positionAt(consumerContent, consumerContent.lastIndexOf('injectedServiceKey') + 1)) as any)
+    const provideDefinitions = asArray(definitionProvider.provideDefinition(providerDocument, positionAt(providerContent, providerContent.lastIndexOf('serviceKey') + 1)) as any)
+    const keyReferences = referenceProvider.provideReferences(keyDocument, positionAt(keyContent, keyContent.indexOf('serviceKey') + 1)) as any[]
+    const keyHover = hoverProvider.provideHover(keyDocument, positionAt(keyContent, keyContent.indexOf('serviceKey') + 1)) as any
+
+    expect(modelDefinition.map((location) => location.uri.fsPath)).toEqual([childUri])
+    expect(declaredDefinition.map((location) => location.uri.fsPath)).toEqual([childUri])
+    expect(updateDefinitions.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(injectDefinitions.map((location) => location.uri.fsPath)).toEqual([providerUri])
+    expect(provideDefinitions.map((location) => location.uri.fsPath)).toEqual([consumerUri])
+    expect(keyReferences.map((location) => location.uri.fsPath)).toEqual([consumerUri])
+    expect(hoverText(keyHover)).toContain('Provided by 1 definition')
+  })
 })

@@ -1,10 +1,10 @@
 # vue-component-navigator
 
-给 Vue 2 Options API 项目用的 VS Code 导航辅助插件。
+给 Vue 2 Options API 项目和 Vue 3 `<script setup>` 静态关系使用的 VS Code 导航辅助插件。
 
 > English documentation: [README.md](./README.md)
 
-这个插件主要处理老 Vue 2 项目里容易断开的关系：`$refs`、组件 props/events、`provide` / `inject`、mixins、全局组件，以及常见的 Event Bus。
+这个插件主要处理 Vue 项目里容易断开的静态关系。Vue 2 继续支持 `$refs`、组件 props/events、`provide` / `inject`、mixins、全局组件，以及常见的 Event Bus。Vue 3 支持范围更聚焦，当前覆盖类型化 `defineProps`、`defineEmits`、`v-model` 更新事件和静态 `provide` / `inject`。
 
 它不会替代 Vue 官方工具。比如局部组件标签名的定义跳转会交给官方扩展处理，避免同一个位置出现重复结果。
 
@@ -48,6 +48,11 @@
 - workspace 内 `.js`、`.ts`、`.vue` 文件中的静态 mixin。
 - `Vue.component(...)` 这类静态全局组件注册。
 - 已支持第三方库的 `$refs` 方法类型，例如 Element UI 的 `el-form.validate()` 和 Vant 的 `van-field.focus()`。
+- Vue 3 `<script setup>` 中的局部组件 import。
+- Vue 3 `defineProps<Props>()` / `defineProps<{ ... }>()` 的类型成员与组件内部静态 prop 使用。
+- Vue 3 `defineEmits` 声明和 `emit('confirm')` 这类调用与父组件模板监听的关系。
+- Vue 3 `v-model` / `v-model:show` 与 `update:modelValue` / `update:show` 事件的关系。
+- Vue 3 静态 `provide('key', value)` / `inject('key')` 和 `InjectionKey` / `Symbol` key 关系。
 - 从最近的 `jsconfig.json` 或 `tsconfig.json` 读取 `@/` 这类路径别名。
 
 ## Event Bus 入口
@@ -103,12 +108,7 @@ Vue.prototype.$eventBus = new Vue()
 
 ## 边界
 
-- 只面向 Vue 2 Options API。
-- 不处理 Vue 3 和 `<script setup>`。
-- 不处理动态名称和拼接路径，比如 `import('./' + type + '.vue')`。
-- 不处理动态 refs、prop 名、event 名、Event Bus 名称、`provide` / `inject` key。
-- 不处理全局 mixin、spread mixin、条件 mixin 和 package mixin。
-- `node_modules` 中组件的模板 prop/event 关系仍会忽略。`$refs` 方法只按需读取已支持库里能直接映射到的类型文件，例如 Element UI 和 Vant 的声明文件。
+- Vue 2 和 Vue 3 workspace 会按检测到的 Vue 主版本分别索引，两套能力边界保持隔离。
 - 忽略 workspace 外部文件。
 
 解析策略会尽量保守。静态证明不了的关系，不返回猜测结果。

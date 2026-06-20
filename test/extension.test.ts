@@ -60,14 +60,14 @@ describe('Extension lifecycle indexing', () => {
     await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
     expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: yes')
 
-    const vue3Root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-'))
-    writePackageJson(vue3Root, '^3.4.0')
-    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(vue3Root) }]
+    const emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-no-vue-'))
+    writeText(path.join(emptyRoot, 'package.json'), JSON.stringify({ dependencies: {} }))
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(emptyRoot) }]
     await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
     await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
 
-    expect(vscode.informationMessages.at(-2)).toContain('no Vue 2 dependency')
-    expect(vscode.informationMessages.at(-1)).toContain('Vue 2 package detected: no')
+    expect(vscode.informationMessages.at(-2)).toContain('no supported Vue 2 or Vue 3 dependency')
+    expect(vscode.informationMessages.at(-1)).toContain('Supported Vue package detected: no')
     expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: no')
   })
 
@@ -218,37 +218,42 @@ export default {
     expect(vscode.shownDocuments.at(-1)?.uri.fsPath).toBe(listenerFile)
   })
 
-  it('非 Vue 2 workspace 不注册 provider 且不索引', async () => {
+  it('Vue 3 workspace 会注册 provider 且索引', async () => {
     const vscode = await import('vscode') as any
     vscode.resetMockState()
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-disabled-'))
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-enabled-'))
     const file = path.join(root, 'App.vue')
     writePackageJson(root, '^3.4.0')
     writeVue(file, 'App')
-    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+    vscode.workspace.workspaceFolders = []
 
     const { activate } = await import('../src/extension')
     activate({ subscriptions: [] } as any)
     await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
     await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
     vscode.window.activeTextEditor = { document: new TestDocument(file, fs.readFileSync(file, 'utf8')) }
     await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
 
-    expect(vscode.providerRegistrations).toEqual([])
-    expect(vscode.informationMessages.at(-2)).toContain('no Vue 2 dependency')
-    expect(vscode.informationMessages.at(-1)).toContain('Vue 2 package detected: no')
-    expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: no')
+    expect(vscode.providerRegistrations.length).toBeGreaterThan(0)
+    expect(vscode.informationMessages.at(-1)).toContain('Supported Vue package detected: yes')
+    expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: yes')
   })
 
-  it('Vue 2 package 版本识别只接受 2.x 范围', async () => {
-    const { isVue2Version, normalizeEntryConfig, packageHasVue2 } = await import('../src/extension')
+  it('Vue package 版本识别支持 2.x 和 3.x 范围', async () => {
+    const { isVue2Version, isVue3Version, normalizeEntryConfig, packageHasSupportedVue, packageHasVue2, packageVueVersion } = await import('../src/extension')
 
     expect(isVue2Version('^2.7.16')).toBe(true)
     expect(isVue2Version('2.x')).toBe(true)
     expect(isVue2Version('>=2.6.0 <3')).toBe(true)
     expect(isVue2Version('^3.4.0')).toBe(false)
     expect(isVue2Version('latest')).toBe(false)
+    expect(isVue3Version('^3.4.0')).toBe(true)
+    expect(isVue3Version('3.x')).toBe(true)
+    expect(isVue3Version('^2.7.16')).toBe(false)
     expect(packageHasVue2({ devDependencies: { vue: '~2.6.14' } })).toBe(true)
+    expect(packageVueVersion({ dependencies: { vue: '^3.4.0' } })).toBe(3)
+    expect(packageHasSupportedVue({ dependencies: { vue: '^3.4.0' } })).toBe(true)
     expect(normalizeEntryConfig(' src/entry.js ')).toEqual(['src/entry.js'])
     expect(normalizeEntryConfig(['src/main.js', '', 'src/main.js', '@/bootstrap'])).toEqual(['src/main.js', '@/bootstrap'])
   })

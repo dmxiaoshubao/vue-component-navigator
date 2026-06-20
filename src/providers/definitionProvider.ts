@@ -63,7 +63,7 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
       return undefined
     }
 
-    const sourceDefinition = this.index.hasMixinSource(document.uri.fsPath)
+    const sourceDefinition = this.index.hasSourceRelations(document.uri.fsPath)
       ? this.provideSourceDefinition(document.uri.fsPath, offset)
       : undefined
     if (sourceDefinition) {
@@ -73,7 +73,18 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
       return undefined
     }
 
-    const refAccess = findRefMethodAccessInFile(file, offset)
+    const vue3PropType = this.index.findVue3PropTypeAtOffset(file, offset)
+    if (vue3PropType?.sourceLocation) {
+      return toLocation(file, vue3PropType.span, vue3PropType.sourceLocation)
+    }
+
+    const vue3PropUsage = this.index.findVue3PropUsageAtOffset(file, offset)
+    if (vue3PropUsage) {
+      const prop = findProp(file, vue3PropUsage.propName)
+      return prop ? toLocation(file, prop.span, prop.sourceLocation) : undefined
+    }
+
+    const refAccess = file.vueVersion === 2 ? findRefMethodAccessInFile(file, offset) : undefined
     if (refAccess) {
       const definitions = uniqueLocations(findResolvedRefComponents(this.index, file, refAccess.refName).flatMap((childUri) => {
         const child = this.index.getFile(childUri)
@@ -110,6 +121,9 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
         }
         if (attr.kind === 'prop') {
           const definitions = children.flatMap((child) => {
+            if (child.vueVersion === 3) {
+              return []
+            }
             const prop = findProp(child, attr.normalizedName)
             return prop ? [toLocation(child, prop.span, prop.sourceLocation)] : []
           })
@@ -175,7 +189,12 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
       return methodUsages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
     }
 
-    const propUsages = this.index.findTemplatePropUsagesFromSource(sourceUri, offset)
+    const typeUsages = this.index.findVue3PropTypeUsagesFromSource(sourceUri, offset)
+    if (typeUsages.length > 0) {
+      return typeUsages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
+    }
+
+    const propUsages = this.index.findPropUsagesFromSource(sourceUri, offset)
     if (propUsages.length > 0) {
       return propUsages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
     }

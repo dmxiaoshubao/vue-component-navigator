@@ -26,7 +26,7 @@ function stripModifier(name: string): string {
   return name.split('.')[0]
 }
 
-function normalizeAttr(attrName: string): TemplateAttrUsage | undefined {
+function normalizeAttr(attrName: string, vue3ModelEvents: boolean): TemplateAttrUsage | undefined {
   if (attrName === 'ref') {
     return undefined
   }
@@ -39,6 +39,15 @@ function normalizeAttr(attrName: string): TemplateAttrUsage | undefined {
   if (attrName.startsWith('v-on:')) {
     const name = stripModifier(attrName.slice('v-on:'.length))
     return { kind: 'event', name, normalizedName: name, span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } }
+  }
+
+  if (vue3ModelEvents && attrName === 'v-model') {
+    return { kind: 'event', name: 'v-model', normalizedName: 'update:modelValue', span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } }
+  }
+
+  if (vue3ModelEvents && attrName.startsWith('v-model:')) {
+    const name = stripModifier(attrName.slice('v-model:'.length))
+    return { kind: 'event', name, normalizedName: `update:${name}`, span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } }
   }
 
   if (attrName.startsWith(':')) {
@@ -82,7 +91,7 @@ function extractRef(openTag: string, openStart: number): TemplateAttrUsage[] {
   return refs
 }
 
-function extractAttrs(openTag: string, openStart: number): TemplateAttrUsage[] {
+function extractAttrs(openTag: string, openStart: number, vue3ModelEvents: boolean): TemplateAttrUsage[] {
   const attrs = extractRef(openTag, openStart)
   const pattern = /\s([:@A-Za-z_][\w:.-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g
   let match: RegExpExecArray | null
@@ -92,7 +101,7 @@ function extractAttrs(openTag: string, openStart: number): TemplateAttrUsage[] {
     if (rawName === 'ref') {
       continue
     }
-    const normalized = normalizeAttr(rawName)
+    const normalized = normalizeAttr(rawName, vue3ModelEvents)
     if (!normalized) {
       continue
     }
@@ -106,7 +115,9 @@ function extractAttrs(openTag: string, openStart: number): TemplateAttrUsage[] {
           ? fullStart + 'v-on:'.length
           : rawName.startsWith('v-bind:')
             ? fullStart + 'v-bind:'.length
-            : fullStart
+            : rawName.startsWith('v-model:')
+              ? fullStart + 'v-model:'.length
+              : fullStart
 
     attrs.push({
       ...normalized,
@@ -212,7 +223,7 @@ function findOpenTagEnd(template: string, openStart: number): number {
   return template.length
 }
 
-export function parseTemplate(content: string, templateStart: number, registeredTags: string[], staticComponentNames: StaticComponentNameBinding[] = [], eventBusNames: readonly string[] = []): TemplateIndex {
+export function parseTemplate(content: string, templateStart: number, registeredTags: string[], staticComponentNames: StaticComponentNameBinding[] = [], eventBusNames: readonly string[] = [], vue3ModelEvents = false): TemplateIndex {
   const uniqueTags = new Set(registeredTags.map((tag) => toKebabCase(tag)))
   const components: TemplateComponentUsage[] = []
   const emits: EmitInfo[] = []
@@ -245,7 +256,7 @@ export function parseTemplate(content: string, templateStart: number, registered
       continue
     }
 
-    const attrs = extractAttrs(openTag, templateStart + match.index)
+    const attrs = extractAttrs(openTag, templateStart + match.index, vue3ModelEvents)
     components.push({
       tag: rawTag,
       dynamicTags,

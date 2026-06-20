@@ -33,13 +33,49 @@ function findBlock(source: string, tag: 'script' | 'template'): SfcBlock | undef
   return undefined
 }
 
+function findScriptBlocks(source: string): { script?: SfcBlock, scriptSetup?: SfcBlock } {
+  const tagPattern = /<script\b[^>]*>|<\/script>/gi
+  let openTag: RegExpExecArray | undefined
+  let match: RegExpExecArray | null
+  let script: SfcBlock | undefined
+  let scriptSetup: SfcBlock | undefined
+
+  while ((match = tagPattern.exec(source))) {
+    const token = match[0]
+    if (!token.startsWith('</')) {
+      openTag = match
+      continue
+    }
+
+    if (!openTag) {
+      continue
+    }
+
+    const block = {
+      content: source.slice(openTag.index + openTag[0].length, match.index),
+      start: openTag.index + openTag[0].length,
+      end: match.index,
+    }
+    if (/\bsetup\b/i.test(openTag[0])) {
+      scriptSetup ??= block
+    } else {
+      script ??= block
+    }
+    openTag = undefined
+  }
+
+  return { script, scriptSetup }
+}
+
 export function parseSfc(uri: string, content: string): ParsedSfc {
+  const scripts = findScriptBlocks(content)
   return {
     uri,
     fileName: path.basename(uri),
     content,
     lineStarts: createLineStarts(content),
-    script: findBlock(content, 'script'),
+    script: scripts.script,
+    scriptSetup: scripts.scriptSetup,
     template: findBlock(content, 'template'),
   }
 }

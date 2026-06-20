@@ -1,7 +1,7 @@
 import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { ComponentRegistration, EventBusCall, EventBusRegistration, EventBusUsageInfo, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex } from './types'
+import type { ComponentRegistration, EventBusCall, EventBusRegistration, EventBusUsageInfo, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, ParsedSfc, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex, Vue3PropTypeInfo, Vue3PropUsage, VueMajorVersion } from './types'
 import { parseEventBusRegistrations, parseStaticImportSources } from './eventBusParser'
 import { resolveExternalRefComponent } from './externalComponentResolver'
 import { guessGlobalComponentsFromRequireContext, parseGlobalComponents } from './globalComponentParser'
@@ -9,6 +9,7 @@ import { resolveImportPathWithExtensions, resolveProjectPathWithExtensions } fro
 import { parseSfc } from './sfcParser'
 import { parseScript } from './scriptParser'
 import { parseTemplate } from './templateParser'
+import { createVue3ScriptParseCache, parseVue3Script } from './vue3ScriptParser'
 import { createLineStarts, positionToOffset } from '../utils/position'
 import { matchesName, toKebabCase } from '../utils/casing'
 import { maskStringsAndComments } from '../utils/scriptScan'
@@ -20,9 +21,28 @@ export interface IndexCancellationToken {
 type EventBusEntryConfig = string | readonly string[]
 type TrackedUsageMap = Map<string, UsageInfo[]>
 
+type SourceRelationMap<T extends { file: VueFileIndex }> = Map<string, T[]>
+
+function emptyScriptIndex(): ScriptIndex {
+  return {
+    imports: [],
+    mixins: [],
+    components: [],
+    staticComponentNames: [],
+    props: [],
+    methods: [],
+    emits: [],
+    eventBusCalls: [],
+    provides: [],
+    injects: [],
+    vue3PropUsages: [],
+  }
+}
+
 export class WorkspaceIndex {
   private readonly files = new Map<string, VueFileIndex>()
   private readonly workspaceRoots: string[] = []
+  private readonly workspaceVueVersions = new Map<string, VueMajorVersion>()
   private readonly eventBusEntriesByRoot = new Map<string, string[]>()
   private readonly externalRefComponents = new Map<string, VueFileIndex | undefined>()
   private readonly externalRefComponentUris = new Map<string, VueFileIndex>()
@@ -36,12 +56,24 @@ export class WorkspaceIndex {
   private readonly eventBusListeners = new Map<string, EventBusUsageInfo[]>()
   private readonly eventBusEventNames = new Map<string, Set<string>>()
   private readonly refMethodUsages = new Map<string, UsageInfo[]>()
+  private readonly vue3PropInternalUsages = new Map<string, UsageInfo[]>()
   private readonly provideDefinitions = new Map<string, UsageInfo[]>()
   private readonly injectUsages = new Map<string, UsageInfo[]>()
+  private readonly sourceProps: SourceRelationMap<{ file: VueFileIndex, prop: PropInfo }> = new Map()
+  private readonly sourcePropTypes: SourceRelationMap<{ file: VueFileIndex, type: Vue3PropTypeInfo }> = new Map()
+  private readonly sourceMethods: SourceRelationMap<{ file: VueFileIndex, method: MethodInfo }> = new Map()
+  private readonly sourceEmits: SourceRelationMap<{ file: VueFileIndex, emit: ScriptIndex['emits'][number] }> = new Map()
+  private readonly sourceEventBusCalls: SourceRelationMap<{ file: VueFileIndex, call: EventBusCall }> = new Map()
+  private readonly sourceProvides: SourceRelationMap<{ file: VueFileIndex, provide: ProvideInfo }> = new Map()
+  private readonly sourceInjects: SourceRelationMap<{ file: VueFileIndex, inject: InjectInfo }> = new Map()
+  private readonly sourceRefMethodCalls: SourceRelationMap<{ file: VueFileIndex, call: RefMethodAccess }> = new Map()
+  private readonly sourceRelationFiles = new Map<string, Set<string>>()
   private readonly parentComponents = new Map<string, Set<string>>()
   private readonly mixinIndexCache = new Map<string, { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } | undefined>()
   private readonly mixinSourceUris = new Set<string>()
+  private readonly vue3ScriptParseCache = createVue3ScriptParseCache()
   private usageKeysByFile = new WeakMap<VueFileIndex, Map<TrackedUsageMap, Set<string>>>()
+  private sourceKeysByFile = new WeakMap<VueFileIndex, Set<string>>()
   private injectUsageKeysByProvider = new WeakMap<VueFileIndex, Set<string>>()
   private parentLinksByFile = new WeakMap<VueFileIndex, Set<string>>()
   private isBulkIndexing = false
@@ -49,6 +81,7 @@ export class WorkspaceIndex {
   clear(): void {
     this.files.clear()
     this.workspaceRoots.length = 0
+    this.workspaceVueVersions.clear()
     this.eventBusEntriesByRoot.clear()
     this.externalRefComponents.clear()
     this.externalRefComponentUris.clear()
@@ -58,6 +91,7 @@ export class WorkspaceIndex {
     this.eventBusRegistrations.clear()
     this.mixinIndexCache.clear()
     this.mixinSourceUris.clear()
+    this.vue3ScriptParseCache.clear()
     this.clearReverseIndexes()
   }
 
@@ -68,6 +102,10 @@ export class WorkspaceIndex {
     }
     this.workspaceRoots.length = 0
     this.workspaceRoots.push(...other.workspaceRoots)
+    this.workspaceVueVersions.clear()
+    for (const [root, version] of other.workspaceVueVersions) {
+      this.workspaceVueVersions.set(root, version)
+    }
     this.eventBusEntriesByRoot.clear()
     for (const [root, entries] of other.eventBusEntriesByRoot) {
       this.eventBusEntriesByRoot.set(root, [...entries])
@@ -110,6 +148,13 @@ export class WorkspaceIndex {
       return
     }
     this.eventBusEntriesByRoot.set(root, normalized)
+  }
+
+  setWorkspaceVueVersion(root: string, version: VueMajorVersion): void {
+    if (!this.workspaceRoots.includes(root)) {
+      this.workspaceRoots.push(root)
+    }
+    this.workspaceVueVersions.set(root, version)
   }
 
   getFileCount(): number {
@@ -161,7 +206,8 @@ export class WorkspaceIndex {
   }
 
   resolveComponent(parent: VueFileIndex, tag: string): string | undefined {
-    return findRegisteredComponentInFile(parent, tag) ?? this.resolveGlobalComponent(tag, parent.uri)
+    return findRegisteredComponentInFile(parent, tag)
+      ?? (parent.vueVersion === 2 ? this.resolveGlobalComponent(tag, parent.uri) : undefined)
   }
 
   resolveTemplateComponentUris(parent: VueFileIndex, component: TemplateComponentUsage): string[] {
@@ -194,18 +240,23 @@ export class WorkspaceIndex {
     }
 
     const sfc = parseSfc(uri, content)
-    const eventBusNames = this.getEventBusNames()
-    const ownScriptIndex = sfc.script
-      ? parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots, 'default', eventBusNames)
-      : { imports: [], mixins: [], components: [], staticComponentNames: [], props: [], methods: [], emits: [], eventBusCalls: [], provides: [], injects: [] }
-    const mixed = this.mergeStaticMixins(uri, ownScriptIndex)
+    const vueVersion = this.vueVersionForUri(uri, sfc)
+    const eventBusNames = vueVersion === 2 ? this.getEventBusNames() : []
+    const ownScriptIndex = vueVersion === 3
+      ? parseVue3Script(sfc, this.workspaceRoots, this.vue3ScriptParseCache)
+      : sfc.script
+        ? parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots, 'default', eventBusNames)
+        : emptyScriptIndex()
+    const mixed = vueVersion === 2
+      ? this.mergeStaticMixins(uri, ownScriptIndex)
+      : { scriptIndex: ownScriptIndex, refMethodCalls: [] }
     let scriptIndex = mixed.scriptIndex
     const registeredTags = [
       ...scriptIndex.components.flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
-      ...this.getGlobalComponents().flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
+      ...(vueVersion === 2 ? this.getGlobalComponents().flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]) : []),
     ]
     const templateIndex = sfc.template
-      ? parseTemplate(sfc.template.content, sfc.template.start, registeredTags, scriptIndex.staticComponentNames, eventBusNames)
+      ? parseTemplate(sfc.template.content, sfc.template.start, registeredTags, scriptIndex.staticComponentNames, eventBusNames, vueVersion === 3)
       : { components: [], emits: [], eventBusCalls: [] }
     scriptIndex = {
       ...scriptIndex,
@@ -217,23 +268,28 @@ export class WorkspaceIndex {
     const file: VueFileIndex = {
       uri,
       fileName: sfc.fileName,
+      vueVersion,
       content: sfc.content,
       searchableContent,
       lineStarts: sfc.lineStarts,
       script: sfc.script,
+      scriptSetup: sfc.scriptSetup,
       template: sfc.template,
       scriptIndex,
       templateIndex,
-      refMethodCalls: [
-        ...findRefMethodCalls(searchableContent),
-        ...mixed.refMethodCalls,
-      ],
+      refMethodCalls: vueVersion === 2
+        ? [
+            ...findRefMethodCalls(searchableContent),
+            ...mixed.refMethodCalls,
+          ]
+        : [],
     }
     this.files.set(uri, file)
     if (this.isBulkIndexing) {
       return file
     }
 
+    this.addSourceRelations(file)
     this.addProvideDefinitions(file)
     const relationshipChildren = this.addRelationshipUsages(file)
     this.addEventBusUsages(file)
@@ -277,10 +333,8 @@ export class WorkspaceIndex {
     return this.indexContent(uri, await fs.readFile(uri, 'utf8'))
   }
 
-  async indexWorkspace(root: string, token?: IndexCancellationToken, eventBusEntries?: EventBusEntryConfig): Promise<void> {
-    if (!this.workspaceRoots.includes(root)) {
-      this.workspaceRoots.push(root)
-    }
+  async indexWorkspace(root: string, token?: IndexCancellationToken, eventBusEntries?: EventBusEntryConfig, vueVersion: VueMajorVersion = 2): Promise<void> {
+    this.setWorkspaceVueVersion(root, vueVersion)
     if (eventBusEntries !== undefined) {
       this.setEventBusEntries(root, eventBusEntries)
     }
@@ -297,21 +351,23 @@ export class WorkspaceIndex {
       return
     }
 
-    for (const file of scriptFiles) {
-      await this.indexGlobalComponentFile(file)
+    if (vueVersion === 2) {
+      for (const file of scriptFiles) {
+        await this.indexGlobalComponentFile(file)
+        if (token?.isCancellationRequested) {
+          return
+        }
+      }
+
+      await this.expandRequireContextGlobals(vueFiles)
       if (token?.isCancellationRequested) {
         return
       }
-    }
 
-    await this.expandRequireContextGlobals(vueFiles)
-    if (token?.isCancellationRequested) {
-      return
-    }
-
-    await this.refreshEventBusRegistrations(root, token)
-    if (token?.isCancellationRequested) {
-      return
+      await this.refreshEventBusRegistrations(root, token)
+      if (token?.isCancellationRequested) {
+        return
+      }
     }
 
     this.isBulkIndexing = true
@@ -347,6 +403,12 @@ export class WorkspaceIndex {
   }
 
   async syncGlobalComponentFile(uri: string): Promise<void> {
+    if (this.vueVersionForUri(uri) === 3) {
+      if (this.hasVue3Source(uri)) {
+        this.rebuildSourceConsumers(uri)
+      }
+      return
+    }
     this.clearMixinCacheForFile(uri)
     await this.indexGlobalComponentFile(uri)
     await this.refreshEventBusRegistrations()
@@ -355,6 +417,12 @@ export class WorkspaceIndex {
   }
 
   async removeGlobalComponentFile(uri: string): Promise<void> {
+    if (this.vueVersionForUri(uri) === 3) {
+      if (this.hasVue3Source(uri)) {
+        this.rebuildSourceConsumers(uri)
+      }
+      return
+    }
     this.clearMixinCacheForFile(uri)
     this.removeGlobalRegistrationsFromFile(uri)
     await this.refreshEventBusRegistrations()
@@ -465,8 +533,27 @@ export class WorkspaceIndex {
     return this.mixinSourceUris.has(uri) || this.hasMixinCacheForFile(uri)
   }
 
+  hasVue3PropSource(uri: string): boolean {
+    return (this.sourceProps.get(uri)?.some(({ file }) => file.vueVersion === 3) ?? false)
+      || (this.sourcePropTypes.get(uri)?.some(({ file }) => file.vueVersion === 3) ?? false)
+  }
+
+  hasVue3StaticKeySource(uri: string): boolean {
+    return (this.sourceProvides.get(uri)?.some(({ file, provide }) => file.vueVersion === 3 && provide.keySourceLocation?.uri === uri) ?? false)
+      || (this.sourceInjects.get(uri)?.some(({ file, inject }) => file.vueVersion === 3 && inject.keySourceLocation?.uri === uri) ?? false)
+  }
+
+  hasVue3Source(uri: string): boolean {
+    return this.hasVue3PropSource(uri) || this.hasVue3StaticKeySource(uri)
+  }
+
+  hasSourceRelations(uri: string): boolean {
+    return this.hasMixinSource(uri) || this.sourceRelationFiles.has(uri)
+  }
+
   async refreshEventBusRegistrations(root?: string, token?: IndexCancellationToken): Promise<void> {
-    const roots = root ? [root] : this.workspaceRoots
+    const roots = (root ? [root] : this.workspaceRoots)
+      .filter((workspaceRoot) => this.workspaceVueVersions.get(workspaceRoot) !== 3)
     if (root && !this.workspaceRoots.includes(root)) {
       this.workspaceRoots.push(root)
     }
@@ -498,6 +585,44 @@ export class WorkspaceIndex {
   findTemplatePropUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
     return dedupeUsages(this.findSourceProps(sourceUri, offset)
       .flatMap(({ file, prop }) => this.findTemplatePropUsages(file.uri, prop.name)))
+  }
+
+  findVue3PropInternalUsages(childUri: string, propName: string): UsageInfo[] {
+    return dedupeUsages(this.vue3PropInternalUsages.get(usageKey(childUri, propName)) ?? [])
+  }
+
+  findVue3PropInternalUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
+    return dedupeUsages(this.findSourceProps(sourceUri, offset)
+      .filter(({ file }) => file.vueVersion === 3)
+      .flatMap(({ file, prop }) => this.findVue3PropInternalUsages(file.uri, prop.name)))
+  }
+
+  findPropUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
+    return dedupeUsages([
+      ...this.findTemplatePropUsagesFromSource(sourceUri, offset),
+      ...this.findVue3PropInternalUsagesFromSource(sourceUri, offset),
+    ])
+  }
+
+  findVue3PropTypeUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
+    return (this.sourcePropTypes.get(sourceUri) ?? [])
+      .filter(({ type }) => containsSourceOffset(type.sourceLocation, sourceUri, offset))
+      .map(({ file, type }) => ({ file, span: type.span }))
+  }
+
+  findVue3PropUsageAtOffset(file: VueFileIndex, offset: number): Vue3PropUsage | undefined {
+    if (file.vueVersion !== 3) {
+      return undefined
+    }
+    return file.scriptIndex.vue3PropUsages.find((usage) => offset >= usage.span.start && offset < usage.span.end)
+  }
+
+  findVue3PropTypeAtOffset(file: VueFileIndex, offset: number): ScriptIndex['vue3PropType'] | undefined {
+    const type = file.scriptIndex.vue3PropType
+    if (!type || offset < type.span.start || offset >= type.span.end) {
+      return undefined
+    }
+    return type
   }
 
   findRefMethodUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
@@ -533,34 +658,20 @@ export class WorkspaceIndex {
   }
 
   findSourceRefMethodCalls(sourceUri: string, offset: number): Array<{ file: VueFileIndex, call: RefMethodAccess }> {
-    const results: Array<{ file: VueFileIndex, call: RefMethodAccess }> = []
-    for (const file of this.files.values()) {
-      for (const call of file.refMethodCalls) {
-        if (containsSourceOffset(call.sourceLocation, sourceUri, offset)) {
-          results.push({ file, call })
-        }
-      }
-    }
-    return results
+    return (this.sourceRefMethodCalls.get(sourceUri) ?? [])
+      .filter(({ call }) => containsSourceOffset(call.sourceLocation, sourceUri, offset))
   }
 
   findSourceEventBusCalls(sourceUri: string, offset: number): Array<{ file: VueFileIndex, call: EventBusCall }> {
-    const results: Array<{ file: VueFileIndex, call: EventBusCall }> = []
-    for (const file of this.files.values()) {
-      for (const call of file.scriptIndex.eventBusCalls) {
-        if (containsSourceOffset(call.sourceLocation, sourceUri, offset)) {
-          results.push({ file, call })
-        }
-      }
-    }
-    return results
+    return (this.sourceEventBusCalls.get(sourceUri) ?? [])
+      .filter(({ call }) => containsSourceOffset(call.sourceLocation, sourceUri, offset))
   }
 
   findSourceRefOwners(sourceUri: string, refName: string): VueFileIndex[] {
     const results: VueFileIndex[] = []
     const seen = new Set<string>()
-    for (const file of this.files.values()) {
-      if (!usesSource(file, sourceUri) || seen.has(file.uri) || !this.resolveRefComponent(file, refName)) {
+    for (const file of this.findSourceConsumers(sourceUri)) {
+      if (seen.has(file.uri) || !this.resolveRefComponent(file, refName)) {
         continue
       }
       seen.add(file.uri)
@@ -570,7 +681,9 @@ export class WorkspaceIndex {
   }
 
   findSourceConsumers(sourceUri: string): VueFileIndex[] {
-    return [...this.files.values()].filter((file) => usesSource(file, sourceUri))
+    return [...(this.sourceRelationFiles.get(sourceUri) ?? [])]
+      .map((uri) => this.files.get(uri))
+      .filter((file): file is VueFileIndex => Boolean(file))
   }
 
   private isStaticAncestor(ancestorUri: string, childUri: string): boolean {
@@ -704,63 +817,28 @@ export class WorkspaceIndex {
   }
 
   private findSourceProps(sourceUri: string, offset: number): Array<{ file: VueFileIndex, prop: PropInfo }> {
-    const results: Array<{ file: VueFileIndex, prop: PropInfo }> = []
-    for (const file of this.files.values()) {
-      for (const prop of file.scriptIndex.props) {
-        if (containsSourceOffset(prop.sourceLocation, sourceUri, offset)) {
-          results.push({ file, prop })
-        }
-      }
-    }
-    return results
+    return (this.sourceProps.get(sourceUri) ?? [])
+      .filter(({ prop }) => containsSourceOffset(prop.sourceLocation, sourceUri, offset))
   }
 
   private findSourceMethods(sourceUri: string, offset: number): Array<{ file: VueFileIndex, method: MethodInfo }> {
-    const results: Array<{ file: VueFileIndex, method: MethodInfo }> = []
-    for (const file of this.files.values()) {
-      for (const method of file.scriptIndex.methods) {
-        if (containsSourceOffset(method.sourceLocation, sourceUri, offset)) {
-          results.push({ file, method })
-        }
-      }
-    }
-    return results
+    return (this.sourceMethods.get(sourceUri) ?? [])
+      .filter(({ method }) => containsSourceOffset(method.sourceLocation, sourceUri, offset))
   }
 
   private findSourceEmits(sourceUri: string, offset: number): Array<{ file: VueFileIndex, emit: ScriptIndex['emits'][number] }> {
-    const results: Array<{ file: VueFileIndex, emit: ScriptIndex['emits'][number] }> = []
-    for (const file of this.files.values()) {
-      for (const emit of file.scriptIndex.emits) {
-        if (containsSourceOffset(emit.sourceLocation, sourceUri, offset)) {
-          results.push({ file, emit })
-        }
-      }
-    }
-    return results
+    return (this.sourceEmits.get(sourceUri) ?? [])
+      .filter(({ emit }) => containsSourceOffset(emit.sourceLocation, sourceUri, offset))
   }
 
   private findSourceProvides(sourceUri: string, offset: number): Array<{ file: VueFileIndex, provide: ProvideInfo }> {
-    const results: Array<{ file: VueFileIndex, provide: ProvideInfo }> = []
-    for (const file of this.files.values()) {
-      for (const provide of file.scriptIndex.provides) {
-        if (containsSourceOffset(provide.sourceLocation, sourceUri, offset)) {
-          results.push({ file, provide })
-        }
-      }
-    }
-    return results
+    return (this.sourceProvides.get(sourceUri) ?? [])
+      .filter(({ provide }) => containsSourceOffset(provide.sourceLocation, sourceUri, offset) || containsSourceOffset(provide.keySourceLocation, sourceUri, offset))
   }
 
   private findSourceInjects(sourceUri: string, offset: number): Array<{ file: VueFileIndex, inject: InjectInfo }> {
-    const results: Array<{ file: VueFileIndex, inject: InjectInfo }> = []
-    for (const file of this.files.values()) {
-      for (const inject of file.scriptIndex.injects) {
-        if (containsSourceOffset(inject.sourceLocation, sourceUri, offset)) {
-          results.push({ file, inject })
-        }
-      }
-    }
-    return results
+    return (this.sourceInjects.get(sourceUri) ?? [])
+      .filter(({ inject }) => containsSourceOffset(inject.sourceLocation, sourceUri, offset) || containsSourceOffset(inject.keySourceLocation, sourceUri, offset))
   }
 
   private mergeStaticMixins(uri: string, own: ScriptIndex): { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } {
@@ -886,10 +964,21 @@ export class WorkspaceIndex {
     this.eventBusListeners.clear()
     this.eventBusEventNames.clear()
     this.refMethodUsages.clear()
+    this.vue3PropInternalUsages.clear()
     this.provideDefinitions.clear()
     this.injectUsages.clear()
+    this.sourceProps.clear()
+    this.sourcePropTypes.clear()
+    this.sourceMethods.clear()
+    this.sourceEmits.clear()
+    this.sourceEventBusCalls.clear()
+    this.sourceProvides.clear()
+    this.sourceInjects.clear()
+    this.sourceRefMethodCalls.clear()
+    this.sourceRelationFiles.clear()
     this.parentComponents.clear()
     this.usageKeysByFile = new WeakMap()
+    this.sourceKeysByFile = new WeakMap()
     this.injectUsageKeysByProvider = new WeakMap()
     this.parentLinksByFile = new WeakMap()
   }
@@ -902,6 +991,52 @@ export class WorkspaceIndex {
     keys.add(key)
     usageMaps.set(trackedMap, keys)
     this.usageKeysByFile.set(usage.file, usageMaps)
+  }
+
+  private addSourceRelation<T extends { file: VueFileIndex }>(map: SourceRelationMap<T>, sourceLocation: SourceLocation | undefined, item: T): void {
+    if (!sourceLocation) {
+      return
+    }
+    const items = map.get(sourceLocation.uri) ?? []
+    items.push(item)
+    map.set(sourceLocation.uri, items)
+
+    const files = this.sourceRelationFiles.get(sourceLocation.uri) ?? new Set<string>()
+    files.add(item.file.uri)
+    this.sourceRelationFiles.set(sourceLocation.uri, files)
+
+    const sourceKeys = this.sourceKeysByFile.get(item.file) ?? new Set<string>()
+    sourceKeys.add(sourceLocation.uri)
+    this.sourceKeysByFile.set(item.file, sourceKeys)
+  }
+
+  private addSourceRelations(file: VueFileIndex): void {
+    for (const prop of file.scriptIndex.props) {
+      this.addSourceRelation(this.sourceProps, prop.sourceLocation, { file, prop })
+    }
+    if (file.scriptIndex.vue3PropType) {
+      this.addSourceRelation(this.sourcePropTypes, file.scriptIndex.vue3PropType.sourceLocation, { file, type: file.scriptIndex.vue3PropType })
+    }
+    for (const method of file.scriptIndex.methods) {
+      this.addSourceRelation(this.sourceMethods, method.sourceLocation, { file, method })
+    }
+    for (const emit of file.scriptIndex.emits) {
+      this.addSourceRelation(this.sourceEmits, emit.sourceLocation, { file, emit })
+    }
+    for (const call of file.scriptIndex.eventBusCalls) {
+      this.addSourceRelation(this.sourceEventBusCalls, call.sourceLocation, { file, call })
+    }
+    for (const provide of file.scriptIndex.provides) {
+      this.addSourceRelation(this.sourceProvides, provide.sourceLocation, { file, provide })
+      this.addSourceRelation(this.sourceProvides, provide.keySourceLocation, { file, provide })
+    }
+    for (const inject of file.scriptIndex.injects) {
+      this.addSourceRelation(this.sourceInjects, inject.sourceLocation, { file, inject })
+      this.addSourceRelation(this.sourceInjects, inject.keySourceLocation, { file, inject })
+    }
+    for (const call of file.refMethodCalls) {
+      this.addSourceRelation(this.sourceRefMethodCalls, call.sourceLocation, { file, call })
+    }
   }
 
   private addInjectUsageProvider(provider: VueFileIndex, key: string): void {
@@ -929,6 +1064,30 @@ export class WorkspaceIndex {
       }
     }
     this.usageKeysByFile.delete(file)
+  }
+
+  private removeFileSourceRelations(file: VueFileIndex): void {
+    const keys = this.sourceKeysByFile.get(file)
+    if (!keys) {
+      return
+    }
+    for (const key of keys) {
+      removeSourceRelationItem(this.sourceProps, key, file)
+      removeSourceRelationItem(this.sourcePropTypes, key, file)
+      removeSourceRelationItem(this.sourceMethods, key, file)
+      removeSourceRelationItem(this.sourceEmits, key, file)
+      removeSourceRelationItem(this.sourceEventBusCalls, key, file)
+      removeSourceRelationItem(this.sourceProvides, key, file)
+      removeSourceRelationItem(this.sourceInjects, key, file)
+      removeSourceRelationItem(this.sourceRefMethodCalls, key, file)
+
+      const files = this.sourceRelationFiles.get(key)
+      files?.delete(file.uri)
+      if (files?.size === 0) {
+        this.sourceRelationFiles.delete(key)
+      }
+    }
+    this.sourceKeysByFile.delete(file)
   }
 
   private removeTrackedProviderUsages(file: VueFileIndex): void {
@@ -1003,6 +1162,10 @@ export class WorkspaceIndex {
       for (const attr of component.attrs) {
         for (const childUri of childUris) {
           if (attr.kind === 'prop') {
+            const child = this.getFile(childUri)
+            if (child?.vueVersion === 3) {
+              continue
+            }
             this.addUsage(this.propUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
           } else if (attr.kind === 'event') {
             this.addUsage(this.eventUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
@@ -1011,10 +1174,16 @@ export class WorkspaceIndex {
       }
     }
 
-    for (const call of file.refMethodCalls) {
-      for (const childUri of this.resolveRefComponents(file, call.refName)) {
-        this.addUsage(this.refMethodUsages, usageKey(childUri, call.methodName), { file, span: call.methodSpan, sourceLocation: call.sourceLocation })
+    if (file.vueVersion === 2) {
+      for (const call of file.refMethodCalls) {
+        for (const childUri of this.resolveRefComponents(file, call.refName)) {
+          this.addUsage(this.refMethodUsages, usageKey(childUri, call.methodName), { file, span: call.methodSpan, sourceLocation: call.sourceLocation })
+        }
       }
+    }
+
+    for (const usage of file.scriptIndex.vue3PropUsages) {
+      this.addUsage(this.vue3PropInternalUsages, usageKey(file.uri, usage.propName), { file, span: usage.span })
     }
 
     return relationshipChildren
@@ -1136,9 +1305,30 @@ export class WorkspaceIndex {
     }
   }
 
+  private rebuildSourceConsumers(sourceUri: string): void {
+    const indexedFiles = [...(this.sourceRelationFiles.get(sourceUri) ?? [])]
+      .map((uri) => this.files.get(uri))
+      .filter((file): file is VueFileIndex => Boolean(file))
+      .map((file) => ({ uri: file.uri, content: file.content }))
+    if (indexedFiles.length === 0) {
+      return
+    }
+
+    this.isBulkIndexing = true
+    try {
+      for (const file of indexedFiles) {
+        this.indexContent(file.uri, file.content)
+      }
+    } finally {
+      this.isBulkIndexing = false
+      this.rebuildReverseIndexes()
+    }
+  }
+
   private rebuildReverseIndexes(): void {
     this.clearReverseIndexes()
     for (const file of this.files.values()) {
+      this.addSourceRelations(file)
       this.addProvideDefinitions(file)
     }
     for (const file of this.files.values()) {
@@ -1265,6 +1455,14 @@ export class WorkspaceIndex {
     return this.workspaceRoots.find((root) => uri === root || isInsideDirectory(uri, root))
   }
 
+  private vueVersionForUri(uri: string, sfc?: ParsedSfc): VueMajorVersion {
+    const root = this.workspaceRootFor(uri)
+    if (root) {
+      return this.workspaceVueVersions.get(root) ?? 2
+    }
+    return sfc?.scriptSetup ? 3 : 2
+  }
+
   private removeEventBusRegistrationsInRoot(root: string): void {
     for (const uri of [...this.eventBusRegistrations.keys()]) {
       if (uri === root || isInsideDirectory(uri, root)) {
@@ -1274,6 +1472,7 @@ export class WorkspaceIndex {
   }
 
   private removeReverseIndex(file: VueFileIndex): void {
+    this.removeFileSourceRelations(file)
     this.removeTrackedFileUsages(file)
     removeEventBusEventNames(this.eventBusEventNames, this.eventBusEmits, this.eventBusListeners, file)
     this.removeTrackedProviderUsages(file)
@@ -1370,16 +1569,6 @@ function dedupeUsages<T extends UsageInfo>(usages: T[]): T[] {
     results.push(usage)
   }
   return results
-}
-
-function usesSource(file: VueFileIndex, sourceUri: string): boolean {
-  return file.scriptIndex.props.some((item) => item.sourceLocation?.uri === sourceUri)
-    || file.scriptIndex.methods.some((item) => item.sourceLocation?.uri === sourceUri)
-    || file.scriptIndex.emits.some((item) => item.sourceLocation?.uri === sourceUri)
-    || file.scriptIndex.eventBusCalls.some((item) => item.sourceLocation?.uri === sourceUri)
-    || file.scriptIndex.provides.some((item) => item.sourceLocation?.uri === sourceUri)
-    || file.scriptIndex.injects.some((item) => item.sourceLocation?.uri === sourceUri)
-    || file.refMethodCalls.some((call) => call.sourceLocation?.uri === sourceUri)
 }
 
 function defaultEventBusEntryCandidates(root: string): string[] {
@@ -1601,6 +1790,19 @@ function removeFileUsageAtKey<T extends UsageInfo>(map: Map<string, T[]>, key: s
   if (kept.length === 0) {
     map.delete(key)
   } else if (kept.length !== usages.length) {
+    map.set(key, kept)
+  }
+}
+
+function removeSourceRelationItem<T extends { file: VueFileIndex }>(map: SourceRelationMap<T>, key: string, file: VueFileIndex): void {
+  const items = map.get(key)
+  if (!items) {
+    return
+  }
+  const kept = items.filter((item) => item.file !== file)
+  if (kept.length === 0) {
+    map.delete(key)
+  } else if (kept.length !== items.length) {
     map.set(key, kept)
   }
 }

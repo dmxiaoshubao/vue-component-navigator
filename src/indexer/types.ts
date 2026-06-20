@@ -25,12 +25,15 @@ export interface SfcBlock {
   end: number
 }
 
+export type VueMajorVersion = 2 | 3
+
 export interface ParsedSfc {
   uri: string
   fileName: string
   content: string
   lineStarts: number[]
   script?: SfcBlock
+  scriptSetup?: SfcBlock
   template?: SfcBlock
 }
 
@@ -130,6 +133,7 @@ export interface ProvideInfo {
   detail: string
   documentation?: string
   sourceLocation?: SourceLocation
+  keySourceLocation?: SourceLocation
 }
 
 export interface InjectInfo {
@@ -139,6 +143,18 @@ export interface InjectInfo {
   localSpan: TextSpan
   detail: string
   sourceLocation?: SourceLocation
+  keySourceLocation?: SourceLocation
+}
+
+export interface Vue3PropTypeInfo {
+  name: string
+  span: TextSpan
+  sourceLocation?: SourceLocation
+}
+
+export interface Vue3PropUsage {
+  propName: string
+  span: TextSpan
 }
 
 export interface ScriptIndex {
@@ -153,6 +169,8 @@ export interface ScriptIndex {
   eventBusCalls: EventBusCall[]
   provides: ProvideInfo[]
   injects: InjectInfo[]
+  vue3PropType?: Vue3PropTypeInfo
+  vue3PropUsages: Vue3PropUsage[]
 }
 
 export interface TemplateAttrUsage {
@@ -179,10 +197,12 @@ export interface TemplateIndex {
 export interface VueFileIndex {
   uri: string
   fileName: string
+  vueVersion: VueMajorVersion
   content: string
   searchableContent: string
   lineStarts: number[]
   script?: SfcBlock
+  scriptSetup?: SfcBlock
   template?: SfcBlock
   scriptIndex: ScriptIndex
   templateIndex: TemplateIndex

@@ -42,7 +42,7 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
       return []
     }
 
-    const sourceReferences = this.index.hasMixinSource(document.uri.fsPath)
+    const sourceReferences = this.index.hasSourceRelations(document.uri.fsPath)
       ? this.sourceReferences(document.uri.fsPath, offset)
       : []
     if (sourceReferences.length > 0) {
@@ -50,6 +50,18 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
     }
     if (!file) {
       return []
+    }
+
+    const vue3PropType = this.index.findVue3PropTypeAtOffset(file, offset)
+    if (vue3PropType) {
+      const usages = this.index.findVue3PropTypeUsagesFromSource(vue3PropType.sourceLocation?.uri ?? file.uri, vue3PropType.sourceLocation?.span.start ?? vue3PropType.span.start)
+      return usages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
+    }
+
+    const vue3PropUsage = this.index.findVue3PropUsageAtOffset(file, offset)
+    if (vue3PropUsage) {
+      return this.index.findVue3PropInternalUsages(file.uri, vue3PropUsage.propName)
+        .map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
     }
 
     for (const call of file.scriptIndex.eventBusCalls) {
@@ -91,7 +103,8 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
   private sourceReferences(sourceUri: string, offset: number): vscode.Location[] {
     return [
       ...this.index.findRefMethodUsagesFromSource(sourceUri, offset),
-      ...this.index.findTemplatePropUsagesFromSource(sourceUri, offset),
+      ...this.index.findPropUsagesFromSource(sourceUri, offset),
+      ...this.index.findVue3PropTypeUsagesFromSource(sourceUri, offset),
       ...this.index.findTemplateEventUsagesFromSource(sourceUri, offset),
       ...this.index.findEventBusListenersFromSource(sourceUri, offset),
       ...this.index.findEventBusEmitsFromSource(sourceUri, offset),

@@ -20,7 +20,7 @@ type UsageCommandArgs =
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
-  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'method' | 'event' | 'provide' | 'inject' }
+  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' }
 
 function definitionLink(file: VueFileIndex, span: TextSpan, label: string, sourceLocation?: SourceLocation): string {
   const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
@@ -346,7 +346,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
     if (offset === undefined) {
       return undefined
     }
-    const sourceHover = this.index.hasMixinSource(document.uri.fsPath)
+    const sourceHover = this.index.hasSourceRelations(document.uri.fsPath)
       ? this.sourceHover(document.uri.fsPath, offset)
       : undefined
     if (sourceHover) {
@@ -361,7 +361,29 @@ export class VueHoverProvider implements vscode.HoverProvider {
       return labels
     }
 
-    const refAccess = findRefMethodAccessInFile(file, offset)
+    const vue3PropType = this.index.findVue3PropTypeAtOffset(file, offset)
+    if (vue3PropType) {
+      const sourceUri = vue3PropType.sourceLocation?.uri ?? file.uri
+      const sourceOffset = vue3PropType.sourceLocation?.span.start ?? vue3PropType.span.start
+      const usages = this.index.findVue3PropTypeUsagesFromSource(sourceUri, sourceOffset)
+      const summary = usageSummary(usages, this.workspaceBaseDirectory(), {
+        noneText: 'No defineProps usages found.',
+        title: 'Used by',
+        singular: 'defineProps type',
+        plural: 'defineProps types',
+        commandArgs: { kind: 'source-usages', sourceUri, offset: sourceOffset, relation: 'prop-type' },
+        includeContext: false,
+      })
+      return markdownHover(summary.text, summary.trusted)
+    }
+
+    const vue3PropUsage = this.index.findVue3PropUsageAtOffset(file, offset)
+    if (vue3PropUsage) {
+      const prop = findProp(file, vue3PropUsage.propName)
+      return prop ? propHover(file, prop, labelForDefinition(definitionLabels(), file, prop.sourceLocation)) : undefined
+    }
+
+    const refAccess = file.vueVersion === 2 ? findRefMethodAccessInFile(file, offset) : undefined
     if (refAccess) {
       const definitions = findResolvedRefComponents(this.index, file, refAccess.refName).flatMap((childUri) => {
         const child = this.index.getFile(childUri)
@@ -391,6 +413,9 @@ export class VueHoverProvider implements vscode.HoverProvider {
         }
         if (attr.kind === 'prop') {
           const definitions = children.flatMap((child) => {
+            if (child.vueVersion === 3) {
+              return []
+            }
             const prop = findProp(child, attr.normalizedName)
             return prop ? [{ child, prop }] : []
           })
@@ -455,6 +480,31 @@ export class VueHoverProvider implements vscode.HoverProvider {
     const eventBusCalls = this.index.findSourceEventBusCalls(sourceUri, offset)
     if (eventBusCalls.length > 0) {
       return this.eventBusHover(eventBusCalls[0].call)
+    }
+
+    const typeUsages = this.index.findVue3PropTypeUsagesFromSource(sourceUri, offset)
+    if (typeUsages.length > 0) {
+      const summary = usageSummary(typeUsages, this.workspaceBaseDirectory(), {
+        noneText: 'No defineProps usages found.',
+        title: 'Used by',
+        singular: 'defineProps type',
+        plural: 'defineProps types',
+        commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'prop-type' },
+        includeContext: false,
+      })
+      return markdownHover(summary.text, summary.trusted)
+    }
+
+    const vue3PropUsages = this.index.findVue3PropInternalUsagesFromSource(sourceUri, offset)
+    if (vue3PropUsages.length > 0) {
+      const summary = usageSummary(vue3PropUsages, this.workspaceBaseDirectory(), {
+        noneText: 'No prop usages found.',
+        title: 'Used by',
+        singular: 'prop usage',
+        plural: 'prop usages',
+        commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'prop' },
+      })
+      return markdownHover(summary.text, summary.trusted)
     }
 
     const propUsages = this.index.findTemplatePropUsagesFromSource(sourceUri, offset)
@@ -526,6 +576,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
     const uris = this.index.getAllFiles().flatMap((file) => [
       file.uri,
       ...file.scriptIndex.props.map((item) => item.sourceLocation?.uri),
+      file.scriptIndex.vue3PropType?.sourceLocation?.uri,
       ...file.scriptIndex.methods.map((item) => item.sourceLocation?.uri),
       ...file.scriptIndex.emits.map((item) => item.sourceLocation?.uri),
       ...file.scriptIndex.eventBusCalls.map((item) => item.sourceLocation?.uri),

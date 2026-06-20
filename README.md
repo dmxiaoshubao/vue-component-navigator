@@ -1,10 +1,10 @@
 # vue-component-navigator
 
-VS Code navigation helpers for Vue 2 projects that still use the Options API.
+VS Code navigation helpers for Vue 2 Options API projects and focused Vue 3 `<script setup>` relationships.
 
 > 中文文档: [README.zh-CN.md](./README.zh-CN.md)
 
-This extension focuses on relationships that are easy to miss in older Vue 2 codebases: `$refs`, component props and events, `provide` / `inject`, mixins, global components, and common Event Bus usage.
+This extension focuses on relationships that are easy to miss in Vue codebases. Vue 2 keeps the existing `$refs`, component props/events, `provide` / `inject`, mixins, global components, and Event Bus support. Vue 3 support is intentionally narrower and targets typed `defineProps`, `defineEmits`, `v-model` update events, and static `provide` / `inject`.
 
 It does not try to replace the official Vue tooling. Local component tag definitions are intentionally left alone to avoid duplicate results.
 
@@ -47,6 +47,11 @@ Shows jumping from static `inject` keys to the nearest static provider, and from
 - Static mixins imported from workspace `.js`, `.ts`, or `.vue` files.
 - Static global component registrations such as `Vue.component(...)`.
 - Third-party `$refs` methods for supported libraries, such as Element UI `el-form.validate()` and Vant `van-field.focus()`.
+- Vue 3 `<script setup>` local component imports.
+- Vue 3 `defineProps<Props>()` / `defineProps<{ ... }>()` type members and static internal prop usages.
+- Vue 3 `defineEmits` declarations and calls such as `emit('confirm')` linked to parent template listeners.
+- Vue 3 `v-model` / `v-model:show` relationships to `update:modelValue` / `update:show` events.
+- Vue 3 static `provide('key', value)` / `inject('key')` and `InjectionKey` / `Symbol` key relationships.
 - `@/` style aliases from the nearest `jsconfig.json` or `tsconfig.json`.
 
 ## Event Bus Entry
@@ -102,12 +107,7 @@ Event Bus usage is ignored until the bus name is found from these entry files. T
 
 ## Boundaries
 
-- Vue 2 Options API only.
-- Vue 3 and `<script setup>` are not targeted.
-- Dynamic names and composed paths are skipped, for example `import('./' + type + '.vue')`.
-- Dynamic refs, prop names, event names, Event Bus names, and `provide` / `inject` keys are skipped.
-- Global mixins, spread mixins, conditional mixins, and package mixins are skipped.
-- Template prop/event relationships for package components in `node_modules` are ignored. `$refs` method support reads only known, directly mapped component type files for supported libraries such as Element UI and Vant.
+- Vue 2 and Vue 3 workspaces are indexed by detected Vue major version; their feature sets are intentionally separated.
 - Files outside the workspace are ignored.
 
 The parser is deliberately conservative. When a relationship cannot be proven statically, the extension avoids returning a misleading result.

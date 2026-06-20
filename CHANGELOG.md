@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.2.0 - 2026-06-20
+
+### English
+
+#### Added
+
+- Added Vue 3 workspace support for static component navigation, `defineProps` type usage, `defineEmits` event relationships, and Composition API `provide` / `inject` relationships.
+
+#### Improved
+
+- Improved Vue workspace detection so Vue 2 and Vue 3 projects use separate indexing behavior.
+- Improved Vue 3 source-file indexing performance with source relation tracking, cached static key parsing, and direct-consumer rebuilds.
+
+### 中文
+
+#### 新增
+
+- 新增 Vue 3 workspace 支持，覆盖静态组件导航、`defineProps` 类型使用、`defineEmits` 事件关系，以及 Composition API `provide` / `inject` 关系。
+
+#### 改进
+
+- 改进 Vue workspace 识别，让 Vue 2 和 Vue 3 项目分别使用对应索引行为。
+- 改进 Vue 3 source 文件索引性能，通过 source relation 跟踪、静态 key 缓存和直接依赖文件重建减少不必要扫描。
+
 ## 1.1.0 - 2026-06-13
 
 ### English

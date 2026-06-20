@@ -68,6 +68,7 @@ function parseDtsComponent(uri: string, componentName: string): VueFileIndex | u
   return {
     uri,
     fileName: path.basename(uri),
+    vueVersion: 2,
     content,
     searchableContent: content,
     lineStarts,
@@ -85,6 +86,7 @@ function parseDtsComponent(uri: string, componentName: string): VueFileIndex | u
       eventBusCalls: [],
       provides: [],
       injects: [],
+      vue3PropUsages: [],
     },
     templateIndex: { components: [], emits: [], eventBusCalls: [] },
     refMethodCalls: [],

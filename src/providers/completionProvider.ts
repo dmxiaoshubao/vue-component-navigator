@@ -66,7 +66,7 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
       return undefined
     }
 
-    const eventBusNames = this.index.getEventBusNames()
+    const eventBusNames = file?.vueVersion === 3 ? [] : this.index.getEventBusNames()
     const eventBusSearchContent = eventBusCompletionSearchContent(file, content, offset)
     const eventBusMethodContext = findEventBusMethodCompletionContext(eventBusSearchContent, offset, eventBusNames)
     if (eventBusMethodContext) {
@@ -86,6 +86,10 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
           ? this.index.findSourceConsumers(document.uri.fsPath)
           : []
       return this.provideKeyCompletions(consumers, injectContext, position)
+    }
+
+    if (file?.vueVersion === 3) {
+      return undefined
     }
 
     const refRootContext = isVueDocument(document) && file

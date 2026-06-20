@@ -1102,6 +1102,296 @@ export default {
   })
 })
 
+describe('Vue3 indexer', () => {
+  it('解析 script setup props 类型、emits、provide/inject，并隔离 ref/eventBus/global/外部 prop', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-indexer-'))
+    const typeUri = path.join(root, 'src/components/confirm-dialog/type.ts')
+    const childUri = path.join(root, 'src/components/confirm-dialog/index.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const providerUri = path.join(root, 'src/Provider.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+    const globalUri = path.join(root, 'src/global.ts')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.4.0' } }))
+    writeText(typeUri, `
+export type ConfirmDialogProps = {
+  show: boolean
+  /** 确认之前的回调，返回 false 则不关闭弹窗 */
+  beforeConfirm?: () => Promise<boolean> | boolean | void
+  title?: string
+}
+`)
+    writeText(childUri, `
+<template>
+  <div
+    beforeConfirm="beforeConfirm"
+    :beforeConfirm="noop"
+    title="title"
+    :data-title="'title'"
+  >
+    {{ title }} {{ props.beforeConfirm }}
+  </div>
+</template>
+<script setup lang="ts">
+import type { ConfirmDialogProps as DialogProps } from './type'
+
+defineOptions({ name: 'confirm-dialog' })
+
+const props = withDefaults(defineProps<DialogProps>(), {
+  title: '',
+})
+const emits = defineEmits<{
+  confirm: []
+}>()
+
+const noop = () => {}
+const confirmHandler = async () => {
+  if (props.beforeConfirm) {
+    await props.beforeConfirm()
+  }
+  emits('confirm')
+}
+
+provide('dialog-service', confirmHandler)
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <ConfirmDialog ref="dialog" :beforeConfirm="beforeConfirm" @confirm="onConfirm" />
+  <GlobalDialog @confirm="onConfirm" />
+</template>
+<script setup lang="ts">
+import ConfirmDialog from './components/confirm-dialog/index.vue'
+const beforeConfirm = () => true
+const onConfirm = () => {}
+const dialog = ref()
+dialog.value?.open()
+</script>
+`)
+    writeText(providerUri, `
+<template><Consumer /></template>
+<script setup lang="ts">
+import Consumer from './Consumer.vue'
+provide<{ ready: boolean }>('service', { ready: true })
+</script>
+`)
+    writeText(consumerUri, `
+<template><div /></template>
+<script setup lang="ts">
+const service =
+  inject<{ ready: boolean }>('service')
+</script>
+`)
+    writeText(globalUri, `
+import ConfirmDialog from './components/confirm-dialog/index.vue'
+app.component('GlobalDialog', ConfirmDialog)
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const child = index.getFile(childUri)!
+    const parent = index.getFile(parentUri)!
+    const consumer = index.getFile(consumerUri)!
+
+    expect(child.vueVersion).toBe(3)
+    expect(child.scriptSetup?.content).toContain('defineProps')
+    expect(child.scriptIndex.componentName).toBe('confirm-dialog')
+    expect(child.scriptIndex.props.map((prop) => prop.name)).toEqual(['show', 'beforeConfirm', 'title'])
+    expect(child.scriptIndex.props.find((prop) => prop.name === 'beforeConfirm')?.sourceLocation?.uri).toBe(typeUri)
+    expect(child.scriptIndex.vue3PropType?.sourceLocation?.uri).toBe(typeUri)
+    expect(index.findVue3PropInternalUsages(childUri, 'beforeConfirm')).toHaveLength(3)
+    expect(index.findVue3PropInternalUsagesFromSource(typeUri, fs.readFileSync(typeUri, 'utf8').indexOf('beforeConfirm'))).toHaveLength(3)
+    expect(index.findVue3PropInternalUsages(childUri, 'title')).toHaveLength(1)
+
+    expect(index.resolveComponent(parent, 'ConfirmDialog')).toBe(childUri)
+    expect(index.resolveComponent(parent, 'GlobalDialog')).toBeUndefined()
+    expect(index.findTemplatePropUsages(childUri, 'beforeConfirm')).toHaveLength(0)
+    expect(index.findTemplateEventUsages(childUri, 'confirm')).toHaveLength(1)
+    expect(findEmit(child, 'confirm')).toHaveLength(1)
+    expect(index.findRefMethodUsages(childUri, 'open')).toHaveLength(0)
+    expect(index.getEventBusNames()).toEqual([])
+
+    expect(index.findProvideDefinitions(consumer, 'service').map((usage) => usage.file.uri)).toEqual([providerUri])
+    expect(index.findInjectUsages(providerUri, 'service').map((usage) => usage.file.uri)).toEqual([consumerUri])
+    expect(consumer.scriptIndex.injects.map((inject) => [inject.localName, inject.key])).toEqual([
+      ['service', 'service'],
+    ])
+  })
+
+  it('支持 inline props、声明式 emits、v-model 事件和 InjectionKey 静态关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-static-features-'))
+    const keyUri = path.join(root, 'src/keys.ts')
+    const childUri = path.join(root, 'src/InlineChild.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const providerUri = path.join(root, 'src/Provider.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(keyUri, `
+import type { InjectionKey } from 'vue'
+
+interface Service {
+  ready: boolean
+}
+
+export const serviceKey: InjectionKey<Service> = Symbol('service')
+`)
+    writeText(childUri, `
+<template>
+  <button @click="call">{{ props.inlineTitle }}</button>
+</template>
+<script setup lang="ts">
+const props = defineProps<{
+  inlineTitle?: string
+  show: boolean
+}>()
+
+const emit = defineEmits<{
+  declared: []
+  'update:show': [value: boolean]
+  (e: 'closed'): void
+}>()
+
+function call() {
+  emit('called')
+}
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <InlineChild v-model:show="show" inline-title="hello" @declared="onDeclared" @closed="onClosed" />
+</template>
+<script setup lang="ts">
+import InlineChild from './InlineChild.vue'
+
+const show = ref(false)
+const onDeclared = () => {}
+const onClosed = () => {}
+</script>
+`)
+    writeText(providerUri, `
+<template><Consumer /></template>
+<script setup lang="ts">
+import Consumer from './Consumer.vue'
+import { serviceKey } from './keys'
+
+provide(serviceKey, { ready: true })
+</script>
+`)
+    writeText(consumerUri, `
+<template><div /></template>
+<script setup lang="ts">
+import { serviceKey as injectedServiceKey } from './keys'
+
+const service = inject(injectedServiceKey)
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const child = index.getFile(childUri)!
+    const parent = index.getFile(parentUri)!
+    const provider = index.getFile(providerUri)!
+    const consumer = index.getFile(consumerUri)!
+    const symbolKey = provider.scriptIndex.provides[0].key
+
+    expect(child.scriptIndex.props.map((prop) => prop.name)).toEqual(['inlineTitle', 'show'])
+    expect(index.findVue3PropInternalUsages(childUri, 'inlineTitle')).toHaveLength(1)
+    expect(child.scriptIndex.emits.map((emit) => emit.eventName).sort()).toEqual(['called', 'closed', 'declared', 'update:show'])
+    expect(index.findTemplateEventUsages(childUri, 'declared')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(childUri, 'closed')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(childUri, 'update:show')).toHaveLength(1)
+    expect(parent.templateIndex.components[0].attrs.some((attr) => attr.kind === 'event' && attr.normalizedName === 'update:show')).toBe(true)
+
+    expect(symbolKey).toBe(`symbol:${keyUri}:serviceKey`)
+    expect(provider.scriptIndex.provides[0].detail).toBe('serviceKey')
+    expect(provider.scriptIndex.provides[0].keySourceLocation?.uri).toBe(keyUri)
+    expect(consumer.scriptIndex.injects[0].key).toBe(symbolKey)
+    expect(consumer.scriptIndex.injects[0].detail).toBe('injectedServiceKey')
+    expect(index.findProvideDefinitions(consumer, symbolKey).map((usage) => usage.file.uri)).toEqual([providerUri])
+    expect(index.findInjectUsages(providerUri, symbolKey).map((usage) => usage.file.uri)).toEqual([consumerUri])
+  })
+
+  it('Vue3 key 源文件更新时只重建直接依赖文件', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-source-rebuild-'))
+    const keyUri = path.join(root, 'src/keys.ts')
+    const providerUri = path.join(root, 'src/Provider.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+    const unrelatedUri = path.join(root, 'src/Unrelated.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(keyUri, `
+export const serviceKey = Symbol('service')
+`)
+    writeText(providerUri, `
+<template><Consumer /></template>
+<script setup lang="ts">
+import Consumer from './Consumer.vue'
+import { serviceKey } from './keys'
+
+provide(serviceKey, { ready: true })
+</script>
+`)
+    writeText(consumerUri, `
+<template><div /></template>
+<script setup lang="ts">
+import { serviceKey } from './keys'
+
+const service = inject(serviceKey)
+</script>
+`)
+    writeText(unrelatedUri, `
+<template><div /></template>
+<script setup lang="ts">
+const message = 'stable'
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const beforeProvider = index.getFile(providerUri)!
+    const beforeConsumer = index.getFile(consumerUri)!
+    const beforeUnrelated = index.getFile(unrelatedUri)!
+    const symbolKey = beforeProvider.scriptIndex.provides[0].key
+
+    expect(index.findInjectUsages(providerUri, symbolKey).map((usage) => usage.file.uri)).toEqual([consumerUri])
+
+    writeText(keyUri, `
+export const serviceKey = {}
+`)
+    await index.syncGlobalComponentFile(keyUri)
+
+    const afterProvider = index.getFile(providerUri)!
+    const afterConsumer = index.getFile(consumerUri)!
+    expect(afterProvider).not.toBe(beforeProvider)
+    expect(afterConsumer).not.toBe(beforeConsumer)
+    expect(index.getFile(unrelatedUri)).toBe(beforeUnrelated)
+    expect(afterProvider.scriptIndex.provides).toEqual([])
+    expect(afterConsumer.scriptIndex.injects).toEqual([])
+    expect(index.findInjectUsages(providerUri, symbolKey)).toEqual([])
+    expect(index.hasVue3Source(keyUri)).toBe(false)
+  })
+
+  it('混合 workspace 刷新 Event Bus 时不会扫描 Vue3 root', async () => {
+    const vue2Root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-eventbus-'))
+    const vue3Root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-eventbus-'))
+    writeText(path.join(vue2Root, 'package.json'), JSON.stringify({ dependencies: { vue: '^2.7.16' } }))
+    writeText(path.join(vue2Root, 'src/main.js'), 'Vue.prototype.$bus = new Vue()\n')
+    writeText(path.join(vue2Root, 'src/App.vue'), '<template><div /></template><script>export default {}</script>')
+    writeText(path.join(vue3Root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(path.join(vue3Root, 'src/main.ts'), 'Vue.prototype.$badBus = new Vue()\n')
+    writeText(path.join(vue3Root, 'src/App.vue'), '<template><div /></template><script setup lang="ts"></script>')
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(vue3Root, undefined, undefined, 3)
+    await index.indexWorkspace(vue2Root, undefined, undefined, 2)
+
+    expect(index.getEventBusNames()).toEqual(['$bus'])
+    await index.refreshEventBusRegistrations()
+    expect(index.getEventBusNames()).toEqual(['$bus'])
+  })
+})
+
 describe('Vue2 relation resolver', () => {
   it('解析 ref 到子组件方法关系', async () => {
     const index = await buildIndex()

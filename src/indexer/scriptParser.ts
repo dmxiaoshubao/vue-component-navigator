@@ -394,7 +394,7 @@ function eachObjectMember(content: string, objectStart: number, objectEnd: numbe
   }
 }
 
-function parseImports(content: string): ImportInfo[] {
+export function parseImports(content: string): ImportInfo[] {
   const imports: ImportInfo[] = []
   let index = 0
 
@@ -461,8 +461,9 @@ function findImportFromIndex(content: string, start: number): number {
 
 function parseImportClause(clause: string, source: string): ImportInfo[] {
   const imports: ImportInfo[] = []
-  const namedStart = clause.indexOf('{')
-  const defaultClause = namedStart === -1 ? clause : clause.slice(0, namedStart).replace(/,$/, '').trim()
+  const normalizedClause = clause.replace(/^type\s+/, '').trim()
+  const namedStart = normalizedClause.indexOf('{')
+  const defaultClause = namedStart === -1 ? normalizedClause : normalizedClause.slice(0, namedStart).replace(/,$/, '').trim()
   const defaultName = readIdentifier(defaultClause, 0)
   if (defaultName) {
     imports.push({ localName: defaultName.value, source })
@@ -472,12 +473,12 @@ function parseImportClause(clause: string, source: string): ImportInfo[] {
     return imports
   }
 
-  const namedEnd = clause.indexOf('}', namedStart + 1)
+  const namedEnd = normalizedClause.indexOf('}', namedStart + 1)
   if (namedEnd === -1) {
     return imports
   }
 
-  for (const part of clause.slice(namedStart + 1, namedEnd).split(',')) {
+  for (const part of normalizedClause.slice(namedStart + 1, namedEnd).split(',')) {
     const match = /^\s*([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*$/.exec(part)
     if (!match) {
       continue
@@ -1231,6 +1232,7 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
       eventBusCalls: exportName === 'default' ? parseEventBusCalls(content, scriptStart, eventBusNames) : [],
       provides: [],
       injects: [],
+      vue3PropUsages: [],
     }
   }
 
@@ -1254,5 +1256,6 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
     eventBusCalls: parseEventBusCalls(content, scriptStart, eventBusNames, exportObject.open, exportObject.close),
     provides: parseProvides(content, provideProperty, scriptStart),
     injects: parseInjects(content, injectProperty, scriptStart),
+    vue3PropUsages: [],
   }
 }

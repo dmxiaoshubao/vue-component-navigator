@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as vscode from 'vscode'
-import type { SourceLocation, TextSpan, UsageInfo, VueFileIndex } from './indexer/types'
+import type { SourceLocation, TextSpan, UsageInfo, VueFileIndex, VueMajorVersion } from './indexer/types'
 import { clearTsConfigCache } from './indexer/relationResolver'
 import { WorkspaceIndex } from './indexer/workspaceIndex'
 import { VueCompletionProvider } from './providers/completionProvider'
@@ -19,7 +19,7 @@ type UsageCommandArgs =
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
-  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'method' | 'event' | 'provide' | 'inject' }
+  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' }
 
 type PackageDependencies = Record<string, string | undefined> | undefined
 type EntryConfig = string | readonly string[] | undefined
@@ -68,7 +68,7 @@ export function activate(context: vscode.ExtensionContext): void {
   ]
   const pendingSyncTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const featureDisposables: vscode.Disposable[] = []
-  let vue2Workspace: boolean | undefined
+  let supportedVueWorkspace: boolean | undefined
   let featuresRegistered = false
   let indexStatus: 'idle' | 'indexing' | 'ready' | 'failed' | 'cancelled' = 'idle'
 
@@ -146,7 +146,11 @@ export function activate(context: vscode.ExtensionContext): void {
           if (token.isCancellationRequested) {
             return false
           }
-          await nextIndex.indexWorkspace(folder.uri.fsPath, token, getWorkspaceEntryConfig(folder))
+          const vueVersion = await workspaceVueVersion(folder.uri.fsPath)
+          if (!vueVersion) {
+            continue
+          }
+          await nextIndex.indexWorkspace(folder.uri.fsPath, token, getWorkspaceEntryConfig(folder), vueVersion)
         }
         if (token.isCancellationRequested) {
           return false
@@ -168,7 +172,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   async function refreshForAliasConfigChange(configPath: string): Promise<void> {
     clearTsConfigCache(path.dirname(configPath))
-    if (await ensureVue2Workspace(false)) {
+    if (await ensureSupportedVueWorkspace(false)) {
       await indexWorkspaceFolders('Indexing Vue files...', false)
     }
   }
@@ -182,7 +186,7 @@ export function activate(context: vscode.ExtensionContext): void {
     for (const configPath of configPaths) {
       clearTsConfigCache(path.dirname(configPath))
     }
-    if (await ensureVue2Workspace(false)) {
+    if (await ensureSupportedVueWorkspace(false)) {
       await indexWorkspaceFolders('Indexing Vue files...', false)
     }
   }
@@ -258,7 +262,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       }),
       vscode.workspace.onDidChangeWorkspaceFolders(async () => {
-        if (await ensureVue2Workspace(false)) {
+        if (await ensureSupportedVueWorkspace(false)) {
           await indexWorkspaceFolders('Indexing Vue files...', false)
         }
       }),
@@ -266,7 +270,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!event.affectsConfiguration('vueComponentNavigator.entry')) {
           return
         }
-        if (await ensureVue2Workspace(false)) {
+        if (await ensureSupportedVueWorkspace(false)) {
           await indexWorkspaceFolders('Indexing Vue files...', false)
         }
       }),
@@ -285,13 +289,13 @@ export function activate(context: vscode.ExtensionContext): void {
     index.replaceWith(new WorkspaceIndex())
   }
 
-  async function ensureVue2Workspace(showMessage: boolean): Promise<boolean> {
-    vue2Workspace = await hasVue2Workspace()
-    if (!vue2Workspace) {
+  async function ensureSupportedVueWorkspace(showMessage: boolean): Promise<boolean> {
+    supportedVueWorkspace = await hasSupportedVueWorkspace()
+    if (!supportedVueWorkspace) {
       disableWorkspaceFeatures()
       indexStatus = 'idle'
       if (showMessage) {
-        void vscode.window.showInformationMessage('Vue Component Navigator is disabled because no Vue 2 dependency was found in workspace package.json.')
+        void vscode.window.showInformationMessage('Vue Component Navigator is disabled because no supported Vue 2 or Vue 3 dependency was found in workspace package.json.')
       }
       return false
     }
@@ -304,8 +308,14 @@ export function activate(context: vscode.ExtensionContext): void {
     if (args.kind === 'source-usages') {
       if (args.relation === 'prop') {
         return {
-          usages: index.findTemplatePropUsagesFromSource(args.sourceUri, args.offset),
+          usages: index.findPropUsagesFromSource(args.sourceUri, args.offset),
           placeHolder: 'Select prop usage',
+        }
+      }
+      if (args.relation === 'prop-type') {
+        return {
+          usages: index.findVue3PropTypeUsagesFromSource(args.sourceUri, args.offset),
+          placeHolder: 'Select defineProps usage',
         }
       }
       if (args.relation === 'method') {
@@ -391,13 +401,13 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.window.showInformationMessage([
         `Vue Component Navigator indexed ${index.getFileCount()} Vue files.`,
         `Index status: ${indexStatus}.`,
-        `Vue 2 package detected: ${vue2Workspace === undefined ? 'unknown' : vue2Workspace ? 'yes' : 'no'}.`,
+        `Supported Vue package detected: ${supportedVueWorkspace === undefined ? 'unknown' : supportedVueWorkspace ? 'yes' : 'no'}.`,
         activeDocument ? `Current language: ${activeDocument.languageId}.` : 'No active editor.',
         activeDocument ? `Current file indexed: ${indexedCurrentFile ? 'yes' : 'no'}.` : '',
       ].filter(Boolean).join(' '))
     }),
     vscode.commands.registerCommand('vueComponentNavigator.reindexWorkspace', async () => {
-      if (!await ensureVue2Workspace(true)) {
+      if (!await ensureSupportedVueWorkspace(true)) {
         return
       }
       await indexWorkspaceFolders('Reindexing Vue files...', true)
@@ -435,7 +445,7 @@ export function activate(context: vscode.ExtensionContext): void {
     },
   )
 
-  void ensureVue2Workspace(false).then((enabled) => {
+  void ensureSupportedVueWorkspace(false).then((enabled) => {
     if (enabled) {
       void indexWorkspaceFolders('Indexing Vue files...', false)
     }
@@ -453,30 +463,44 @@ function isAliasConfigFile(filePath: string): boolean {
   return fileName === 'jsconfig.json' || fileName === 'tsconfig.json'
 }
 
-async function hasVue2Workspace(): Promise<boolean> {
+async function hasSupportedVueWorkspace(): Promise<boolean> {
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    if (await hasVue2PackageJson(folder.uri.fsPath)) {
+    if (await workspaceVueVersion(folder.uri.fsPath)) {
       return true
     }
   }
   return false
 }
 
-async function hasVue2PackageJson(root: string): Promise<boolean> {
+async function workspaceVueVersion(root: string): Promise<VueMajorVersion | undefined> {
   try {
     const pkg = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8')) as PackageJson
-    return packageHasVue2(pkg)
+    return packageVueVersion(pkg)
   } catch {
-    return false
+    return undefined
   }
 }
 
 export function packageHasVue2(pkg: PackageJson): boolean {
+  return packageVueVersion(pkg) === 2
+}
+
+export function packageHasSupportedVue(pkg: PackageJson): boolean {
+  return packageVueVersion(pkg) !== undefined
+}
+
+export function packageVueVersion(pkg: PackageJson): VueMajorVersion | undefined {
   const version = pkg.dependencies?.vue
     ?? pkg.devDependencies?.vue
     ?? pkg.peerDependencies?.vue
     ?? pkg.optionalDependencies?.vue
-  return typeof version === 'string' && isVue2Version(version)
+  if (typeof version !== 'string') {
+    return undefined
+  }
+  if (isVue2Version(version)) {
+    return 2
+  }
+  return isVue3Version(version) ? 3 : undefined
 }
 
 export function isVue2Version(version: string): boolean {
@@ -488,4 +512,15 @@ export function isVue2Version(version: string): boolean {
     return true
   }
   return /(?:^|\s)(?:>=|>|=)?\s*2(?:$|[.\s*x-])/.test(normalized) && /(?:^|\s)<\s*3(?:$|[.\s*x-])/.test(normalized)
+}
+
+export function isVue3Version(version: string): boolean {
+  const normalized = version.trim().toLowerCase()
+  if (/^(?:npm:vue@)?[\^~]?\s*3(?:$|[.\s*x-])/.test(normalized)) {
+    return true
+  }
+  if (/\b3\.(?:x|\*)\b/.test(normalized)) {
+    return true
+  }
+  return /(?:^|\s)(?:>=|>|=)?\s*3(?:$|[.\s*x-])/.test(normalized) && !/(?:^|\s)<\s*3(?:$|[.\s*x-])/.test(normalized)
 }
