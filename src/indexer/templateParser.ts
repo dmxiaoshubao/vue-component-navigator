@@ -129,6 +129,14 @@ function extractAttrs(openTag: string, openStart: number, vue3ModelEvents: boole
   return attrs
 }
 
+function forwardsAttrs(openTag: string): boolean {
+  return /\sv-bind\s*=\s*["']\$attrs["']/.test(openTag)
+}
+
+function forwardsListeners(openTag: string): boolean {
+  return forwardsAttrs(openTag) || /\sv-on\s*=\s*["']\$listeners["']/.test(openTag)
+}
+
 function extractAttrValue(openTag: string, rawName: string): string | undefined {
   const escaped = rawName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const pattern = new RegExp(`\\s${escaped}\\s*=\\s*("[^"]*"|'[^']*'|[^\\s>]+)`)
@@ -265,6 +273,8 @@ export function parseTemplate(content: string, templateStart: number, registered
         end: templateStart + match.index + 1 + rawTag.length,
       },
       attrs,
+      forwardsAttrs: forwardsAttrs(openTag),
+      forwardsListeners: forwardsListeners(openTag),
     })
   }
 

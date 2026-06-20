@@ -276,7 +276,7 @@ export function findMethod(child: VueFileIndex, methodName: string) {
 }
 
 export function findEmit(child: VueFileIndex, eventName: string) {
-  return child.scriptIndex.emits.filter((emit) => emit.eventName === eventName)
+  return child.scriptIndex.emits.filter((emit) => matchesName(emit.eventName, eventName))
 }
 
 export function findRefComponent(parent: VueFileIndex, refName: string): string | undefined {

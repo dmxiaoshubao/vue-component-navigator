@@ -743,11 +743,11 @@ function readArrayStaticCandidateValues(content: string, arrayStart: number, arr
   return [...new Set(values)]
 }
 
-function collectStaticComponentNameBindings(content: string): StaticComponentNameBinding[] {
+function collectStaticVariableComponentNameBindings(content: string, start = 0, end = content.length): StaticComponentNameBinding[] {
   const bindings: StaticComponentNameBinding[] = []
   let depth = 0
 
-  for (let index = 0; index < content.length; index += 1) {
+  for (let index = start; index < end; index += 1) {
     const skipped = skipStringCommentOrRegex(content, index)
     if (skipped !== undefined) {
       index = skipped - 1
@@ -772,7 +772,7 @@ function collectStaticComponentNameBindings(content: string): StaticComponentNam
       cursor = skipTrivia(content, index + 'const'.length)
     }
 
-    while (cursor < content.length) {
+    while (cursor < end) {
       const name = readIdentifier(content, cursor)
       if (!name) {
         break
@@ -785,7 +785,7 @@ function collectStaticComponentNameBindings(content: string): StaticComponentNam
       }
 
       const valueStart = skipTrivia(content, equals + 1)
-      const valueEnd = findExpressionEnd(content, valueStart, content.length)
+      const valueEnd = findExpressionEnd(content, valueStart, end)
       const expression = content.slice(valueStart, valueEnd).trim()
       const literalOrIdentifier = readStaticCandidateValue(content, valueStart, valueEnd)
 
@@ -834,6 +834,110 @@ function collectStaticComponentNameBindings(content: string): StaticComponentNam
   }
 
   return bindings
+}
+
+function functionBodyRange(content: string, valueStart: number, valueEnd: number): { start: number, end: number } | undefined {
+  let cursor = valueStart
+  const firstWord = readIdentifier(content, cursor)
+  if (firstWord?.value === 'async') {
+    cursor = skipTrivia(content, firstWord.end)
+  }
+
+  const functionWord = readIdentifier(content, cursor)
+  if (functionWord?.value === 'function') {
+    cursor = skipTrivia(content, functionWord.end)
+    const functionName = readIdentifier(content, cursor)
+    if (functionName) {
+      cursor = skipTrivia(content, functionName.end)
+    }
+  }
+
+  if (content[cursor] !== '(') {
+    return undefined
+  }
+  const paramsEnd = findMatchingBracket(content, cursor)
+  cursor = skipTrivia(content, paramsEnd + 1)
+  if (content.slice(cursor, cursor + 2) === '=>') {
+    cursor = skipTrivia(content, cursor + 2)
+  }
+  if (content[cursor] !== '{' || cursor >= valueEnd) {
+    return undefined
+  }
+  return { start: cursor + 1, end: findMatchingBracket(content, cursor) }
+}
+
+function collectReturnedStaticComponentNameBindings(content: string, bodyStart: number, bodyEnd: number): StaticComponentNameBinding[] {
+  const bindings: StaticComponentNameBinding[] = []
+  let depth = 0
+
+  for (let index = bodyStart; index < bodyEnd; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = content[index]
+    if (char === '{' || char === '[' || char === '(') {
+      depth += 1
+      continue
+    }
+    if (char === '}' || char === ']' || char === ')') {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth !== 0 || !isCodeTokenAt(content, 'return', index)) {
+      continue
+    }
+
+    const objectStart = skipTrivia(content, index + 'return'.length)
+    if (content[objectStart] !== '{') {
+      continue
+    }
+    const objectEnd = findMatchingBracket(content, objectStart)
+    eachObjectMember(content, objectStart, objectEnd, (member) => {
+      if (content[skipTrivia(content, member.nameSpan.end)] !== ':') {
+        return
+      }
+      const expression = content.slice(member.valueStart, member.valueEnd).trim()
+      const literalOrIdentifier = readStaticCandidateValue(content, member.valueStart, member.valueEnd)
+      bindings.push({
+        variableName: member.name,
+        tags: literalOrIdentifier ? [literalOrIdentifier] : [],
+        kind: literalOrIdentifier ? 'literal' : 'expression',
+        expression,
+      })
+    })
+    index = objectEnd
+  }
+
+  return bindings
+}
+
+function collectDataStaticComponentNameBindings(content: string): StaticComponentNameBinding[] {
+  const object = findDefaultExportObject(content)
+  if (!object) {
+    return []
+  }
+  const data = findTopLevelProperty(content, object.open, object.close, 'data')
+  if (!data) {
+    return []
+  }
+  const body = functionBodyRange(content, data.valueStart, data.valueEnd)
+  if (!body) {
+    return []
+  }
+  return [
+    ...collectStaticVariableComponentNameBindings(content, body.start, body.end),
+    ...collectReturnedStaticComponentNameBindings(content, body.start, body.end),
+  ]
+}
+
+function collectStaticComponentNameBindings(content: string): StaticComponentNameBinding[] {
+  return [
+    ...collectDataStaticComponentNameBindings(content),
+    ...collectStaticVariableComponentNameBindings(content),
+  ]
 }
 
 function resolveStaticComponentAlias(name: string, aliases: Map<string, StaticComponentAlias>, importSources: Map<string, string>): StaticComponentAlias | undefined {

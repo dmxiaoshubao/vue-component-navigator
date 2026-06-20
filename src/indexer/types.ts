@@ -186,6 +186,8 @@ export interface TemplateComponentUsage {
   dynamicTags?: string[]
   span: TextSpan
   attrs: TemplateAttrUsage[]
+  forwardsAttrs?: boolean
+  forwardsListeners?: boolean
 }
 
 export interface TemplateIndex {

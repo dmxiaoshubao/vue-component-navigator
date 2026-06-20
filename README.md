@@ -41,6 +41,7 @@ Shows jumping from static `inject` keys to the nearest static provider, and from
 - `$refs` method navigation, completion, hover, and references.
 - Component prop navigation from template usage to child prop definitions.
 - Component event navigation between template listeners and `this.$emit(...)`.
+- Vue 2 fallthrough prop and listener navigation through `v-bind="$attrs"` / `v-on="$listeners"` wrappers, including statically resolved dynamic component candidates.
 - Vue 2 Event Bus navigation for static string event names.
 - Static `provide` / `inject` key navigation and completion.
 - Static local component imports, async component imports, and simple aliases.
@@ -50,6 +51,7 @@ Shows jumping from static `inject` keys to the nearest static provider, and from
 - Vue 3 `<script setup>` local component imports.
 - Vue 3 `defineProps<Props>()` / `defineProps<{ ... }>()` type members and static internal prop usages.
 - Vue 3 `defineEmits` declarations and calls such as `emit('confirm')` linked to parent template listeners.
+- Vue 3 `v-bind="$attrs"` listener fallthrough linked to child `defineEmits` declarations.
 - Vue 3 `v-model` / `v-model:show` relationships to `update:modelValue` / `update:show` events.
 - Vue 3 static `provide('key', value)` / `inject('key')` and `InjectionKey` / `Symbol` key relationships.
 - `@/` style aliases from the nearest `jsconfig.json` or `tsconfig.json`.

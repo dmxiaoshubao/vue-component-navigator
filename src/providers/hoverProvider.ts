@@ -227,8 +227,8 @@ function usageSummary(
   }
 }
 
-function eventHover(child: VueFileIndex, eventName: string, labels: Map<string, string>): vscode.Hover | undefined {
-  return eventDefinitionsHover(findEmit(child, eventName).map((emit) => ({ child, emit })), labels)
+function eventHover(index: WorkspaceIndex, child: VueFileIndex, eventName: string, labels: Map<string, string>): vscode.Hover | undefined {
+  return eventDefinitionsHover(index.findEventDefinitions(child.uri, eventName).map(({ file, emit }) => ({ child: file, emit })), labels)
 }
 
 function propDefinitionsHover(definitions: Array<{ child: VueFileIndex, prop: PropInfo }>, labels: Map<string, string>): vscode.Hover | undefined {
@@ -413,11 +413,8 @@ export class VueHoverProvider implements vscode.HoverProvider {
         }
         if (attr.kind === 'prop') {
           const definitions = children.flatMap((child) => {
-            if (child.vueVersion === 3) {
-              return []
-            }
-            const prop = findProp(child, attr.normalizedName)
-            return prop ? [{ child, prop }] : []
+            return this.index.findPropDefinitions(child.uri, attr.normalizedName)
+              .map(({ file, prop }) => ({ child: file, prop }))
           })
           if (definitions.length === 0) {
             return undefined
@@ -425,7 +422,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
           return propDefinitionsHover(definitions, definitionLabels())
         }
         if (attr.kind === 'event') {
-          const definitions = children.flatMap((child) => findEmit(child, attr.normalizedName).map((emit) => ({ child, emit })))
+          const definitions = children.flatMap((child) => this.index.findEventDefinitions(child.uri, attr.normalizedName).map(({ file, emit }) => ({ child: file, emit })))
           if (definitions.length === 0) {
             return undefined
           }

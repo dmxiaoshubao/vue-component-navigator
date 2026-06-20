@@ -1,7 +1,7 @@
 import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { ComponentRegistration, EventBusCall, EventBusRegistration, EventBusUsageInfo, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, ParsedSfc, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex, Vue3PropTypeInfo, Vue3PropUsage, VueMajorVersion } from './types'
+import type { ComponentRegistration, EmitInfo, EventBusCall, EventBusRegistration, EventBusUsageInfo, GlobalComponentContext, GlobalComponentRegistration, InjectInfo, MethodInfo, MixinReference, ParsedSfc, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SourceLocation, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex, Vue3PropTypeInfo, Vue3PropUsage, VueMajorVersion } from './types'
 import { parseEventBusRegistrations, parseStaticImportSources } from './eventBusParser'
 import { resolveExternalRefComponent } from './externalComponentResolver'
 import { guessGlobalComponentsFromRequireContext, parseGlobalComponents } from './globalComponentParser'
@@ -294,7 +294,17 @@ export class WorkspaceIndex {
     const relationshipChildren = this.addRelationshipUsages(file)
     this.addEventBusUsages(file)
     this.addInjectUsages(file)
-    if (file.scriptIndex.provides.length > 0 || (previous?.scriptIndex.provides.length ?? 0) > 0 || !sameStringSet(previousRelationshipChildren, relationshipChildren)) {
+    if (
+      file.scriptIndex.provides.length > 0
+      || (previous?.scriptIndex.provides.length ?? 0) > 0
+      || !sameStringSet(previousRelationshipChildren, relationshipChildren)
+      || hasForwardedListeners(file)
+      || (previous ? hasForwardedListeners(previous) : false)
+      || ((hasTemplateEventAttrs(file) || (previous ? hasTemplateEventAttrs(previous) : false)) && this.hasAnyForwardedListeners())
+      || hasForwardedAttrs(file)
+      || (previous ? hasForwardedAttrs(previous) : false)
+      || ((hasTemplatePropAttrs(file) || (previous ? hasTemplatePropAttrs(previous) : false)) && this.hasAnyForwardedAttrs())
+    ) {
       this.rebuildReverseIndexes()
     }
     if (wasMixinSource) {
@@ -464,7 +474,19 @@ export class WorkspaceIndex {
   }
 
   findTemplateEventUsages(childUri: string, eventName: string): UsageInfo[] {
-    return [...(this.eventUsages.get(usageKey(childUri, eventName)) ?? [])]
+    const results: UsageInfo[] = []
+    for (const key of this.eventKeys(childUri, eventName)) {
+      results.push(...(this.eventUsages.get(key) ?? []))
+    }
+    return dedupeUsages(results)
+  }
+
+  findEventDefinitions(childUri: string, eventName: string): Array<{ file: VueFileIndex, emit: EmitInfo }> {
+    return dedupeEventDefinitions(this.findEventDefinitionsRecursive(childUri, eventName, new Set<string>()))
+  }
+
+  findPropDefinitions(childUri: string, propName: string): Array<{ file: VueFileIndex, prop: PropInfo }> {
+    return dedupePropDefinitions(this.findPropDefinitionsRecursive(childUri, propName, new Set<string>()))
   }
 
   findEventBusEmits(busName: string, eventName: string): EventBusUsageInfo[] {
@@ -985,12 +1007,26 @@ export class WorkspaceIndex {
 
   private addUsage<T extends UsageInfo>(map: Map<string, T[]>, key: string, usage: T): void {
     addUsage(map, key, usage)
+    this.trackUsage(map, key, usage.file)
+  }
+
+  private addUsageIfMissing<T extends UsageInfo>(map: Map<string, T[]>, key: string, usage: T): boolean {
+    const usages = map.get(key) ?? []
+    if (usages.some((item) => item.file === usage.file && item.span.start === usage.span.start && item.span.end === usage.span.end)) {
+      return false
+    }
+    addUsage(map, key, usage)
+    this.trackUsage(map, key, usage.file)
+    return true
+  }
+
+  private trackUsage<T extends UsageInfo>(map: Map<string, T[]>, key: string, file: VueFileIndex): void {
     const trackedMap = map as unknown as TrackedUsageMap
-    const usageMaps = this.usageKeysByFile.get(usage.file) ?? new Map<TrackedUsageMap, Set<string>>()
+    const usageMaps = this.usageKeysByFile.get(file) ?? new Map<TrackedUsageMap, Set<string>>()
     const keys = usageMaps.get(trackedMap) ?? new Set<string>()
     keys.add(key)
     usageMaps.set(trackedMap, keys)
-    this.usageKeysByFile.set(usage.file, usageMaps)
+    this.usageKeysByFile.set(file, usageMaps)
   }
 
   private addSourceRelation<T extends { file: VueFileIndex }>(map: SourceRelationMap<T>, sourceLocation: SourceLocation | undefined, item: T): void {
@@ -1189,6 +1225,168 @@ export class WorkspaceIndex {
     return relationshipChildren
   }
 
+  private addForwardedAttrEventUsages(): void {
+    let changed = true
+    while (changed) {
+      changed = false
+      const incomingEvents = this.collectIncomingTemplateEventUsages()
+      for (const file of this.files.values()) {
+        const fileIncomingEvents = incomingEvents.get(file.uri)
+        if (!fileIncomingEvents?.length) {
+          continue
+        }
+        for (const component of file.templateIndex.components) {
+          if (!component.forwardsListeners) {
+            continue
+          }
+          const childUris = this.resolveTemplateComponentUris(file, component)
+          for (const { eventName, usage } of fileIncomingEvents) {
+            if (file.vueVersion === 3 && hasDeclaredEmit(file, eventName)) {
+              continue
+            }
+            for (const childUri of childUris) {
+              changed = this.addUsageIfMissing(this.eventUsages, usageKey(childUri, eventName), usage) || changed
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private addForwardedAttrPropUsages(): void {
+    let changed = true
+    while (changed) {
+      changed = false
+      const incomingProps = this.collectIncomingTemplatePropUsages()
+      for (const file of this.files.values()) {
+        if (file.vueVersion !== 2) {
+          continue
+        }
+        const fileIncomingProps = incomingProps.get(file.uri)
+        if (!fileIncomingProps?.length) {
+          continue
+        }
+        for (const component of file.templateIndex.components) {
+          if (!component.forwardsAttrs) {
+            continue
+          }
+          const childUris = this.resolveTemplateComponentUris(file, component)
+          for (const { propName, usage } of fileIncomingProps) {
+            if (hasDeclaredProp(file, propName)) {
+              continue
+            }
+            for (const childUri of childUris) {
+              const child = this.getFile(childUri)
+              if (child?.vueVersion === 3) {
+                continue
+              }
+              changed = this.addUsageIfMissing(this.propUsages, usageKey(childUri, propName), usage) || changed
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private findEventDefinitionsRecursive(childUri: string, eventName: string, seen: Set<string>): Array<{ file: VueFileIndex, emit: EmitInfo }> {
+    if (seen.has(childUri)) {
+      return []
+    }
+    seen.add(childUri)
+    const file = this.getFile(childUri)
+    if (!file) {
+      return []
+    }
+
+    const definitions = file.scriptIndex.emits
+      .filter((emit) => matchesName(emit.eventName, eventName))
+      .map((emit) => ({ file, emit }))
+
+    if (file.vueVersion === 3 && definitions.length > 0) {
+      return definitions
+    }
+
+    for (const component of file.templateIndex.components) {
+      if (!component.forwardsListeners) {
+        continue
+      }
+      for (const forwardedChildUri of this.resolveTemplateComponentUris(file, component)) {
+        definitions.push(...this.findEventDefinitionsRecursive(forwardedChildUri, eventName, seen))
+      }
+    }
+
+    return definitions
+  }
+
+  private findPropDefinitionsRecursive(childUri: string, propName: string, seen: Set<string>): Array<{ file: VueFileIndex, prop: PropInfo }> {
+    if (seen.has(childUri)) {
+      return []
+    }
+    seen.add(childUri)
+    const file = this.getFile(childUri)
+    if (!file || file.vueVersion === 3) {
+      return []
+    }
+
+    const definitions = file.scriptIndex.props
+      .filter((prop) => matchesName(prop.name, propName))
+      .map((prop) => ({ file, prop }))
+
+    if (file.vueVersion !== 2 || definitions.length > 0) {
+      return definitions
+    }
+    for (const component of file.templateIndex.components) {
+      if (!component.forwardsAttrs) {
+        continue
+      }
+      for (const forwardedChildUri of this.resolveTemplateComponentUris(file, component)) {
+        definitions.push(...this.findPropDefinitionsRecursive(forwardedChildUri, propName, seen))
+      }
+    }
+
+    return definitions
+  }
+
+  private hasAnyForwardedListeners(): boolean {
+    return [...this.files.values()].some((file) => hasForwardedListeners(file))
+  }
+
+  private hasAnyForwardedAttrs(): boolean {
+    return [...this.files.values()].some((file) => file.vueVersion === 2 && hasForwardedAttrs(file))
+  }
+
+  private collectIncomingTemplateEventUsages(): Map<string, Array<{ eventName: string, usage: UsageInfo }>> {
+    const results = new Map<string, Array<{ eventName: string, usage: UsageInfo }>>()
+    for (const [key, usages] of this.eventUsages) {
+      const separator = key.lastIndexOf('\0')
+      if (separator === -1) {
+        continue
+      }
+      const childUri = key.slice(0, separator)
+      const eventName = key.slice(separator + 1)
+      const current = results.get(childUri) ?? []
+      current.push(...usages.map((usage) => ({ eventName, usage })))
+      results.set(childUri, current)
+    }
+    return results
+  }
+
+  private collectIncomingTemplatePropUsages(): Map<string, Array<{ propName: string, usage: UsageInfo }>> {
+    const results = new Map<string, Array<{ propName: string, usage: UsageInfo }>>()
+    for (const [key, usages] of this.propUsages) {
+      const separator = key.lastIndexOf('\0')
+      if (separator === -1) {
+        continue
+      }
+      const childUri = key.slice(0, separator)
+      const propName = key.slice(separator + 1)
+      const current = results.get(childUri) ?? []
+      current.push(...usages.map((usage) => ({ propName, usage })))
+      results.set(childUri, current)
+    }
+    return results
+  }
+
   private addEventBusUsages(file: VueFileIndex): void {
     for (const call of file.scriptIndex.eventBusCalls) {
       const usage = { file, span: call.eventSpan, sourceLocation: call.sourceLocation, method: call.method }
@@ -1335,6 +1533,8 @@ export class WorkspaceIndex {
       this.addRelationshipUsages(file)
       this.addEventBusUsages(file)
     }
+    this.addForwardedAttrPropUsages()
+    this.addForwardedAttrEventUsages()
     for (const file of this.files.values()) {
       this.addInjectUsages(file)
     }
@@ -1508,6 +1708,25 @@ export class WorkspaceIndex {
 
     return [...keys]
   }
+
+  private eventKeys(childUri: string, eventName: string): string[] {
+    const keys = new Set<string>()
+    keys.add(usageKey(childUri, eventName))
+    keys.add(usageKey(childUri, toKebabCase(eventName)))
+
+    for (const key of this.eventUsages.keys()) {
+      const separator = key.lastIndexOf('\0')
+      if (separator === -1 || key.slice(0, separator) !== childUri) {
+        continue
+      }
+      const indexedName = key.slice(separator + 1)
+      if (matchesName(indexedName, eventName)) {
+        keys.add(key)
+      }
+    }
+
+    return [...keys]
+  }
 }
 
 function mergeNamed<T>(own: T[], mixed: T[], keyOf: (item: T) => string): T[] {
@@ -1567,6 +1786,38 @@ function dedupeUsages<T extends UsageInfo>(usages: T[]): T[] {
     }
     seen.add(key)
     results.push(usage)
+  }
+  return results
+}
+
+function dedupeEventDefinitions(definitions: Array<{ file: VueFileIndex, emit: EmitInfo }>): Array<{ file: VueFileIndex, emit: EmitInfo }> {
+  const seen = new Set<string>()
+  const results: Array<{ file: VueFileIndex, emit: EmitInfo }> = []
+  for (const definition of definitions) {
+    const uri = definition.emit.sourceLocation?.uri ?? definition.file.uri
+    const span = definition.emit.sourceLocation?.span ?? definition.emit.eventSpan
+    const key = `${uri}\0${span.start}\0${span.end}`
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    results.push(definition)
+  }
+  return results
+}
+
+function dedupePropDefinitions(definitions: Array<{ file: VueFileIndex, prop: PropInfo }>): Array<{ file: VueFileIndex, prop: PropInfo }> {
+  const seen = new Set<string>()
+  const results: Array<{ file: VueFileIndex, prop: PropInfo }> = []
+  for (const definition of definitions) {
+    const uri = definition.prop.sourceLocation?.uri ?? definition.file.uri
+    const span = definition.prop.sourceLocation?.span ?? definition.prop.span
+    const key = `${uri}\0${span.start}\0${span.end}`
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    results.push(definition)
   }
   return results
 }
@@ -1805,6 +2056,30 @@ function removeSourceRelationItem<T extends { file: VueFileIndex }>(map: SourceR
   } else if (kept.length !== items.length) {
     map.set(key, kept)
   }
+}
+
+function hasForwardedListeners(file: VueFileIndex): boolean {
+  return file.templateIndex.components.some((component) => component.forwardsListeners)
+}
+
+function hasForwardedAttrs(file: VueFileIndex): boolean {
+  return file.templateIndex.components.some((component) => component.forwardsAttrs)
+}
+
+function hasTemplateEventAttrs(file: VueFileIndex): boolean {
+  return file.templateIndex.components.some((component) => component.attrs.some((attr) => attr.kind === 'event'))
+}
+
+function hasTemplatePropAttrs(file: VueFileIndex): boolean {
+  return file.templateIndex.components.some((component) => component.attrs.some((attr) => attr.kind === 'prop'))
+}
+
+function hasDeclaredProp(file: VueFileIndex, propName: string): boolean {
+  return file.scriptIndex.props.some((prop) => matchesName(prop.name, propName))
+}
+
+function hasDeclaredEmit(file: VueFileIndex, eventName: string): boolean {
+  return file.scriptIndex.emits.some((emit) => matchesName(emit.eventName, eventName))
 }
 
 function removeEventBusEventNames(

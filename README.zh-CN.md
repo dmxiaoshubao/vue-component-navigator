@@ -42,6 +42,7 @@
 - `$refs` 方法跳转、补全、hover 和引用查询。
 - 模板 prop 跳到子组件 prop 定义。
 - 模板事件和子组件 `this.$emit(...)` 互相跳转。
+- Vue 2 通过 `v-bind="$attrs"` / `v-on="$listeners"` wrapper 透传的 prop 和 listener 导航，包括可静态解析的动态组件候选。
 - Vue 2 Event Bus 静态字符串事件名导航。
 - 静态 `provide` / `inject` key 跳转和补全。
 - 静态局部组件 import、异步组件 import、简单别名。
@@ -51,6 +52,7 @@
 - Vue 3 `<script setup>` 中的局部组件 import。
 - Vue 3 `defineProps<Props>()` / `defineProps<{ ... }>()` 的类型成员与组件内部静态 prop 使用。
 - Vue 3 `defineEmits` 声明和 `emit('confirm')` 这类调用与父组件模板监听的关系。
+- Vue 3 通过 `v-bind="$attrs"` 透传的 listener 与子组件 `defineEmits` 声明关系。
 - Vue 3 `v-model` / `v-model:show` 与 `update:modelValue` / `update:show` 事件的关系。
 - Vue 3 静态 `provide('key', value)` / `inject('key')` 和 `InjectionKey` / `Symbol` key 关系。
 - 从最近的 `jsconfig.json` 或 `tsconfig.json` 读取 `@/` 这类路径别名。

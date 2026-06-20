@@ -121,18 +121,15 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
         }
         if (attr.kind === 'prop') {
           const definitions = children.flatMap((child) => {
-            if (child.vueVersion === 3) {
-              return []
-            }
-            const prop = findProp(child, attr.normalizedName)
-            return prop ? [toLocation(child, prop.span, prop.sourceLocation)] : []
+            return this.index.findPropDefinitions(child.uri, attr.normalizedName)
+              .map(({ file, prop }) => toLocation(file, prop.span, prop.sourceLocation))
           })
           return locationResult(uniqueLocations(definitions))
         }
         if (attr.kind === 'event') {
           return uniqueLocations(children.flatMap((child) => {
-            const emits = findEmit(child, attr.normalizedName)
-            return emits.map((emit) => toLocation(child, emit.eventSpan, emit.sourceLocation))
+            return this.index.findEventDefinitions(child.uri, attr.normalizedName)
+              .map(({ file, emit }) => toLocation(file, emit.eventSpan, emit.sourceLocation))
           }))
         }
       }

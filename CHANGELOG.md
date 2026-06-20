@@ -7,22 +7,38 @@
 #### Added
 
 - Added Vue 3 workspace support for static component navigation, `defineProps` type usage, `defineEmits` event relationships, and Composition API `provide` / `inject` relationships.
+- Added Vue 2 fallthrough prop and listener navigation through `v-bind="$attrs"` / `v-on="$listeners"` wrappers, including statically resolved dynamic component candidates.
+- Added Vue 3 `v-bind="$attrs"` listener fallthrough navigation to child `defineEmits` declarations.
 
 #### Improved
 
 - Improved Vue workspace detection so Vue 2 and Vue 3 projects use separate indexing behavior.
 - Improved Vue 3 source-file indexing performance with source relation tracking, cached static key parsing, and direct-consumer rebuilds.
+- Improved Vue 2 dynamic component candidate detection for static `data()` maps used by `<component :is="...">`.
+- Improved component event matching across camelCase and kebab-case usage.
+
+#### Fixed
+
+- Fixed fallthrough propagation so Vue 2 wrapper props and Vue 3 declared emits are treated as consumed by the wrapper before forwarding `$attrs`.
 
 ### 中文
 
 #### 新增
 
 - 新增 Vue 3 workspace 支持，覆盖静态组件导航、`defineProps` 类型使用、`defineEmits` 事件关系，以及 Composition API `provide` / `inject` 关系。
+- 新增 Vue 2 通过 `v-bind="$attrs"` / `v-on="$listeners"` wrapper 透传的 prop 和 listener 导航，包括可静态解析的动态组件候选。
+- 新增 Vue 3 通过 `v-bind="$attrs"` 透传 listener 到子组件 `defineEmits` 声明的导航关系。
 
 #### 改进
 
 - 改进 Vue workspace 识别，让 Vue 2 和 Vue 3 项目分别使用对应索引行为。
 - 改进 Vue 3 source 文件索引性能，通过 source relation 跟踪、静态 key 缓存和直接依赖文件重建减少不必要扫描。
+- 改进 Vue 2 `<component :is="...">` 对 `data()` 中静态映射的动态组件候选识别。
+- 改进组件事件在 camelCase 和 kebab-case 写法之间的匹配。
+
+#### 修复
+
+- 修复透传关系中 wrapper 已消费的内容仍继续下传的问题：Vue 2 已声明 props 和 Vue 3 已声明 emits 现在会在 wrapper 层停止 `$attrs` 透传。
 
 ## 1.1.0 - 2026-06-13
 

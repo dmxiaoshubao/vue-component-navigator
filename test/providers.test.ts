@@ -1594,4 +1594,164 @@ const service = inject(injectedServiceKey)
     expect(keyReferences.map((location) => location.uri.fsPath)).toEqual([consumerUri])
     expect(hoverText(keyHover)).toContain('Provided by 1 definition')
   })
+
+  it('Vue2 v-on $listeners 透传事件的 provider 关系可用', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-provider-forwarded-listeners-'))
+    const wrapperUri = path.join(root, 'src/GoodsDetail.vue')
+    const physicalUri = path.join(root, 'src/PhysicalGoodsDetail.vue')
+    const virtualUri = path.join(root, 'src/VirtualGoodsDetail.vue')
+    const parentUri = path.join(root, 'src/GoodsAdd.vue')
+    const wrapperContent = `
+<template>
+  <component :is="compName" v-bind="$attrs" v-on="$listeners"></component>
+</template>
+<script>
+import PhysicalGoodsDetail from './PhysicalGoodsDetail.vue'
+import VirtualGoodsDetail from './VirtualGoodsDetail.vue'
+
+export default {
+  components: {
+    PhysicalGoodsDetail,
+    VirtualGoodsDetail,
+  },
+  data() {
+    const goodsClassify = {
+      20101: 'PhysicalGoodsDetail',
+      20102: 'VirtualGoodsDetail',
+    }
+    return {
+      compName: goodsClassify[this.classifyId],
+    }
+  },
+}
+</script>
+`
+    const physicalContent = `
+<script>
+export default {
+  props: {
+    operateType: String,
+  },
+  methods: {
+    save() {
+      this.$emit('saveSuccess')
+    },
+  },
+}
+</script>
+`
+    const virtualContent = physicalContent
+    const parentContent = `
+<template>
+  <goods-detail classify-id="20101" operate-type="add" @saveSuccess="handleSaveSuccess"></goods-detail>
+</template>
+<script>
+import GoodsDetail from './GoodsDetail.vue'
+
+export default {
+  components: { GoodsDetail },
+  methods: {
+    handleSaveSuccess() {},
+  },
+}
+</script>
+`
+
+    localIndex.indexContent(wrapperUri, wrapperContent)
+    localIndex.indexContent(physicalUri, physicalContent)
+    localIndex.indexContent(virtualUri, virtualContent)
+    localIndex.indexContent(parentUri, parentContent)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const parentDocument = new TestDocument(parentUri, parentContent) as any
+    const physicalDocument = new TestDocument(physicalUri, physicalContent) as any
+
+    const listenerPosition = positionAt(parentContent, parentContent.indexOf('@saveSuccess') + 2)
+    const propPosition = positionAt(parentContent, parentContent.indexOf('operate-type') + 2)
+    const eventPosition = positionAt(physicalContent, physicalContent.indexOf("'saveSuccess'") + 2)
+    const propDefinitionPosition = positionAt(physicalContent, physicalContent.indexOf('operateType') + 2)
+    const listenerDefinitions = asArray(definitionProvider.provideDefinition(parentDocument, listenerPosition) as any)
+    const propDefinitions = asArray(definitionProvider.provideDefinition(parentDocument, propPosition) as any)
+    const listenerHover = hoverProvider.provideHover(parentDocument, listenerPosition) as any
+    const propHover = hoverProvider.provideHover(parentDocument, propPosition) as any
+    const eventReferences = referenceProvider.provideReferences(physicalDocument, eventPosition) as any[]
+    const eventHover = hoverProvider.provideHover(physicalDocument, eventPosition) as any
+    const propReferences = referenceProvider.provideReferences(physicalDocument, propDefinitionPosition) as any[]
+    const propDefinitionHover = hoverProvider.provideHover(physicalDocument, propDefinitionPosition) as any
+
+    expect(listenerDefinitions.map((location) => location.uri.fsPath).sort()).toEqual([physicalUri, virtualUri].sort())
+    expect(propDefinitions.map((location) => location.uri.fsPath).sort()).toEqual([physicalUri, virtualUri].sort())
+    expect(hoverText(listenerHover)).toContain('Definitions')
+    expect(hoverText(propHover)).toContain('Definitions')
+    expect(eventReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(hoverText(eventHover)).toContain('Used by 1 listener')
+    expect(propReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(hoverText(propDefinitionHover)).toContain('Used by 1 template prop')
+  })
+
+  it('Vue3 v-bind $attrs 透传事件的 provider 关系可用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-provider-forwarded-attrs-'))
+    const childUri = path.join(root, 'src/PositiveScan.vue')
+    const middleUri = path.join(root, 'src/MemberLogin.vue')
+    const parentUri = path.join(root, 'src/Dialog.vue')
+    const childContent = `
+<template><button @click="start">start</button></template>
+<script setup lang="ts">
+const emits = defineEmits<{
+  fetchStart: []
+}>()
+
+function start() {
+  emits('fetchStart')
+}
+</script>
+`
+    const middleContent = `
+<template>
+  <PositiveScan v-bind="$attrs" />
+</template>
+<script setup lang="ts">
+import PositiveScan from './PositiveScan.vue'
+</script>
+`
+    const parentContent = `
+<template>
+  <MemberLogin @fetchStart="onFetchStart" />
+</template>
+<script setup lang="ts">
+import MemberLogin from './MemberLogin.vue'
+
+const onFetchStart = () => {}
+</script>
+`
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, childContent)
+    writeText(middleUri, middleContent)
+    writeText(parentUri, parentContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const parentDocument = new TestDocument(parentUri, parentContent) as any
+    const childDocument = new TestDocument(childUri, childContent) as any
+
+    const eventPosition = positionAt(childContent, childContent.lastIndexOf("'fetchStart'") + 2)
+    const definitions = asArray(definitionProvider.provideDefinition(childDocument, eventPosition) as any)
+    const references = referenceProvider.provideReferences(childDocument, eventPosition) as any[]
+    const hover = hoverProvider.provideHover(childDocument, eventPosition) as any
+    const listenerPosition = positionAt(parentContent, parentContent.indexOf('@fetchStart') + 2)
+    const listenerDefinitions = asArray(definitionProvider.provideDefinition(parentDocument, listenerPosition) as any)
+    const listenerHover = hoverProvider.provideHover(parentDocument, listenerPosition) as any
+
+    expect(definitions.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(references.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(hoverText(hover)).toContain('Used by 1 listener')
+    expect(hoverText(hover)).not.toContain('No template listeners found')
+    expect(listenerDefinitions.map((location) => location.uri.fsPath)).toEqual([childUri])
+    expect(hoverText(listenerHover)).toContain('Definition')
+  })
 })

@@ -569,6 +569,102 @@ export default {
     expect(index.findTemplateEventUsages(objectChild.uri, 'save')).toHaveLength(2)
   })
 
+  it('Vue2 v-on $listeners 透传到 data 动态组件候选的事件关系', () => {
+    const index = new WorkspaceIndex()
+    const wrapperUri = path.join(fixtureRoot, 'GoodsDetail.vue')
+    const physicalUri = path.join(fixtureRoot, 'PhysicalGoodsDetail.vue')
+    const virtualUri = path.join(fixtureRoot, 'VirtualGoodsDetail.vue')
+    const parentUri = path.join(fixtureRoot, 'GoodsAdd.vue')
+
+    const wrapper = index.indexContent(wrapperUri, `
+<template>
+  <component :is="compName" v-bind="$attrs" v-on="$listeners"></component>
+</template>
+<script>
+import PhysicalGoodsDetail from './PhysicalGoodsDetail.vue'
+import VirtualGoodsDetail from './VirtualGoodsDetail.vue'
+
+export default {
+  components: {
+    PhysicalGoodsDetail,
+    VirtualGoodsDetail,
+  },
+  props: {
+    classifyId: String,
+  },
+  data() {
+    const goodsClassify = {
+      20101: 'PhysicalGoodsDetail',
+      20102: 'VirtualGoodsDetail',
+    }
+    return {
+      compName: goodsClassify[this.classifyId],
+    }
+  },
+}
+</script>
+`)
+    const physical = index.indexContent(physicalUri, `
+<script>
+export default {
+  props: {
+    classifyId: String,
+    operateType: String,
+  },
+  methods: {
+    save() {
+      this.$emit('saveSuccess')
+    },
+  },
+}
+</script>
+`)
+    const virtual = index.indexContent(virtualUri, `
+<script>
+export default {
+  props: {
+    classifyId: String,
+    operateType: String,
+  },
+  methods: {
+    save() {
+      this.$emit('saveSuccess')
+    },
+  },
+}
+</script>
+`)
+    index.indexContent(parentUri, `
+<template>
+  <goods-detail classify-id="20101" operate-type="add" @saveSuccess="handleSaveSuccess"></goods-detail>
+</template>
+<script>
+import GoodsDetail from './GoodsDetail.vue'
+
+export default {
+  components: { GoodsDetail },
+  methods: {
+    handleSaveSuccess() {},
+  },
+}
+</script>
+`)
+
+    const dynamicUsage = wrapper.templateIndex.components.find((component) => component.tag === 'component')!
+
+    expect(dynamicUsage.dynamicTags).toEqual(['PhysicalGoodsDetail', 'VirtualGoodsDetail'])
+    expect(dynamicUsage.forwardsListeners).toBe(true)
+    expect(index.findPropDefinitions(wrapperUri, 'classifyId').map(({ file }) => file.uri)).toEqual([wrapperUri])
+    expect(index.findPropDefinitions(wrapperUri, 'operateType').map(({ file }) => file.uri).sort()).toEqual([physical.uri, virtual.uri].sort())
+    expect(index.findTemplatePropUsages(physical.uri, 'classifyId')).toHaveLength(0)
+    expect(index.findTemplatePropUsages(virtual.uri, 'classifyId')).toHaveLength(0)
+    expect(index.findTemplatePropUsages(physical.uri, 'operateType').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplatePropUsages(virtual.uri, 'operateType').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findEventDefinitions(wrapperUri, 'saveSuccess').map(({ file }) => file.uri).sort()).toEqual([physical.uri, virtual.uri].sort())
+    expect(index.findTemplateEventUsages(physical.uri, 'saveSuccess').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplateEventUsages(virtual.uri, 'saveSuccess').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
   it('template $emit 只索引当前组件 emit 调用', () => {
     const index = new WorkspaceIndex()
     const file = index.indexContent(path.join(fixtureRoot, 'TemplateEmitBoundary.vue'), `
@@ -1310,6 +1406,105 @@ const service = inject(injectedServiceKey)
     expect(consumer.scriptIndex.injects[0].detail).toBe('injectedServiceKey')
     expect(index.findProvideDefinitions(consumer, symbolKey).map((usage) => usage.file.uri)).toEqual([providerUri])
     expect(index.findInjectUsages(providerUri, symbolKey).map((usage) => usage.file.uri)).toEqual([consumerUri])
+  })
+
+  it('支持 Vue3 v-bind $attrs 透传的模板事件关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-forwarded-attrs-'))
+    const childUri = path.join(root, 'src/PositiveScan.vue')
+    const middleUri = path.join(root, 'src/MemberLogin.vue')
+    const parentUri = path.join(root, 'src/Dialog.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<template><button @click="start">start</button></template>
+<script setup lang="ts">
+const emits = defineEmits<{
+  fetchStart: []
+}>()
+
+function start() {
+  emits('fetchStart')
+}
+</script>
+`)
+    writeText(middleUri, `
+<template>
+  <PositiveScan v-bind="$attrs" />
+</template>
+<script setup lang="ts">
+import PositiveScan from './PositiveScan.vue'
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <MemberLogin @fetch-start="onFetchStart" />
+</template>
+<script setup lang="ts">
+import MemberLogin from './MemberLogin.vue'
+
+const onFetchStart = () => {}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const middle = index.getFile(middleUri)!
+    const child = index.getFile(childUri)!
+
+    expect(middle.templateIndex.components[0].forwardsAttrs).toBe(true)
+    expect(child.scriptIndex.emits.map((emit) => emit.eventName)).toEqual(['fetchStart'])
+    expect(index.findEventDefinitions(middleUri, 'fetchStart').map(({ file }) => file.uri)).toEqual([childUri])
+    expect(index.findTemplateEventUsages(childUri, 'fetchStart').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplateEventUsages(childUri, 'fetch-start').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
+  it('Vue3 v-bind $attrs 不透传当前组件已声明的事件', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-forwarded-declared-event-'))
+    const childUri = path.join(root, 'src/PositiveScan.vue')
+    const middleUri = path.join(root, 'src/MemberLogin.vue')
+    const parentUri = path.join(root, 'src/Dialog.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<script setup lang="ts">
+const emit = defineEmits<{
+  fetchStart: []
+}>()
+
+emit('fetchStart')
+</script>
+`)
+    writeText(middleUri, `
+<template>
+  <PositiveScan v-bind="$attrs" />
+</template>
+<script setup lang="ts">
+import PositiveScan from './PositiveScan.vue'
+
+const emit = defineEmits<{
+  fetchStart: []
+}>()
+
+emit('fetchStart')
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <MemberLogin @fetch-start="onFetchStart" />
+</template>
+<script setup lang="ts">
+import MemberLogin from './MemberLogin.vue'
+
+const onFetchStart = () => {}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findEventDefinitions(middleUri, 'fetchStart').map(({ file }) => file.uri)).toEqual([middleUri])
+    expect(index.findTemplateEventUsages(middleUri, 'fetchStart').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplateEventUsages(childUri, 'fetchStart')).toHaveLength(0)
   })
 
   it('Vue3 key 源文件更新时只重建直接依赖文件', async () => {
