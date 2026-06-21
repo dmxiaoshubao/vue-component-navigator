@@ -7,6 +7,7 @@
 #### Added
 
 - Added Vue 3 workspace support for static component navigation, `defineProps` type usage, `defineEmits` event relationships, and Composition API `provide` / `inject` relationships.
+- Added component usage inlay hints on component `<template>` tags, with hover details and click-through usage navigation for template tags and static `.vue` imports.
 - Added Vue 2 fallthrough prop and listener navigation through `v-bind="$attrs"` / `v-on="$listeners"` wrappers, including statically resolved dynamic component candidates.
 - Added Vue 3 `v-bind="$attrs"` listener fallthrough navigation to child `defineEmits` declarations.
 
@@ -26,6 +27,7 @@
 #### 新增
 
 - 新增 Vue 3 workspace 支持，覆盖静态组件导航、`defineProps` 类型使用、`defineEmits` 事件关系，以及 Composition API `provide` / `inject` 关系。
+- 新增组件 `<template>` 标签处的组件用法 inlay hint，支持 template 标签和静态 `.vue` import 用法的 hover 详情与点击跳转。
 - 新增 Vue 2 通过 `v-bind="$attrs"` / `v-on="$listeners"` wrapper 透传的 prop 和 listener 导航，包括可静态解析的动态组件候选。
 - 新增 Vue 3 通过 `v-bind="$attrs"` 透传 listener 到子组件 `defineEmits` 声明的导航关系。
 

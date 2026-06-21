@@ -42,6 +42,7 @@
 - `$refs` 方法跳转、补全、hover 和引用查询。
 - 模板 prop 跳到子组件 prop 定义。
 - 模板事件和子组件 `this.$emit(...)` 互相跳转。
+- 在组件 `<template>` 标签处显示组件用法 inlay hint，并支持 template 标签和静态 `.vue` import 用法的 hover 详情与点击跳转。
 - Vue 2 通过 `v-bind="$attrs"` / `v-on="$listeners"` wrapper 透传的 prop 和 listener 导航，包括可静态解析的动态组件候选。
 - Vue 2 Event Bus 静态字符串事件名导航。
 - 静态 `provide` / `inject` key 跳转和补全。

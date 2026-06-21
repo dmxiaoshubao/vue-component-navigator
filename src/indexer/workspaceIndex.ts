@@ -12,7 +12,7 @@ import { parseTemplate } from './templateParser'
 import { createVue3ScriptParseCache, parseVue3Script } from './vue3ScriptParser'
 import { createLineStarts, positionToOffset } from '../utils/position'
 import { matchesName, toKebabCase } from '../utils/casing'
-import { maskStringsAndComments } from '../utils/scriptScan'
+import { maskStringsAndComments, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
 export interface IndexCancellationToken {
   readonly isCancellationRequested: boolean
@@ -22,6 +22,20 @@ type EventBusEntryConfig = string | readonly string[]
 type TrackedUsageMap = Map<string, UsageInfo[]>
 
 type SourceRelationMap<T extends { file: VueFileIndex }> = Map<string, T[]>
+
+interface ScriptComponentUsageFile {
+  file: VueFileIndex
+  usages: Array<{ childUri: string, span: TextSpan }>
+}
+
+interface ScriptComponentUsageImport {
+  localName: string
+  childUri: string
+  importStart: number
+  importEnd: number
+  fallbackSpan: TextSpan
+  spans: TextSpan[]
+}
 
 function emptyScriptIndex(): ScriptIndex {
   return {
@@ -51,6 +65,7 @@ export class WorkspaceIndex {
   private readonly globalComponentContexts = new Map<string, GlobalComponentContext[]>()
   private readonly eventBusRegistrations = new Map<string, EventBusRegistration[]>()
   private readonly propUsages = new Map<string, UsageInfo[]>()
+  private readonly componentUsages = new Map<string, UsageInfo[]>()
   private readonly eventUsages = new Map<string, UsageInfo[]>()
   private readonly eventBusEmits = new Map<string, EventBusUsageInfo[]>()
   private readonly eventBusListeners = new Map<string, EventBusUsageInfo[]>()
@@ -69,6 +84,7 @@ export class WorkspaceIndex {
   private readonly sourceRefMethodCalls: SourceRelationMap<{ file: VueFileIndex, call: RefMethodAccess }> = new Map()
   private readonly sourceRelationFiles = new Map<string, Set<string>>()
   private readonly parentComponents = new Map<string, Set<string>>()
+  private readonly scriptComponentUsageFiles = new Map<string, ScriptComponentUsageFile>()
   private readonly mixinIndexCache = new Map<string, { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } | undefined>()
   private readonly mixinSourceUris = new Set<string>()
   private readonly vue3ScriptParseCache = createVue3ScriptParseCache()
@@ -89,6 +105,7 @@ export class WorkspaceIndex {
     this.globalComponentRegistrations.clear()
     this.globalComponentContexts.clear()
     this.eventBusRegistrations.clear()
+    this.scriptComponentUsageFiles.clear()
     this.mixinIndexCache.clear()
     this.mixinSourceUris.clear()
     this.vue3ScriptParseCache.clear()
@@ -132,6 +149,13 @@ export class WorkspaceIndex {
     this.mixinSourceUris.clear()
     for (const uri of other.mixinSourceUris) {
       this.mixinSourceUris.add(uri)
+    }
+    this.scriptComponentUsageFiles.clear()
+    for (const [uri, usageFile] of other.scriptComponentUsageFiles) {
+      this.scriptComponentUsageFiles.set(uri, {
+        file: usageFile.file,
+        usages: [...usageFile.usages],
+      })
     }
     this.rebuildReverseIndexes()
   }
@@ -363,7 +387,7 @@ export class WorkspaceIndex {
 
     if (vueVersion === 2) {
       for (const file of scriptFiles) {
-        await this.indexGlobalComponentFile(file)
+        await this.indexGlobalComponentFile(file, false)
         if (token?.isCancellationRequested) {
           return
         }
@@ -377,6 +401,17 @@ export class WorkspaceIndex {
       await this.refreshEventBusRegistrations(root, token)
       if (token?.isCancellationRequested) {
         return
+      }
+    }
+    if (vueVersion === 3) {
+      for (const file of scriptFiles) {
+        if (token?.isCancellationRequested) {
+          return
+        }
+        const content = await readTextIfExists(file)
+        if (content !== undefined) {
+          this.indexScriptComponentUsageContent(file, content, false)
+        }
       }
     }
 
@@ -394,8 +429,9 @@ export class WorkspaceIndex {
     }
   }
 
-  async indexGlobalComponentFile(uri: string): Promise<void> {
+  async indexGlobalComponentFile(uri: string, rebuildScriptUsages = true): Promise<void> {
     const content = await fs.readFile(uri, 'utf8')
+    this.indexScriptComponentUsageContent(uri, content, rebuildScriptUsages)
     await this.indexGlobalComponentContent(uri, content)
   }
 
@@ -413,20 +449,29 @@ export class WorkspaceIndex {
   }
 
   async syncGlobalComponentFile(uri: string): Promise<void> {
-    if (this.vueVersionForUri(uri) === 3) {
-      if (this.hasVue3Source(uri)) {
+    const vueVersion = this.vueVersionForUri(uri)
+    const hasVue3Source = vueVersion === 3 && this.hasVue3Source(uri)
+    const content = await readTextIfExists(uri)
+    if (content !== undefined) {
+      this.indexScriptComponentUsageContent(uri, content, vueVersion === 3 && !hasVue3Source)
+    }
+    if (vueVersion === 3) {
+      if (hasVue3Source) {
         this.rebuildSourceConsumers(uri)
       }
       return
     }
     this.clearMixinCacheForFile(uri)
-    await this.indexGlobalComponentFile(uri)
+    if (content !== undefined) {
+      await this.indexGlobalComponentContent(uri, content)
+    }
     await this.refreshEventBusRegistrations()
     await this.refreshRequireContextGlobals(this.getIndexedUris())
     this.rebuildIndexedFiles()
   }
 
   async removeGlobalComponentFile(uri: string): Promise<void> {
+    this.removeScriptComponentUsageFile(uri)
     if (this.vueVersionForUri(uri) === 3) {
       if (this.hasVue3Source(uri)) {
         this.rebuildSourceConsumers(uri)
@@ -479,6 +524,10 @@ export class WorkspaceIndex {
       results.push(...(this.eventUsages.get(key) ?? []))
     }
     return dedupeUsages(results)
+  }
+
+  findComponentUsages(childUri: string): UsageInfo[] {
+    return dedupeUsages(this.componentUsages.get(childUri) ?? [])
   }
 
   findEventDefinitions(childUri: string, eventName: string): Array<{ file: VueFileIndex, emit: EmitInfo }> {
@@ -981,6 +1030,7 @@ export class WorkspaceIndex {
 
   private clearReverseIndexes(): void {
     this.propUsages.clear()
+    this.componentUsages.clear()
     this.eventUsages.clear()
     this.eventBusEmits.clear()
     this.eventBusListeners.clear()
@@ -1003,6 +1053,40 @@ export class WorkspaceIndex {
     this.sourceKeysByFile = new WeakMap()
     this.injectUsageKeysByProvider = new WeakMap()
     this.parentLinksByFile = new WeakMap()
+  }
+
+  private indexScriptComponentUsageContent(uri: string, content: string, rebuild = true): void {
+    this.removeScriptComponentUsageFile(uri)
+    const usages = parseScriptComponentUsages(uri, content, this.workspaceRoots)
+      .filter((usage) => this.isInsideWorkspace(usage.childUri) && !isInsideNodeModules(usage.childUri))
+    if (usages.length === 0) {
+      return
+    }
+
+    this.scriptComponentUsageFiles.set(uri, {
+      file: scriptUsageFile(uri, content, this.vueVersionForUri(uri)),
+      usages,
+    })
+    if (rebuild && !this.isBulkIndexing) {
+      this.rebuildReverseIndexes()
+    }
+  }
+
+  private removeScriptComponentUsageFile(uri: string): void {
+    const usageFile = this.scriptComponentUsageFiles.get(uri)
+    if (!usageFile) {
+      return
+    }
+    this.removeTrackedFileUsages(usageFile.file)
+    this.scriptComponentUsageFiles.delete(uri)
+  }
+
+  private addScriptComponentUsages(): void {
+    for (const usageFile of this.scriptComponentUsageFiles.values()) {
+      for (const usage of usageFile.usages) {
+        this.addUsage(this.componentUsages, usage.childUri, { file: usageFile.file, span: usage.span })
+      }
+    }
   }
 
   private addUsage<T extends UsageInfo>(map: Map<string, T[]>, key: string, usage: T): void {
@@ -1192,6 +1276,7 @@ export class WorkspaceIndex {
       }
       for (const childUri of childUris) {
         this.addParentLink(file, childUri)
+        this.addUsage(this.componentUsages, childUri, { file, span: component.span })
         relationshipChildren.add(childUri)
       }
 
@@ -1533,6 +1618,7 @@ export class WorkspaceIndex {
       this.addRelationshipUsages(file)
       this.addEventBusUsages(file)
     }
+    this.addScriptComponentUsages()
     this.addForwardedAttrPropUsages()
     this.addForwardedAttrEventUsages()
     for (const file of this.files.values()) {
@@ -1652,7 +1738,9 @@ export class WorkspaceIndex {
   }
 
   private workspaceRootFor(uri: string): string | undefined {
-    return this.workspaceRoots.find((root) => uri === root || isInsideDirectory(uri, root))
+    return this.workspaceRoots
+      .filter((root) => uri === root || isInsideDirectory(uri, root))
+      .sort((a, b) => b.length - a.length)[0]
   }
 
   private vueVersionForUri(uri: string, sfc?: ParsedSfc): VueMajorVersion {
@@ -1820,6 +1908,189 @@ function dedupePropDefinitions(definitions: Array<{ file: VueFileIndex, prop: Pr
     results.push(definition)
   }
   return results
+}
+
+function scriptUsageFile(uri: string, content: string, vueVersion: VueMajorVersion): VueFileIndex {
+  return {
+    uri,
+    fileName: path.basename(uri),
+    vueVersion,
+    content: '',
+    searchableContent: '',
+    lineStarts: createLineStarts(content),
+    scriptIndex: emptyScriptIndex(),
+    templateIndex: { components: [], emits: [], eventBusCalls: [] },
+    refMethodCalls: [],
+  }
+}
+
+function parseScriptComponentUsages(uri: string, content: string, workspaceRoots: string[]): Array<{ childUri: string, span: TextSpan }> {
+  const usages: Array<{ childUri: string, span: TextSpan }> = []
+  const imports: ScriptComponentUsageImport[] = []
+
+  for (let index = 0; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+    if (!isCodeTokenAt(content, 'import', index)) {
+      continue
+    }
+
+    const cursor = skipWhitespace(content, index + 'import'.length)
+    if (content[cursor] === '(') {
+      const literalStart = skipWhitespace(content, cursor + 1)
+      const literal = readStringLiteral(content, literalStart)
+      const childUri = literal ? resolveVueImport(uri, literal.value, workspaceRoots) : undefined
+      if (literal && childUri) {
+        usages.push({ childUri, span: { start: literal.start, end: literal.end } })
+      }
+      continue
+    }
+
+    const statementEnd = findImportStatementEnd(content, cursor)
+    const statement = content.slice(index, statementEnd)
+    const sourceMatch = /\bfrom\s*(["'])/.exec(statement)
+    if (!sourceMatch) {
+      continue
+    }
+    const literalStart = index + sourceMatch.index + sourceMatch[0].length - 1
+    const literal = readStringLiteral(content, literalStart)
+    const childUri = literal ? resolveVueImport(uri, literal.value, workspaceRoots) : undefined
+    if (!literal || !childUri) {
+      continue
+    }
+
+    const clause = content.slice(cursor, index + sourceMatch.index).trim()
+    const localName = parseDefaultImportName(clause)
+    if (localName) {
+      imports.push({
+        localName,
+        childUri,
+        importStart: index,
+        importEnd: statementEnd,
+        fallbackSpan: { start: literal.start, end: literal.end },
+        spans: [],
+      })
+    } else {
+      usages.push({ childUri, span: { start: literal.start, end: literal.end } })
+    }
+    index = statementEnd - 1
+  }
+
+  collectImportedIdentifierUsages(content, imports)
+  for (const item of imports) {
+    if (item.spans.length === 0) {
+      usages.push({ childUri: item.childUri, span: item.fallbackSpan })
+      continue
+    }
+    usages.push(...item.spans.map((span) => ({ childUri: item.childUri, span })))
+  }
+
+  return usages
+}
+
+function resolveVueImport(fromUri: string, source: string, workspaceRoots: string[]): string | undefined {
+  const cleanSource = source.split('?')[0]
+  if (!cleanSource.endsWith('.vue')) {
+    return undefined
+  }
+  return resolveImportPathWithExtensions(fromUri, cleanSource, workspaceRoots, ['.vue'])
+}
+
+function parseDefaultImportName(clause: string): string | undefined {
+  if (clause.startsWith('type ')) {
+    return undefined
+  }
+  const match = /^([A-Za-z_$][\w$]*)\b/.exec(clause)
+  return match?.[1]
+}
+
+function collectImportedIdentifierUsages(content: string, imports: ScriptComponentUsageImport[]): void {
+  if (imports.length === 0) {
+    return
+  }
+
+  const importsByName = new Map<string, ScriptComponentUsageImport[]>()
+  for (const item of imports) {
+    const items = importsByName.get(item.localName) ?? []
+    items.push(item)
+    importsByName.set(item.localName, items)
+  }
+
+  const importRanges = imports
+    .map((item) => ({ start: item.importStart, end: item.importEnd }))
+    .sort((a, b) => a.start - b.start)
+  let rangeIndex = 0
+
+  for (let index = 0; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    while (rangeIndex < importRanges.length && importRanges[rangeIndex].end <= index) {
+      rangeIndex += 1
+    }
+    const importRange = importRanges[rangeIndex]
+    if (importRange && index >= importRange.start && index < importRange.end) {
+      index = importRange.end - 1
+      continue
+    }
+
+    if (!isIdentifierStart(content[index])) {
+      continue
+    }
+    const end = readIdentifierEnd(content, index + 1)
+    const name = content.slice(index, end)
+    const items = importsByName.get(name)
+    if (items) {
+      for (const item of items) {
+        item.spans.push({ start: index, end })
+      }
+    }
+    index = end - 1
+  }
+}
+
+function findImportStatementEnd(content: string, start: number): number {
+  for (let index = start; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+    if (content[index] === ';' || content[index] === '\n') {
+      return index + 1
+    }
+  }
+  return content.length
+}
+
+function skipWhitespace(content: string, index: number): number {
+  while (index < content.length && /\s/.test(content[index])) {
+    index += 1
+  }
+  return index
+}
+
+function isCodeTokenAt(content: string, token: string, index: number): boolean {
+  return content.startsWith(token, index)
+    && !/[\w$]/.test(content[index - 1] ?? '')
+    && !/[\w$]/.test(content[index + token.length] ?? '')
+}
+
+function isIdentifierStart(char: string | undefined): boolean {
+  return Boolean(char && /[A-Za-z_$]/.test(char))
+}
+
+function readIdentifierEnd(content: string, index: number): number {
+  while (index < content.length && /[\w$]/.test(content[index])) {
+    index += 1
+  }
+  return index
 }
 
 function defaultEventBusEntryCandidates(root: string): string[] {

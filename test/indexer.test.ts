@@ -1199,6 +1199,43 @@ export default {
 })
 
 describe('Vue3 indexer', () => {
+  it('嵌套 workspace root 使用最近的 Vue 主版本', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-nested-vue-version-'))
+    const nestedVue3Root = path.join(root, 'packages/vue3-app')
+    const nestedVue2Root = path.join(root, 'packages/vue2-app')
+    const vue3File = path.join(nestedVue3Root, 'Child.vue')
+    const vue2File = path.join(nestedVue2Root, 'Child.vue')
+
+    const index = new WorkspaceIndex()
+    index.setWorkspaceVueVersion(root, 2)
+    index.setWorkspaceVueVersion(nestedVue3Root, 3)
+    let file = index.indexContent(vue3File, `
+<template>{{ title }}</template>
+<script setup lang="ts">
+defineProps<{ title: string }>()
+</script>
+`)
+
+    expect(file.vueVersion).toBe(3)
+    expect(file.scriptIndex.props.map((prop) => prop.name)).toEqual(['title'])
+    expect(file.scriptSetup?.content).toContain('defineProps')
+
+    const reverseIndex = new WorkspaceIndex()
+    reverseIndex.setWorkspaceVueVersion(root, 3)
+    reverseIndex.setWorkspaceVueVersion(nestedVue2Root, 2)
+    file = reverseIndex.indexContent(vue2File, `
+<template><div /></template>
+<script>
+export default {
+  props: { title: String },
+}
+</script>
+`)
+
+    expect(file.vueVersion).toBe(2)
+    expect(file.scriptIndex.props.map((prop) => prop.name)).toEqual(['title'])
+  })
+
   it('解析 script setup props 类型、emits、provide/inject，并隔离 ref/eventBus/global/外部 prop', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-indexer-'))
     const typeUri = path.join(root, 'src/components/confirm-dialog/type.ts')
@@ -1902,6 +1939,7 @@ export default {
     expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
     expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(1)
     expect(index.findRefMethodUsages(childUri, 'open')).toHaveLength(1)
+    expect(index.findComponentUsages(childUri)).toHaveLength(1)
 
     index.syncContent(parentUri, `
 <template>
@@ -1916,9 +1954,79 @@ export default { components: { IndexedChild } }
     expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(0)
     expect(index.findTemplateEventUsages(childUri, 'save')).toHaveLength(0)
     expect(index.findRefMethodUsages(childUri, 'open')).toHaveLength(0)
+    expect(index.findComponentUsages(childUri)).toHaveLength(1)
 
     index.remove(parentUri)
     expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(0)
+    expect(index.findComponentUsages(childUri)).toHaveLength(0)
+  })
+
+  it('脚本中的动态 vue import 会参与组件用法关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-script-dynamic-component-usage-'))
+    const childUri = path.join(root, 'src/pages/GoodsEdit.vue')
+    const routerUri = path.join(root, 'src/router/goods.js')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^2.7.16' } }))
+    writeText(path.join(root, 'jsconfig.json'), JSON.stringify({
+      compilerOptions: {
+        baseUrl: '.',
+        paths: {
+          '@/*': ['src/*'],
+        },
+      },
+    }))
+    writeText(childUri, `
+<template><div /></template>
+<script>
+export default { name: 'goods-edit' }
+</script>
+`)
+    const routerContent = `
+export default [{
+  name: 'goods-edit',
+  component: () => import('@/pages/GoodsEdit.vue'),
+}]
+`
+    writeText(routerUri, routerContent)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 2)
+
+    const usages = index.findComponentUsages(childUri)
+    expect(usages).toHaveLength(1)
+    expect(usages[0].file.uri).toBe(routerUri)
+    expect(routerContent.slice(usages[0].span.start, usages[0].span.end)).toBe('@/pages/GoodsEdit.vue')
+  })
+
+  it('脚本中的静态 vue import 标识符使用会参与组件用法关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-script-static-component-usage-'))
+    const childUri = path.join(root, 'src/components/member-login/member-login-dialog.vue')
+    const commandUri = path.join(root, 'src/components/member-login/dialog-command.ts')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<template><div /></template>
+<script setup lang="ts">
+defineOptions({ name: 'member-login-dialog' })
+</script>
+`)
+    const commandContent = `
+import { h } from 'vue'
+import MemberLoginDialog from './member-login-dialog.vue'
+
+export function renderDialog() {
+  return h(MemberLoginDialog, { ref: 'dialogRef' })
+}
+`
+    writeText(commandUri, commandContent)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    const usages = index.findComponentUsages(childUri)
+    expect(usages).toHaveLength(1)
+    expect(usages[0].file.uri).toBe(commandUri)
+    expect(commandContent.slice(usages[0].span.start, usages[0].span.end)).toBe('MemberLoginDialog')
   })
 
   it('忽略注释中的 $refs 调用', () => {

@@ -7,11 +7,13 @@ import { WorkspaceIndex } from './indexer/workspaceIndex'
 import { VueCompletionProvider } from './providers/completionProvider'
 import { VueDefinitionProvider } from './providers/definitionProvider'
 import { SHOW_USAGES_COMMAND, VueHoverProvider } from './providers/hoverProvider'
+import { VueInlayHintProvider } from './providers/inlayHintProvider'
 import { VueReferenceProvider } from './providers/referenceProvider'
 import { offsetToPosition, spanToRange } from './utils/position'
 import { commonDirectory, relativePath, usagePathLabels } from './utils/pathDisplay'
 
 type UsageCommandArgs =
+  | { kind: 'component-usages', childUri: string }
   | { kind?: 'event-listeners', childUri: string, eventName: string }
   | { kind: 'event-bus-listeners', busName: string, eventName: string }
   | { kind: 'event-bus-emits', busName: string, eventName: string }
@@ -57,6 +59,11 @@ function toVsCodeRange(file: VueFileIndex, span: TextSpan, sourceLocation?: Sour
   const location = sourceLocation ?? { lineStarts: file.lineStarts, span }
   const range = spanToRange(location.lineStarts, location.span)
   return new vscode.Range(range.start.line, range.start.character, range.end.line, range.end.character)
+}
+
+async function openUsage(usage: UsageInfo): Promise<void> {
+  const range = toVsCodeRange(usage.file, usage.span, usage.sourceLocation)
+  await vscode.window.showTextDocument(vscode.Uri.file(usage.sourceLocation?.uri ?? usage.file.uri), { selection: range, preview: true })
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -201,6 +208,7 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?', '\'', '"'),
       vscode.languages.registerHoverProvider(selector, new VueHoverProvider(index)),
       vscode.languages.registerReferenceProvider(selector, new VueReferenceProvider(index)),
+      vscode.languages.registerInlayHintsProvider([{ language: 'vue', scheme: 'file' }], new VueInlayHintProvider(index)),
       vscode.workspace.onDidSaveTextDocument((document) => {
         if (document.languageId === 'vue' && document.uri.scheme === 'file') {
           clearPendingSync(document.uri.fsPath)
@@ -349,6 +357,14 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
 
+    if (args.kind === 'component-usages') {
+      const child = index.getFile(args.childUri)
+      return {
+        usages: index.findComponentUsages(args.childUri),
+        placeHolder: `Select ${child?.scriptIndex.componentName ?? child?.fileName ?? 'component'} usage`,
+      }
+    }
+
     if (args.kind === 'event-bus-listeners') {
       return {
         usages: index.findEventBusListeners(args.busName, args.eventName),
@@ -418,6 +434,11 @@ export function activate(context: vscode.ExtensionContext): void {
         return
       }
 
+      if (args.kind === 'component-usages' && usages.length === 1) {
+        await openUsage(usages[0])
+        return
+      }
+
       const files = index.getAllFiles()
       const baseDirectory = commonDirectory(files.map((file) => file.uri))
       const labels = usagePathLabels(usages.map((usage) => usage.sourceLocation?.uri ?? usage.file.uri), baseDirectory)
@@ -435,8 +456,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return
       }
 
-      const range = toVsCodeRange(selected.file, selected.span, selected.sourceLocation)
-      await vscode.window.showTextDocument(vscode.Uri.file(selected.sourceLocation?.uri ?? selected.file.uri), { selection: range, preview: true })
+      await openUsage(selected)
     }),
     {
       dispose: () => {

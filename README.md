@@ -41,6 +41,7 @@ Shows jumping from static `inject` keys to the nearest static provider, and from
 - `$refs` method navigation, completion, hover, and references.
 - Component prop navigation from template usage to child prop definitions.
 - Component event navigation between template listeners and `this.$emit(...)`.
+- Component usage inlay hints on the component `<template>` tag, with hover details and click-through usage navigation for template tags and static `.vue` imports.
 - Vue 2 fallthrough prop and listener navigation through `v-bind="$attrs"` / `v-on="$listeners"` wrappers, including statically resolved dynamic component candidates.
 - Vue 2 Event Bus navigation for static string event names.
 - Static `provide` / `inject` key navigation and completion.

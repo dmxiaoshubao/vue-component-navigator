@@ -145,6 +145,97 @@ export default { components: { Child } }
     expect(vscode.shownDocuments.at(-1)?.uri.fsPath).toBe(parentFile)
   })
 
+  it('Show usages 命令在单个组件使用位置时直接打开引用', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-component-usages-'))
+    const childFile = path.join(root, 'Child.vue')
+    const parentFile = path.join(root, 'Parent.vue')
+    writePackageJson(root)
+    writeText(childFile, `
+<template><div /></template>
+<script>
+export default { name: 'Child' }
+</script>
+`)
+    writeText(parentFile, `
+<template>
+  <Child />
+</template>
+<script>
+import Child from './Child.vue'
+export default { components: { Child } }
+</script>
+`)
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+    await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'component-usages',
+      childUri: childFile,
+    })
+
+    expect(vscode.quickPickCalls).toHaveLength(0)
+    expect(vscode.shownDocuments.at(-1)?.uri.fsPath).toBe(parentFile)
+  })
+
+  it('Show usages 命令在多个组件使用位置时保留选择列表', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-component-usages-many-'))
+    const childFile = path.join(root, 'Child.vue')
+    const firstParentFile = path.join(root, 'ParentA.vue')
+    const secondParentFile = path.join(root, 'ParentB.vue')
+    writePackageJson(root)
+    writeText(childFile, `
+<template><div /></template>
+<script>
+export default { name: 'Child' }
+</script>
+`)
+    writeText(firstParentFile, `
+<template>
+  <Child />
+</template>
+<script>
+import Child from './Child.vue'
+export default { components: { Child } }
+</script>
+`)
+    writeText(secondParentFile, `
+<template>
+  <Child />
+</template>
+<script>
+import Child from './Child.vue'
+export default { components: { Child } }
+</script>
+`)
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+    await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'component-usages',
+      childUri: childFile,
+    })
+
+    const items = vscode.quickPickCalls.at(-1)?.items ?? []
+    expect(items).toHaveLength(2)
+    expect(items.map((item: any) => item.label)).toEqual(expect.arrayContaining([
+      expect.stringContaining('ParentA.vue'),
+      expect.stringContaining('ParentB.vue'),
+    ]))
+    expect([firstParentFile, secondParentFile]).toContain(vscode.shownDocuments.at(-1)?.uri.fsPath)
+  })
+
   it('保存 jsconfig 后会清理别名缓存并重建入口索引', async () => {
     const vscode = await import('vscode') as any
     vscode.resetMockState()
@@ -236,6 +327,7 @@ export default {
     await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
 
     expect(vscode.providerRegistrations.length).toBeGreaterThan(0)
+    expect(vscode.providerRegistrations).toContain('inlayHint')
     expect(vscode.informationMessages.at(-1)).toContain('Supported Vue package detected: yes')
     expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: yes')
   })
