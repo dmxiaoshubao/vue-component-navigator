@@ -2,7 +2,7 @@
   "name": "vue-component-navigator",
   "displayName": "Vue Component Navigator",
   "description": "Vue 2 and Vue 3 navigation, references, hover, and completions for static component relationships.",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "publisher": "dmxiaoshubao",
   "author": "dmxiaoshubao",
   "license": "MIT",

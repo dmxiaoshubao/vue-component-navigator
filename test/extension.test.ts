@@ -327,7 +327,8 @@ export default {
     await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
 
     expect(vscode.providerRegistrations.length).toBeGreaterThan(0)
-    expect(vscode.providerRegistrations).toContain('inlayHint')
+    expect(vscode.providerRegistrations).toContain('codeLens')
+    expect(vscode.providerRegistrations).not.toContain('inlayHint')
     expect(vscode.informationMessages.at(-1)).toContain('Supported Vue package detected: yes')
     expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: yes')
   })

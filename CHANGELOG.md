@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.1 - 2026-06-29
+
+### English
+
+#### Changed
+
+- Replaced component usage inlay hints with component usage CodeLens so usage counts work without enabling editor Inlay Hints.
+
+### 中文
+
+#### 变更
+
+- 将组件用法 inlay hint 替换为组件用法 CodeLens，无需开启编辑器 Inlay Hints 也能看到用法数量。
+
 ## 1.2.0 - 2026-06-20
 
 ### English

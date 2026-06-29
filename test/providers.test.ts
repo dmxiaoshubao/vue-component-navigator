@@ -124,7 +124,7 @@ describe('Vue providers', () => {
   let VueDefinitionProvider: typeof import('../src/providers/definitionProvider').VueDefinitionProvider
   let VueCompletionProvider: typeof import('../src/providers/completionProvider').VueCompletionProvider
   let VueHoverProvider: typeof import('../src/providers/hoverProvider').VueHoverProvider
-  let VueInlayHintProvider: typeof import('../src/providers/inlayHintProvider').VueInlayHintProvider
+  let VueCodeLensProvider: typeof import('../src/providers/codeLensProvider').VueCodeLensProvider
   let VueReferenceProvider: typeof import('../src/providers/referenceProvider').VueReferenceProvider
   let index: import('../src/indexer/workspaceIndex').WorkspaceIndex
 
@@ -133,7 +133,7 @@ describe('Vue providers', () => {
     ;({ VueDefinitionProvider } = await import('../src/providers/definitionProvider'))
     ;({ VueCompletionProvider } = await import('../src/providers/completionProvider'))
     ;({ VueHoverProvider } = await import('../src/providers/hoverProvider'))
-    ;({ VueInlayHintProvider } = await import('../src/providers/inlayHintProvider'))
+    ;({ VueCodeLensProvider } = await import('../src/providers/codeLensProvider'))
     ;({ VueReferenceProvider } = await import('../src/providers/referenceProvider'))
     index = new WorkspaceIndex()
     await index.indexWorkspace(fixtureRoot)
@@ -1757,10 +1757,9 @@ const onFetchStart = () => {}
     expect(hoverText(listenerHover)).toContain('Definition')
   })
 
-  it('组件 template 处展示组件用法 inlay hint，单个用法也可点击执行命令', async () => {
-    const vscode = await import('vscode') as any
+  it('组件 template 处展示组件用法 CodeLens，单个用法也可点击执行命令', () => {
     const localIndex = new WorkspaceIndex()
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-component-usage-hints-'))
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-component-usage-codelens-'))
     const childUri = path.join(root, 'src/Child.vue')
     const parentUri = path.join(root, 'src/Parent.vue')
     const childContent = `
@@ -1783,26 +1782,21 @@ export default { components: { Child } }
 
     localIndex.indexContent(childUri, childContent)
     localIndex.indexContent(parentUri, parentContent)
-    const provider = new VueInlayHintProvider(localIndex)
+    const provider = new VueCodeLensProvider(localIndex)
     const document = new TestDocument(childUri, childContent) as any
-    const hints = provider.provideInlayHints(document, new vscode.Range(0, 0, 20, 0)) as any[]
+    const lenses = provider.provideCodeLenses(document) as any[]
 
-    expect(hints).toHaveLength(1)
-    expect(hints[0].position.line).toBe(1)
-    expect(hints[0].label[0].value).toBe('Used by 1 usage')
-    expect(hints[0].label[0].tooltip.value).toContain('Parent.vue:3')
-    expect(hints[0].label[0].tooltip.value).not.toContain('Open 1 usage')
-    expect(hints[0].label[0].tooltip.isTrusted).toBe(false)
-    expect(hints[0].tooltip).toBeUndefined()
-    expect(hints[0].label[0].location).toBeUndefined()
-    expect(hints[0].label[0].command.command).toBe('vueComponentNavigator.showUsages')
-    expect(hints[0].label[0].command.arguments).toEqual([{ kind: 'component-usages', childUri }])
+    expect(lenses).toHaveLength(1)
+    expect(lenses[0].range.start.line).toBe(1)
+    expect(lenses[0].range.end.line).toBe(1)
+    expect(lenses[0].command.title).toBe('Used by 1 usage')
+    expect(lenses[0].command.command).toBe('vueComponentNavigator.showUsages')
+    expect(lenses[0].command.arguments).toEqual([{ kind: 'component-usages', childUri }])
   })
 
-  it('组件有多个用法时 inlay hint 可点击打开用法列表', async () => {
-    const vscode = await import('vscode') as any
+  it('组件有多个用法时 CodeLens 可点击打开用法列表', () => {
     const localIndex = new WorkspaceIndex()
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-component-usage-list-hints-'))
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-component-usage-list-codelens-'))
     const childUri = path.join(root, 'src/Child.vue')
     const firstParentUri = path.join(root, 'src/FirstParent.vue')
     const secondParentUri = path.join(root, 'src/SecondParent.vue')
@@ -1827,24 +1821,19 @@ export default { components: { Child } }
     localIndex.indexContent(childUri, childContent)
     localIndex.indexContent(firstParentUri, parentContent)
     localIndex.indexContent(secondParentUri, parentContent)
-    const provider = new VueInlayHintProvider(localIndex)
+    const provider = new VueCodeLensProvider(localIndex)
     const document = new TestDocument(childUri, childContent) as any
-    const hints = provider.provideInlayHints(document, new vscode.Range(0, 0, 20, 0)) as any[]
+    const lenses = provider.provideCodeLenses(document) as any[]
 
-    expect(hints).toHaveLength(1)
-    expect(hints[0].tooltip).toBeUndefined()
-    expect(hints[0].label[0].value).toBe('Used by 2 usages')
-    expect(hints[0].label[0].tooltip.value).not.toContain('Open 2 usages')
-    expect(hints[0].label[0].tooltip.isTrusted).toBe(false)
-    expect(hints[0].label[0].location).toBeUndefined()
-    expect(hints[0].label[0].command.command).toBe('vueComponentNavigator.showUsages')
-    expect(hints[0].label[0].command.arguments).toEqual([{ kind: 'component-usages', childUri }])
+    expect(lenses).toHaveLength(1)
+    expect(lenses[0].command.title).toBe('Used by 2 usages')
+    expect(lenses[0].command.command).toBe('vueComponentNavigator.showUsages')
+    expect(lenses[0].command.arguments).toEqual([{ kind: 'component-usages', childUri }])
   })
 
-  it('Vue3 组件也只在 template 处展示组件用法 inlay hint', async () => {
-    const vscode = await import('vscode') as any
+  it('Vue3 组件也只在 template 处展示组件用法 CodeLens', async () => {
     const localIndex = new WorkspaceIndex()
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-component-usage-hints-'))
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-component-usage-codelens-'))
     const childUri = path.join(root, 'src/MemberLogin.vue')
     const parentUri = path.join(root, 'src/Dialog.vue')
     const childContent = `
@@ -1868,17 +1857,16 @@ import MemberLogin from './MemberLogin.vue'
     writeText(childUri, childContent)
     writeText(parentUri, parentContent)
     await localIndex.indexWorkspace(root, undefined, undefined, 3)
-    const provider = new VueInlayHintProvider(localIndex)
+    const provider = new VueCodeLensProvider(localIndex)
     const document = new TestDocument(childUri, childContent) as any
-    const hints = provider.provideInlayHints(document, new vscode.Range(0, 0, 20, 0)) as any[]
+    const lenses = provider.provideCodeLenses(document) as any[]
 
-    expect(hints).toHaveLength(1)
-    expect(hints[0].position.line).toBe(1)
-    expect(hints[0].label[0].tooltip.value).toContain('Dialog.vue:3')
+    expect(lenses).toHaveLength(1)
+    expect(lenses[0].range.start.line).toBe(1)
+    expect(lenses[0].command.title).toBe('Used by 1 usage')
   })
 
-  it('没有组件用法时不展示 inlay hint', async () => {
-    const vscode = await import('vscode') as any
+  it('没有组件用法时不展示 CodeLens', () => {
     const localIndex = new WorkspaceIndex()
     const uri = path.join(fixtureRoot, 'UnusedHint.vue')
     const content = `
@@ -1891,9 +1879,9 @@ export default { name: 'UnusedHint' }
 `
 
     localIndex.indexContent(uri, content)
-    const provider = new VueInlayHintProvider(localIndex)
+    const provider = new VueCodeLensProvider(localIndex)
     const document = new TestDocument(uri, content) as any
 
-    expect(provider.provideInlayHints(document, new vscode.Range(0, 0, 20, 0))).toEqual([])
+    expect(provider.provideCodeLenses(document)).toEqual([])
   })
 })

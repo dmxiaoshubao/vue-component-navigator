@@ -63,22 +63,8 @@ export class Hover {
   constructor(public contents: string | MarkdownString) {}
 }
 
-export enum InlayHintKind {
-  Type = 1,
-  Parameter = 2,
-}
-
-export class InlayHintLabelPart {
-  tooltip?: string | MarkdownString
-  command?: any
-  location?: Location
-  constructor(public value: string) {}
-}
-
-export class InlayHint {
-  tooltip?: string | MarkdownString
-  paddingLeft?: boolean
-  constructor(public position: Position, public label: string | InlayHintLabelPart[], public kind?: InlayHintKind) {}
+export class CodeLens {
+  constructor(public range: Range, public command?: any) {}
 }
 
 export enum ProgressLocation {
@@ -98,7 +84,7 @@ export const warningMessages: string[] = []
 export const quickPickCalls: Array<{ items: any[], options?: any }> = []
 export const shownDocuments: Array<{ uri: Uri, options?: any }> = []
 export const providerRegistrations: string[] = []
-export const inlayHintProviders: any[] = []
+export const codeLensProviders: any[] = []
 export const configurationValues = new Map<string, any>()
 
 function disposable(): Disposable {
@@ -119,7 +105,7 @@ export function resetMockState(): void {
   quickPickCalls.length = 0
   shownDocuments.length = 0
   providerRegistrations.length = 0
-  inlayHintProviders.length = 0
+  codeLensProviders.length = 0
   configurationValues.clear()
   workspace.workspaceFolders = []
   window.activeTextEditor = undefined
@@ -142,9 +128,9 @@ export const languages = {
     providerRegistrations.push('reference')
     return disposable()
   },
-  registerInlayHintsProvider: (_selector: any, provider: any) => {
-    providerRegistrations.push('inlayHint')
-    inlayHintProviders.push(provider)
+  registerCodeLensProvider: (_selector: any, provider: any) => {
+    providerRegistrations.push('codeLens')
+    codeLensProviders.push(provider)
     return disposable()
   },
 }

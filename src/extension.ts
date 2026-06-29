@@ -4,10 +4,10 @@ import * as vscode from 'vscode'
 import type { SourceLocation, TextSpan, UsageInfo, VueFileIndex, VueMajorVersion } from './indexer/types'
 import { clearTsConfigCache } from './indexer/relationResolver'
 import { WorkspaceIndex } from './indexer/workspaceIndex'
+import { VueCodeLensProvider } from './providers/codeLensProvider'
 import { VueCompletionProvider } from './providers/completionProvider'
 import { VueDefinitionProvider } from './providers/definitionProvider'
 import { SHOW_USAGES_COMMAND, VueHoverProvider } from './providers/hoverProvider'
-import { VueInlayHintProvider } from './providers/inlayHintProvider'
 import { VueReferenceProvider } from './providers/referenceProvider'
 import { offsetToPosition, spanToRange } from './utils/position'
 import { commonDirectory, relativePath, usagePathLabels } from './utils/pathDisplay'
@@ -208,7 +208,7 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?', '\'', '"'),
       vscode.languages.registerHoverProvider(selector, new VueHoverProvider(index)),
       vscode.languages.registerReferenceProvider(selector, new VueReferenceProvider(index)),
-      vscode.languages.registerInlayHintsProvider([{ language: 'vue', scheme: 'file' }], new VueInlayHintProvider(index)),
+      vscode.languages.registerCodeLensProvider([{ language: 'vue', scheme: 'file' }], new VueCodeLensProvider(index)),
       vscode.workspace.onDidSaveTextDocument((document) => {
         if (document.languageId === 'vue' && document.uri.scheme === 'file') {
           clearPendingSync(document.uri.fsPath)
