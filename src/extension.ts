@@ -21,7 +21,7 @@ type UsageCommandArgs =
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
-  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' }
+  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' | 'hook' }
 
 type PackageDependencies = Record<string, string | undefined> | undefined
 type EntryConfig = string | readonly string[] | undefined
@@ -330,6 +330,12 @@ export function activate(context: vscode.ExtensionContext): void {
         return {
           usages: index.findRefMethodUsagesFromSource(args.sourceUri, args.offset),
           placeHolder: 'Select ref method usage',
+        }
+      }
+      if (args.relation === 'hook') {
+        return {
+          usages: index.findComposableReturnUsagesFromSource(args.sourceUri, args.offset),
+          placeHolder: 'Select hook usage',
         }
       }
       if (args.relation === 'provide') {

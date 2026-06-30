@@ -64,6 +64,7 @@ function emptyScriptIndex(imports: ImportInfo[] = []): ScriptIndex {
     provides: [],
     injects: [],
     vue3PropUsages: [],
+    composableReturnUsages: [],
   }
 }
 

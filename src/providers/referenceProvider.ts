@@ -105,6 +105,7 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
       ...this.index.findRefMethodUsagesFromSource(sourceUri, offset),
       ...this.index.findPropUsagesFromSource(sourceUri, offset),
       ...this.index.findVue3PropTypeUsagesFromSource(sourceUri, offset),
+      ...this.index.findComposableReturnUsagesFromSource(sourceUri, offset),
       ...this.index.findTemplateEventUsagesFromSource(sourceUri, offset),
       ...this.index.findEventBusListenersFromSource(sourceUri, offset),
       ...this.index.findEventBusEmitsFromSource(sourceUri, offset),

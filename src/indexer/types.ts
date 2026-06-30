@@ -157,6 +157,13 @@ export interface Vue3PropUsage {
   span: TextSpan
 }
 
+export interface ComposableReturnUsage {
+  composableName: string
+  name: string
+  span: TextSpan
+  sourceLocation?: SourceLocation
+}
+
 export interface ScriptIndex {
   componentName?: string
   imports: ImportInfo[]
@@ -171,6 +178,7 @@ export interface ScriptIndex {
   injects: InjectInfo[]
   vue3PropType?: Vue3PropTypeInfo
   vue3PropUsages: Vue3PropUsage[]
+  composableReturnUsages: ComposableReturnUsage[]
 }
 
 export interface TemplateAttrUsage {

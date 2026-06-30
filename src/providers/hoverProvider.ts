@@ -20,7 +20,7 @@ type UsageCommandArgs =
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
-  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' }
+  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' | 'hook' }
 
 function definitionLink(file: VueFileIndex, span: TextSpan, label: string, sourceLocation?: SourceLocation): string {
   const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
@@ -524,6 +524,19 @@ export class VueHoverProvider implements vscode.HoverProvider {
         singular: 'ref method',
         plural: 'ref methods',
         commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'method' },
+      })
+      return markdownHover(summary.text, summary.trusted)
+    }
+
+    const hookUsages = this.index.findComposableReturnUsagesFromSource(sourceUri, offset)
+    if (hookUsages.length > 0) {
+      const summary = usageSummary(hookUsages, this.workspaceBaseDirectory(), {
+        noneText: 'No hook usages found.',
+        title: 'Used by',
+        singular: 'hook usage',
+        plural: 'hook usages',
+        commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'hook' },
+        includeContext: false,
       })
       return markdownHover(summary.text, summary.trusted)
     }

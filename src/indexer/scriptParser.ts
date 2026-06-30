@@ -1337,6 +1337,7 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
       provides: [],
       injects: [],
       vue3PropUsages: [],
+      composableReturnUsages: [],
     }
   }
 
@@ -1361,5 +1362,6 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
     provides: parseProvides(content, provideProperty, scriptStart),
     injects: parseInjects(content, injectProperty, scriptStart),
     vue3PropUsages: [],
+    composableReturnUsages: [],
   }
 }

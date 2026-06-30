@@ -1757,6 +1757,163 @@ const onFetchStart = () => {}
     expect(hoverText(listenerHover)).toContain('Definition')
   })
 
+  it('Vue3 hook 返回方法可在源码处 hover 和查找反向引用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-hook-return-usages-'))
+    const hookUri = path.join(root, 'src/pages/channel-verify/hooks/use-verify.ts')
+    const pageUri = path.join(root, 'src/pages/channel-verify/index.vue')
+    const hookContent = `
+const useVerify = () => {
+  const runVerifyWithCode = async (code: string) => {
+    return code
+  }
+
+  const getChannelType = () => 'sms'
+
+  return {
+    runVerifyWithCode,
+    getChannelType,
+  }
+}
+
+export default useVerify
+`
+    const pageContent = `
+<template>
+  <div />
+</template>
+<script setup lang="ts">
+import useVerify from './hooks/use-verify'
+
+const { runVerifyWithCode } = useVerify()
+
+const runTask = (task: (code: string) => Promise<string>, payload: { code: string }) => task(payload.code)
+
+runTask(runVerifyWithCode, { code: 'first' })
+runTask(runVerifyWithCode, { code: 'second' })
+</script>
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(hookUri, hookContent)
+    writeText(pageUri, pageContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const hookDocument = new TestDocument(hookUri, hookContent, 'typescript') as any
+    const methodPosition = positionAt(hookContent, hookContent.indexOf('runVerifyWithCode =') + 1)
+
+    const references = referenceProvider.provideReferences(hookDocument, methodPosition) as any[]
+    const hover = hoverProvider.provideHover(hookDocument, methodPosition) as any
+
+    expect(references).toHaveLength(2)
+    expect(references.map((location) => location.uri.fsPath)).toEqual([pageUri, pageUri])
+    expect(hoverText(hover)).toContain('Used by 2 hook usages')
+    expect(hoverText(hover)).toContain('- [index.vue:')
+    expect(hoverText(hover)).not.toContain('No hook usages found')
+  })
+
+  it('Vue3 hook 返回方法保存后可重建直接导入它的消费文件', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-hook-incremental-'))
+    const hookUri = path.join(root, 'src/hooks/use-verify.ts')
+    const pageUri = path.join(root, 'src/ChannelVerify.vue')
+    const initialHookContent = `
+const useVerify = () => {
+  const runVerifyWithCode = async (code: string) => code
+
+  return {}
+}
+
+export default useVerify
+`
+    const nextHookContent = `
+const useVerify = () => {
+  const runVerifyWithCode = async (code: string) => code
+
+  return {
+    runVerifyWithCode,
+  }
+}
+
+export default useVerify
+`
+    const pageContent = `
+<script setup lang="ts">
+import useVerify from './hooks/use-verify'
+
+const { runVerifyWithCode } = useVerify()
+
+runVerifyWithCode('code')
+</script>
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(hookUri, initialHookContent)
+    writeText(pageUri, pageContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    let referenceProvider = new VueReferenceProvider(localIndex)
+    let hookDocument = new TestDocument(hookUri, initialHookContent, 'typescript') as any
+
+    expect(referenceProvider.provideReferences(hookDocument, positionAt(initialHookContent, initialHookContent.indexOf('runVerifyWithCode =') + 1)) as any[]).toEqual([])
+
+    writeText(hookUri, nextHookContent)
+    await localIndex.syncGlobalComponentFile(hookUri)
+    referenceProvider = new VueReferenceProvider(localIndex)
+    hookDocument = new TestDocument(hookUri, nextHookContent, 'typescript') as any
+
+    const references = referenceProvider.provideReferences(hookDocument, positionAt(nextHookContent, nextHookContent.indexOf('runVerifyWithCode =') + 1)) as any[]
+
+    expect(references).toHaveLength(1)
+    expect(references[0].uri.fsPath).toBe(pageUri)
+  })
+
+  it('Vue3 hook 返回方法不会把后续同名局部变量算成反向引用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-hook-shadow-'))
+    const hookUri = path.join(root, 'src/hooks/use-verify.ts')
+    const pageUri = path.join(root, 'src/ChannelVerify.vue')
+    const hookContent = `
+const useVerify = () => {
+  const runVerifyWithCode = async (code: string) => code
+
+  return {
+    runVerifyWithCode,
+  }
+}
+
+export default useVerify
+`
+    const pageContent = `
+<script setup lang="ts">
+import useVerify from './hooks/use-verify'
+
+const { runVerifyWithCode } = useVerify()
+
+runVerifyWithCode('from-hook')
+
+const runVerifyWithCode = (code: string) => code
+
+runVerifyWithCode('local')
+</script>
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(hookUri, hookContent)
+    writeText(pageUri, pageContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hookDocument = new TestDocument(hookUri, hookContent, 'typescript') as any
+
+    const references = referenceProvider.provideReferences(hookDocument, positionAt(hookContent, hookContent.indexOf('runVerifyWithCode =') + 1)) as any[]
+
+    expect(references).toHaveLength(1)
+    expect(references[0].uri.fsPath).toBe(pageUri)
+  })
+
   it('组件 template 处展示组件用法 CodeLens，单个用法也可点击执行命令', () => {
     const localIndex = new WorkspaceIndex()
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-component-usage-codelens-'))
