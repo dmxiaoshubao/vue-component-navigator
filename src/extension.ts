@@ -18,6 +18,7 @@ type UsageCommandArgs =
   | { kind: 'event-bus-listeners', busName: string, eventName: string }
   | { kind: 'event-bus-emits', busName: string, eventName: string }
   | { kind: 'prop-usages', childUri: string, propName: string }
+  | { kind: 'slot-usages', childUri: string, slotName: string }
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
@@ -72,6 +73,8 @@ export function activate(context: vscode.ExtensionContext): void {
     { language: 'vue', scheme: 'file' },
     { language: 'javascript', scheme: 'file' },
     { language: 'typescript', scheme: 'file' },
+    { language: 'javascriptreact', scheme: 'file' },
+    { language: 'typescriptreact', scheme: 'file' },
   ]
   const pendingSyncTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const featureDisposables: vscode.Disposable[] = []
@@ -363,6 +366,13 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
 
+    if (args.kind === 'slot-usages') {
+      return {
+        usages: index.findTemplateSlotUsages(args.childUri, args.slotName),
+        placeHolder: `Select ${args.slotName} slot usage`,
+      }
+    }
+
     if (args.kind === 'component-usages') {
       const child = index.getFile(args.childUri)
       return {
@@ -481,7 +491,7 @@ export function activate(context: vscode.ExtensionContext): void {
 export function deactivate(): void {}
 
 function isScriptFile(filePath: string): boolean {
-  return filePath.endsWith('.js') || filePath.endsWith('.ts')
+  return filePath.endsWith('.js') || filePath.endsWith('.ts') || filePath.endsWith('.jsx') || filePath.endsWith('.tsx')
 }
 
 function isAliasConfigFile(filePath: string): boolean {

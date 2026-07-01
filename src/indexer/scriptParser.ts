@@ -933,7 +933,7 @@ function collectDataStaticComponentNameBindings(content: string): StaticComponen
   ]
 }
 
-function collectStaticComponentNameBindings(content: string): StaticComponentNameBinding[] {
+export function collectStaticComponentNameBindings(content: string): StaticComponentNameBinding[] {
   return [
     ...collectDataStaticComponentNameBindings(content),
     ...collectStaticVariableComponentNameBindings(content),
@@ -1338,6 +1338,7 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
       injects: [],
       vue3PropUsages: [],
       composableReturnUsages: [],
+      slots: [],
     }
   }
 
@@ -1363,5 +1364,6 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
     injects: parseInjects(content, injectProperty, scriptStart),
     vue3PropUsages: [],
     composableReturnUsages: [],
+    slots: [],
   }
 }

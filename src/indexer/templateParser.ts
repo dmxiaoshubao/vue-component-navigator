@@ -1,4 +1,4 @@
-import type { EmitInfo, EventBusCall, StaticComponentNameBinding, TemplateAttrUsage, TemplateComponentUsage, TemplateIndex } from './types'
+import type { EmitInfo, EventBusCall, SlotInfo, StaticComponentNameBinding, TemplateAttrUsage, TemplateComponentUsage, TemplateIndex, TemplateSlotUsage } from './types'
 import { parseEventBusCalls } from './eventBusParser'
 import { toCamelCase, toKebabCase } from '../utils/casing'
 import { readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
@@ -129,6 +129,106 @@ function extractAttrs(openTag: string, openStart: number, vue3ModelEvents: boole
   return attrs
 }
 
+function normalizeSlotAttr(rawName: string): { name: string, normalizedName: string, semanticOffset: number } | undefined {
+  if (rawName.startsWith('#')) {
+    const name = stripModifier(rawName.slice(1)) || 'default'
+    return { name, normalizedName: name, semanticOffset: 1 }
+  }
+
+  if (rawName === 'v-slot') {
+    return { name: 'default', normalizedName: 'default', semanticOffset: 0 }
+  }
+
+  if (rawName.startsWith('v-slot:')) {
+    const name = stripModifier(rawName.slice('v-slot:'.length)) || 'default'
+    return { name, normalizedName: name, semanticOffset: 'v-slot:'.length }
+  }
+
+  return undefined
+}
+
+function readStaticSlotAttr(openTag: string, openStart: number): TemplateSlotUsage | undefined {
+  const pattern = /\sslot\s*=\s*(["'])([^"']+)\1/
+  const match = pattern.exec(openTag)
+  if (!match) {
+    return undefined
+  }
+
+  const attrStart = openStart + match.index + match[0].indexOf('slot')
+  const valueStart = openStart + match.index + match[0].lastIndexOf(match[2])
+  return {
+    name: match[2],
+    normalizedName: match[2],
+    span: { start: valueStart, end: valueStart + match[2].length },
+    fullSpan: { start: attrStart, end: attrStart + 'slot'.length },
+  }
+}
+
+function extractSlotUsages(openTag: string, openStart: number): TemplateSlotUsage[] {
+  const slots: TemplateSlotUsage[] = []
+  const legacySlot = readStaticSlotAttr(openTag, openStart)
+  if (legacySlot) {
+    slots.push(legacySlot)
+  }
+  const pattern = /\s([#:@A-Za-z_][\w:.-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(openTag))) {
+    const rawName = match[1]
+    const normalized = normalizeSlotAttr(rawName)
+    if (!normalized) {
+      continue
+    }
+
+    const fullStart = openStart + match.index + match[0].indexOf(rawName)
+    const nameStart = fullStart + normalized.semanticOffset
+    const span = normalized.semanticOffset === 0
+      ? { start: fullStart, end: fullStart + rawName.length }
+      : { start: nameStart, end: nameStart + normalized.name.length }
+    slots.push({
+      name: normalized.name,
+      normalizedName: normalized.normalizedName,
+      span,
+      fullSpan: { start: fullStart, end: fullStart + rawName.length },
+    })
+  }
+
+  return slots
+}
+
+function uniqueSlotUsages(slots: TemplateSlotUsage[]): TemplateSlotUsage[] {
+  const seen = new Set<string>()
+  const results: TemplateSlotUsage[] = []
+  for (const slot of slots) {
+    const key = `${slot.normalizedName}\0${slot.span.start}\0${slot.span.end}`
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    results.push(slot)
+  }
+  return results
+}
+
+function extractSlotDefinition(openTag: string, openStart: number): SlotInfo {
+  const nameAttr = /\sname\s*=\s*(["'])([^"']+)\1/.exec(openTag)
+  if (nameAttr) {
+    const valueStart = openStart + nameAttr.index + nameAttr[0].lastIndexOf(nameAttr[2])
+    return {
+      name: nameAttr[2],
+      span: { start: valueStart, end: valueStart + nameAttr[2].length },
+      detail: `<slot name="${nameAttr[2]}">`,
+    }
+  }
+
+  const tagStart = openStart + 1
+  return {
+    name: 'default',
+    span: { start: tagStart, end: tagStart + 'slot'.length },
+    detail: '<slot>',
+  }
+}
+
 function forwardsAttrs(openTag: string): boolean {
   return /\sv-bind\s*=\s*["']\$attrs["']/.test(openTag)
 }
@@ -231,11 +331,152 @@ function findOpenTagEnd(template: string, openStart: number): number {
   return template.length
 }
 
+function isSelfClosingOpenTag(openTag: string): boolean {
+  return /\/\s*>$/.test(openTag)
+}
+
+function findMatchingCloseTag(template: string, tag: string, fromIndex: number): number | undefined {
+  const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const pattern = new RegExp(`<\\/?${escaped}(?=\\s|>|\\/)`, 'g')
+  pattern.lastIndex = fromIndex
+  let depth = 1
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(template))) {
+    if (template.startsWith('<!--', match.index)) {
+      pattern.lastIndex = findHtmlCommentEnd(template, match.index)
+      continue
+    }
+
+    if (template[match.index + 1] === '/') {
+      depth -= 1
+      if (depth === 0) {
+        return match.index
+      }
+      continue
+    }
+
+    const openEnd = findOpenTagEnd(template, match.index)
+    const openTag = template.slice(match.index, openEnd)
+    if (!isSelfClosingOpenTag(openTag)) {
+      depth += 1
+    }
+    pattern.lastIndex = openEnd
+  }
+
+  return undefined
+}
+
+function extractDefaultSlotUsage(template: string, templateStart: number, openEnd: number, closeStart: number): TemplateSlotUsage | undefined {
+  let cursor = openEnd
+  while (cursor < closeStart) {
+    if (template.startsWith('<!--', cursor)) {
+      cursor = findHtmlCommentEnd(template, cursor)
+      continue
+    }
+
+    if (/\s/.test(template[cursor])) {
+      cursor += 1
+      continue
+    }
+
+    if (template[cursor] !== '<') {
+      return {
+        name: 'default',
+        normalizedName: 'default',
+        span: { start: templateStart + cursor, end: templateStart + cursor + 1 },
+        fullSpan: { start: templateStart + cursor, end: templateStart + cursor + 1 },
+      }
+    }
+
+    if (template[cursor + 1] === '/') {
+      return undefined
+    }
+
+    const childOpenEnd = findOpenTagEnd(template, cursor)
+    if (childOpenEnd > closeStart) {
+      return undefined
+    }
+    const childOpenTag = template.slice(cursor, childOpenEnd)
+    const childSlotUsages = extractSlotUsages(childOpenTag, templateStart + cursor)
+    if (childSlotUsages.length === 0) {
+      const tagMatch = /^<([A-Za-z][\w-]*)/.exec(childOpenTag)
+      if (!tagMatch) {
+        return undefined
+      }
+      return {
+        name: 'default',
+        normalizedName: 'default',
+        span: { start: templateStart + cursor + 1, end: templateStart + cursor + 1 + tagMatch[1].length },
+        fullSpan: { start: templateStart + cursor + 1, end: templateStart + cursor + 1 + tagMatch[1].length },
+      }
+    }
+
+    const tagMatch = /^<([A-Za-z][\w-]*)/.exec(childOpenTag)
+    if (!tagMatch || isSelfClosingOpenTag(childOpenTag)) {
+      cursor = childOpenEnd
+      continue
+    }
+    const childCloseStart = findMatchingCloseTag(template, tagMatch[1], childOpenEnd)
+    cursor = childCloseStart !== undefined && childCloseStart < closeStart
+      ? findOpenTagEnd(template, childCloseStart)
+      : childOpenEnd
+  }
+
+  return undefined
+}
+
+function extractComponentSlotUsages(template: string, templateStart: number, rawTag: string, openTag: string, openStart: number, openEnd: number): TemplateSlotUsage[] {
+  const slots = extractSlotUsages(openTag, templateStart + openStart)
+  if (isSelfClosingOpenTag(openTag)) {
+    return slots
+  }
+
+  const closeStart = findMatchingCloseTag(template, rawTag, openEnd)
+  if (closeStart === undefined) {
+    return slots
+  }
+  const defaultSlot = extractDefaultSlotUsage(template, templateStart, openEnd, closeStart)
+  if (defaultSlot) {
+    slots.push(defaultSlot)
+  }
+
+  const nextTemplateStart = template.indexOf('<template', openEnd)
+  const nextSlotMarkerStart = template.indexOf('slot', openEnd)
+  if ((nextTemplateStart === -1 || nextTemplateStart >= closeStart) && (nextSlotMarkerStart === -1 || nextSlotMarkerStart >= closeStart)) {
+    return uniqueSlotUsages(slots)
+  }
+
+  const pattern = /<([A-Za-z][\w-]*)(?=\s|>|\/)/g
+  pattern.lastIndex = openEnd
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(template)) && match.index < closeStart) {
+    const childTag = match[1]
+    const slotOpenEnd = findOpenTagEnd(template, match.index)
+    if (slotOpenEnd > closeStart) {
+      break
+    }
+    slots.push(...extractSlotUsages(template.slice(match.index, slotOpenEnd), templateStart + match.index))
+    if (isSelfClosingOpenTag(template.slice(match.index, slotOpenEnd))) {
+      pattern.lastIndex = slotOpenEnd
+      continue
+    }
+
+    const childCloseStart = findMatchingCloseTag(template, childTag, slotOpenEnd)
+    pattern.lastIndex = childCloseStart !== undefined && childCloseStart < closeStart
+      ? findOpenTagEnd(template, childCloseStart)
+      : slotOpenEnd
+  }
+
+  return uniqueSlotUsages(slots)
+}
+
 export function parseTemplate(content: string, templateStart: number, registeredTags: string[], staticComponentNames: StaticComponentNameBinding[] = [], eventBusNames: readonly string[] = [], vue3ModelEvents = false): TemplateIndex {
   const uniqueTags = new Set(registeredTags.map((tag) => toKebabCase(tag)))
   const components: TemplateComponentUsage[] = []
   const emits: EmitInfo[] = []
   const eventBusCalls: EventBusCall[] = []
+  const slotDefinitions: SlotInfo[] = []
 
   const pattern = /<([A-Za-z][\w-]*)(?=\s|>|\/)/g
   let match: RegExpExecArray | null
@@ -254,6 +495,10 @@ export function parseTemplate(content: string, templateStart: number, registered
     const rawTag = match[1]
     const openEnd = findOpenTagEnd(content, match.index)
     const openTag = content.slice(match.index, openEnd)
+    if (rawTag === 'slot') {
+      slotDefinitions.push(extractSlotDefinition(openTag, templateStart + match.index))
+      continue
+    }
     emits.push(...parseTemplateEmits(openTag, templateStart + match.index))
     eventBusCalls.push(...parseTemplateEventBusCalls(openTag, templateStart + match.index, eventBusNames))
     const dynamicTags = isDynamicComponentTag(rawTag)
@@ -265,6 +510,7 @@ export function parseTemplate(content: string, templateStart: number, registered
     }
 
     const attrs = extractAttrs(openTag, templateStart + match.index, vue3ModelEvents)
+    const slots = extractComponentSlotUsages(content, templateStart, rawTag, openTag, match.index, openEnd)
     components.push({
       tag: rawTag,
       dynamicTags,
@@ -273,13 +519,14 @@ export function parseTemplate(content: string, templateStart: number, registered
         end: templateStart + match.index + 1 + rawTag.length,
       },
       attrs,
+      slots,
       forwardsAttrs: forwardsAttrs(openTag),
       forwardsListeners: forwardsListeners(openTag),
     })
   }
 
   components.sort((a, b) => a.span.start - b.span.start)
-  return { components, emits, eventBusCalls }
+  return { components, emits, eventBusCalls, slots: slotDefinitions }
 }
 
 function isDynamicComponentTag(tag: string): boolean {

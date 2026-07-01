@@ -91,6 +91,12 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
       }
     }
 
+    for (const slot of file.scriptIndex.slots) {
+      if (containsOffsetStrict(slot.span, offset)) {
+        return this.index.findTemplateSlotUsages(file.uri, slot.name).map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
+      }
+    }
+
     for (const provide of file.scriptIndex.provides) {
       if (containsOffsetStrict(provide.keySpan, offset)) {
         return findIndexedInjectUsages(this.index, file.uri, provide.key).map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))

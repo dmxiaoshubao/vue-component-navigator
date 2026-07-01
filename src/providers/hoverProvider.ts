@@ -1,6 +1,6 @@
 import * as path from 'node:path'
 import * as vscode from 'vscode'
-import type { EmitInfo, EventBusCall, MethodInfo, PropInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
+import type { EmitInfo, EventBusCall, MethodInfo, PropInfo, SlotInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
 import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findInject, findMethod, findProp, findProvideAtOffset, findResolvedRefComponents } from '../indexer/relationResolver'
 import { containsOffsetStrict, createLineStarts, offsetToPosition, positionToOffset } from '../utils/position'
@@ -17,6 +17,7 @@ type UsageCommandArgs =
   | { kind: 'event-bus-listeners', busName: string, eventName: string }
   | { kind: 'event-bus-emits', busName: string, eventName: string }
   | { kind: 'prop-usages', childUri: string, propName: string }
+  | { kind: 'slot-usages', childUri: string, slotName: string }
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
@@ -39,6 +40,12 @@ function methodHover(child: VueFileIndex, method: MethodInfo, label: string): vs
   const docs = formatJSDocMarkdown(method.documentation)
   const docText = docs ? `${docs}\n\n` : ''
   return markdownHover(`${docText}${markdownCodeBlock(method.signature)}\n\nDefinition: ${definitionLink(child, method.span, label, method.sourceLocation)}`)
+}
+
+function slotHover(child: VueFileIndex, slot: SlotInfo, label: string): vscode.Hover {
+  const docs = formatJSDocMarkdown(slot.documentation)
+  const docText = docs ? `${docs}\n\n` : ''
+  return markdownHover(`${docText}${markdownCodeBlock(formatCodeBlock(slot.detail))}\n\nDefinition: ${definitionLink(child, slot.span, label, slot.sourceLocation)}`)
 }
 
 function formatCodeBlock(code: string): string {
@@ -277,6 +284,29 @@ function methodDefinitionsHover(definitions: Array<{ child: VueFileIndex, method
   return markdownHover(`Definitions:\n\n${links}`)
 }
 
+function slotDefinitionsHover(definitions: Array<{ child: VueFileIndex, slot: SlotInfo }>, labels: Map<string, string>): vscode.Hover | undefined {
+  const unique = uniqueDefinitions(definitions.map(({ child, slot }) => ({
+    child,
+    slot,
+    span: slot.span,
+    sourceLocation: slot.sourceLocation,
+  })))
+  if (unique.length === 0) {
+    return undefined
+  }
+
+  if (unique.length === 1) {
+    const { child, slot } = unique[0]
+    return slotHover(child, slot, labelForDefinition(labels, child, slot.sourceLocation))
+  }
+
+  const links = unique.map(({ child, slot }) => {
+    const label = labelForDefinition(labels, child, slot.sourceLocation)
+    return `- ${definitionLink(child, slot.span, label, slot.sourceLocation)}`
+  }).join('\n')
+  return markdownHover(`Definitions:\n\n${links}`)
+}
+
 function eventDefinitionsHover(definitions: Array<{ child: VueFileIndex, emit: EmitInfo }>, labels: Map<string, string>): vscode.Hover | undefined {
   const unique = uniqueDefinitions(definitions.map(({ child, emit }) => ({
     child,
@@ -333,6 +363,18 @@ function methodDefinitionHover(index: WorkspaceIndex, child: VueFileIndex, metho
   return markdownHover(summary.text, summary.trusted)
 }
 
+function slotDefinitionHover(index: WorkspaceIndex, child: VueFileIndex, slot: SlotInfo, baseDirectory: string): vscode.Hover {
+  const usages = index.findTemplateSlotUsages(child.uri, slot.name)
+  const summary = usageSummary(usages, baseDirectory, {
+    noneText: 'No slot usages found.',
+    title: 'Used by',
+    singular: 'slot usage',
+    plural: 'slot usages',
+    commandArgs: { kind: 'slot-usages', childUri: child.uri, slotName: slot.name },
+  })
+  return markdownHover(summary.text, summary.trusted)
+}
+
 export class VueHoverProvider implements vscode.HoverProvider {
   constructor(private readonly index: WorkspaceIndex) {}
 
@@ -383,7 +425,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
       return prop ? propHover(file, prop, labelForDefinition(definitionLabels(), file, prop.sourceLocation)) : undefined
     }
 
-    const refAccess = file.vueVersion === 2 ? findRefMethodAccessInFile(file, offset) : undefined
+    const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
       const definitions = findResolvedRefComponents(this.index, file, refAccess.refName).flatMap((childUri) => {
         const child = this.index.getFile(childUri)
@@ -429,6 +471,17 @@ export class VueHoverProvider implements vscode.HoverProvider {
           return eventDefinitionsHover(definitions, definitionLabels())
         }
       }
+
+      for (const slot of component.slots) {
+        if (!containsOffsetStrict(slot.span, offset)) {
+          continue
+        }
+        const definitions = children.flatMap((child) => this.index.findSlotDefinitions(child.uri, slot.normalizedName).map(({ file, slot }) => ({ child: file, slot })))
+        if (definitions.length === 0) {
+          return undefined
+        }
+        return slotDefinitionsHover(definitions, definitionLabels())
+      }
     }
 
     for (const emit of file.scriptIndex.emits) {
@@ -446,6 +499,12 @@ export class VueHoverProvider implements vscode.HoverProvider {
     for (const prop of file.scriptIndex.props) {
       if (containsOffsetStrict(prop.span, offset)) {
         return propDefinitionHover(this.index, file, prop, this.workspaceBaseDirectory())
+      }
+    }
+
+    for (const slot of file.scriptIndex.slots) {
+      if (containsOffsetStrict(slot.span, offset)) {
+        return slotDefinitionHover(this.index, file, slot, this.workspaceBaseDirectory())
       }
     }
 
@@ -588,6 +647,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
       ...file.scriptIndex.props.map((item) => item.sourceLocation?.uri),
       file.scriptIndex.vue3PropType?.sourceLocation?.uri,
       ...file.scriptIndex.methods.map((item) => item.sourceLocation?.uri),
+      ...file.scriptIndex.slots.map((item) => item.sourceLocation?.uri),
       ...file.scriptIndex.emits.map((item) => item.sourceLocation?.uri),
       ...file.scriptIndex.eventBusCalls.map((item) => item.sourceLocation?.uri),
     ]).filter((uri): uri is string => Boolean(uri))

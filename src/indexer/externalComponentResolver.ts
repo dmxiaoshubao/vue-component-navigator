@@ -88,8 +88,9 @@ function parseDtsComponent(uri: string, componentName: string): VueFileIndex | u
       injects: [],
       vue3PropUsages: [],
       composableReturnUsages: [],
+      slots: [],
     },
-    templateIndex: { components: [], emits: [], eventBusCalls: [] },
+    templateIndex: { components: [], emits: [], eventBusCalls: [], slots: [] },
     refMethodCalls: [],
   }
 }

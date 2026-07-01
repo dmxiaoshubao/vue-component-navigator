@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.3.0 - 2026-06-30
+
+### English
+
+#### Added
+
+- Added Vue 3 `defineModel()` / `defineModel('name')` relationships to parent `v-model` / `v-model:name` usages.
+- Added Vue 3 `defineSlots<{ ... }>()` relationships to parent `#name` / `v-slot:name` usages, including definition, hover, and references.
+- Added Vue 3 `defineExpose({ method })` reverse references from exposed methods to parent template-ref calls such as `childRef.value?.open()`.
+- Added Vue 3 static dynamic component map support for `<component :is="componentMap[type]" />`.
+- Added Vue 3 composable / hook return-member reverse references from source definitions to destructured consumer usages.
+- Added Vue 2 slot relationships from child `<slot name="...">` definitions to parent legacy `slot="..."` usages.
+
+#### Improved
+
+- Reused the shared slot usage index for Vue 2 and Vue 3 while keeping their definition sources separate.
+- Improved slot usage parsing so nested component slots are attributed only to their direct parent component.
+- Reduced unnecessary slot scanning for components with no slot-related markers.
+
+### 中文
+
+#### 新增
+
+- 新增 Vue 3 `defineModel()` / `defineModel('name')` 与父组件 `v-model` / `v-model:name` 使用之间的关系。
+- 新增 Vue 3 `defineSlots<{ ... }>()` 与父组件 `#name` / `v-slot:name` 使用之间的关系，支持 definition、hover 和 references。
+- 新增 Vue 3 `defineExpose({ method })` 暴露方法到父组件 `childRef.value?.open()` 这类 template ref 调用的反向引用。
+- 新增 Vue 3 `<component :is="componentMap[type]" />` 静态动态组件 map 支持。
+- 新增 Vue 3 composable / hook 返回成员从源码定义到消费端解构使用的反向引用。
+- 新增 Vue 2 子组件 `<slot name="...">` 定义到父组件 legacy `slot="..."` 使用的关系。
+
+#### 改进
+
+- Vue 2 和 Vue 3 复用统一的 slot usage 索引，同时保持各自的 slot 定义来源独立。
+- 改进 slot 使用解析，嵌套组件的 slot 只归属到它的直接父组件。
+- 减少没有 slot 相关标记的组件上的无用 slot 扫描。
+
 ## 1.2.1 - 2026-06-29
 
 ### English

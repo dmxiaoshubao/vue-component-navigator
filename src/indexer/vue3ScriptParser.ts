@@ -1,7 +1,7 @@
 import fsSync from 'node:fs'
-import type { ComponentRegistration, ImportInfo, InjectInfo, ParsedSfc, PropInfo, ProvideInfo, ScriptIndex, SourceLocation, SfcBlock, TextSpan, Vue3PropTypeInfo, Vue3PropUsage } from './types'
+import type { ComponentRegistration, ImportInfo, InjectInfo, MethodInfo, ParsedSfc, PropInfo, ProvideInfo, ScriptIndex, SlotInfo, SourceLocation, SfcBlock, TextSpan, Vue3PropTypeInfo, Vue3PropUsage } from './types'
 import { parseSfc } from './sfcParser'
-import { parseImports } from './scriptParser'
+import { collectStaticComponentNameBindings, parseImports } from './scriptParser'
 import { resolveImportPathWithExtensions } from './relationResolver'
 import { createLineStarts } from '../utils/position'
 import { findCodeToken, maskStringsAndComments, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
@@ -65,6 +65,7 @@ function emptyScriptIndex(imports: ImportInfo[] = []): ScriptIndex {
     injects: [],
     vue3PropUsages: [],
     composableReturnUsages: [],
+    slots: [],
   }
 }
 
@@ -1237,6 +1238,376 @@ function parseSetupEmits(segment: ScriptSegment | undefined): ScriptIndex['emits
   ]
 }
 
+function parseDefineModelLocalName(content: string, defineIndex: number): { name: string, span: TextSpan } | undefined {
+  const prefix = content.slice(statementBoundaryBefore(content, defineIndex), defineIndex)
+  const match = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)(?:\s*:[\s\S]*?)?\s*=\s*$/.exec(prefix)
+  if (!match) {
+    return undefined
+  }
+  const nameStart = defineIndex - prefix.length + prefix.lastIndexOf(match[1])
+  return { name: match[1], span: { start: nameStart, end: nameStart + match[1].length } }
+}
+
+function parseDefineModelDeclarations(segment: ScriptSegment | undefined): ScriptIndex['emits'] {
+  if (!segment) {
+    return []
+  }
+
+  const emits: ScriptIndex['emits'] = []
+  let index = 0
+
+  while (index < segment.content.length) {
+    const defineIndex = findCodeToken(segment.content, 'defineModel', index)
+    if (defineIndex === -1) {
+      break
+    }
+
+    const open = findCallOpenAfterTypeArguments(segment.content, defineIndex + 'defineModel'.length)
+    if (open === undefined) {
+      index = defineIndex + 'defineModel'.length
+      continue
+    }
+
+    const callEnd = segment.start + findMatchingBracket(segment.content, open) + 1
+    const firstArg = skipTrivia(segment.content, open + 1)
+    const literal = readStringLiteral(segment.content, firstArg)
+    const localName = parseDefineModelLocalName(segment.content, defineIndex)
+    const modelName = literal?.value ?? 'modelValue'
+    const localSpan = localName?.span ?? { start: defineIndex, end: defineIndex + 'defineModel'.length }
+    const eventSpan = literal
+      ? { start: segment.start + literal.start, end: segment.start + literal.end }
+      : { start: segment.start + localSpan.start, end: segment.start + localSpan.end }
+
+    emits.push({
+      eventName: `update:${modelName}`,
+      eventSpan,
+      callSpan: { start: segment.start + defineIndex, end: callEnd },
+    })
+    index = defineIndex + 'defineModel'.length
+  }
+
+  return emits
+}
+
+function parseSetupModels(segment: ScriptSegment | undefined, emits: ScriptIndex['emits']): ScriptIndex['emits'] {
+  const existing = new Set(emits.map((emit) => emit.eventName))
+  return [
+    ...emits,
+    ...parseDefineModelDeclarations(segment).filter((emit) => !existing.has(emit.eventName)),
+  ]
+}
+
+function parseDefineSlots(segment: ScriptSegment | undefined): SlotInfo[] {
+  if (!segment) {
+    return []
+  }
+
+  const slots: SlotInfo[] = []
+  let index = 0
+
+  while (index < segment.content.length) {
+    const defineIndex = findCodeToken(segment.content, 'defineSlots', index)
+    if (defineIndex === -1) {
+      break
+    }
+
+    const genericStart = skipTrivia(segment.content, defineIndex + 'defineSlots'.length)
+    if (segment.content[genericStart] !== '<') {
+      index = defineIndex + 'defineSlots'.length
+      continue
+    }
+    const genericEnd = findMatchingTypeArgument(segment.content, genericStart)
+    if (genericEnd === -1) {
+      break
+    }
+
+    const genericContentStart = skipTrivia(segment.content, genericStart + 1)
+    if (segment.content[genericContentStart] === '{') {
+      const objectEnd = findMatchingBracket(segment.content, genericContentStart)
+      if (skipTrivia(segment.content, objectEnd + 1) === genericEnd) {
+        slots.push(...parseTypeMembers(segment.content, genericContentStart, objectEnd, { uri: '', lineStarts: [] })
+          .map((slot) => ({
+            name: slot.name,
+            span: { start: segment.start + slot.span.start, end: segment.start + slot.span.end },
+            detail: slot.detail,
+            documentation: slot.documentation,
+          })))
+      }
+    }
+
+    index = genericEnd + 1
+  }
+
+  return slots
+}
+
+function readFunctionSignature(content: string, name: string, start: number, end: number): string | undefined {
+  let cursor = skipTrivia(content, start)
+  let asyncPrefix = false
+  const asyncToken = readIdentifier(content, cursor)
+  if (asyncToken?.value === 'async') {
+    asyncPrefix = true
+    cursor = skipTrivia(content, asyncToken.end)
+  }
+
+  const functionToken = readIdentifier(content, cursor)
+  if (functionToken?.value === 'function') {
+    cursor = skipTrivia(content, functionToken.end)
+    const functionName = readIdentifier(content, cursor)
+    if (functionName) {
+      cursor = skipTrivia(content, functionName.end)
+    }
+  }
+
+  if (content[cursor] !== '(' || cursor >= end) {
+    return undefined
+  }
+
+  const paramsEnd = findMatchingBracket(content, cursor)
+  if (paramsEnd >= end) {
+    return undefined
+  }
+  const params = content.slice(cursor, paramsEnd + 1).replace(/\s+/g, ' ')
+  return `${asyncPrefix ? 'async ' : ''}${name}${params}`
+}
+
+function readArrowFunctionSignature(content: string, name: string, start: number, end: number): string | undefined {
+  let cursor = skipTrivia(content, start)
+  let asyncPrefix = false
+  const asyncToken = readIdentifier(content, cursor)
+  if (asyncToken?.value === 'async') {
+    asyncPrefix = true
+    cursor = skipTrivia(content, asyncToken.end)
+  }
+
+  let params = ''
+  if (content[cursor] === '(') {
+    const paramsEnd = findMatchingBracket(content, cursor)
+    params = content.slice(cursor, paramsEnd + 1).replace(/\s+/g, ' ')
+    cursor = skipTrivia(content, paramsEnd + 1)
+  } else {
+    const arg = readIdentifier(content, cursor)
+    if (!arg) {
+      return undefined
+    }
+    params = `(${arg.value})`
+    cursor = skipTrivia(content, arg.end)
+  }
+
+  return content.startsWith('=>', cursor) && cursor < end ? `${asyncPrefix ? 'async ' : ''}${name}${params}` : undefined
+}
+
+function collectLocalFunctionDefinitions(segment: ScriptSegment): Map<string, MethodInfo> {
+  const definitions = new Map<string, MethodInfo>()
+
+  for (let index = 0; index < segment.content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(segment.content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    if (isCodeTokenAt(segment.content, 'function', index)) {
+      const name = readIdentifier(segment.content, skipTrivia(segment.content, index + 'function'.length))
+      if (!name) {
+        continue
+      }
+      const signature = readFunctionSignature(segment.content, name.value, index, segment.content.length) ?? `${name.value}()`
+      definitions.set(name.value, {
+        name: name.value,
+        span: { start: segment.start + name.start, end: segment.start + name.end },
+        detail: signature,
+        signature,
+      })
+      index = name.end
+      continue
+    }
+
+    const declaration = (['const', 'let', 'var'] as const).find((token) => isCodeTokenAt(segment.content, token, index))
+    if (!declaration) {
+      continue
+    }
+
+    const name = readIdentifier(segment.content, skipTrivia(segment.content, index + declaration.length))
+    if (!name) {
+      continue
+    }
+    const equals = findDeclaratorEquals(segment.content, name.end)
+    if (equals === undefined) {
+      continue
+    }
+    const valueStart = skipTrivia(segment.content, equals + 1)
+    const valueEnd = findExpressionEnd(segment.content, valueStart)
+    const signature = readFunctionSignature(segment.content, name.value, valueStart, valueEnd)
+      ?? readArrowFunctionSignature(segment.content, name.value, valueStart, valueEnd)
+    if (!signature) {
+      continue
+    }
+    definitions.set(name.value, {
+      name: name.value,
+      span: { start: segment.start + name.start, end: segment.start + name.end },
+      detail: signature,
+      signature,
+    })
+    index = valueEnd
+  }
+
+  return definitions
+}
+
+function findExpressionEnd(content: string, start: number, end = content.length): number {
+  let index = start
+  let depth = 0
+
+  while (index < end) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped
+      continue
+    }
+
+    const char = content[index]
+    if (char === '(' || char === '[' || char === '{' || char === '<') {
+      depth += 1
+      index += 1
+      continue
+    }
+    if (char === ')' || char === ']' || char === '}' || char === '>') {
+      depth = Math.max(0, depth - 1)
+      index += 1
+      continue
+    }
+    if (depth === 0 && (char === ',' || char === ';' || char === '\n')) {
+      return index
+    }
+    index += 1
+  }
+
+  return end
+}
+
+function parseDefineExposeMethods(segment: ScriptSegment | undefined, uri: string, lineStarts: number[]): MethodInfo[] {
+  if (!segment) {
+    return []
+  }
+
+  const localFunctions = collectLocalFunctionDefinitions(segment)
+  const methods: MethodInfo[] = []
+  let index = 0
+
+  while (index < segment.content.length) {
+    const defineIndex = findCodeToken(segment.content, 'defineExpose', index)
+    if (defineIndex === -1) {
+      break
+    }
+
+    const open = findCallOpenAfterTypeArguments(segment.content, defineIndex + 'defineExpose'.length)
+    if (open === undefined) {
+      index = defineIndex + 'defineExpose'.length
+      continue
+    }
+    const objectStart = skipTrivia(segment.content, open + 1)
+    if (segment.content[objectStart] !== '{') {
+      index = open + 1
+      continue
+    }
+
+    const objectEnd = findMatchingBracket(segment.content, objectStart)
+    let cursor = objectStart + 1
+    while (cursor < objectEnd) {
+      const trivia = readLeadingTypeTrivia(segment.content, cursor)
+      cursor = trivia.cursor
+      if (cursor >= objectEnd) {
+        break
+      }
+      if (segment.content[cursor] === ',') {
+        cursor += 1
+        continue
+      }
+
+      const name = readTypeMemberName(segment.content, cursor)
+      if (!name) {
+        cursor += 1
+        continue
+      }
+
+      const afterName = skipTrivia(segment.content, name.rawEnd ?? name.end)
+      if (segment.content[afterName] === '(') {
+        const memberEnd = findMemberEnd(segment.content, afterName, objectEnd)
+        const publicSpan = { start: segment.start + name.start, end: segment.start + name.end }
+        const signature = readFunctionSignature(segment.content, name.value, afterName, memberEnd) ?? `${name.value}()`
+        methods.push({
+          name: name.value,
+          span: publicSpan,
+          detail: signature,
+          signature,
+          documentation: trivia.documentation,
+        })
+        cursor = memberEnd + 1
+        continue
+      }
+
+      if (segment.content[afterName] === ':') {
+        const valueStart = skipTrivia(segment.content, afterName + 1)
+        const valueName = readIdentifier(segment.content, valueStart)
+        const local = valueName ? localFunctions.get(valueName.value) : undefined
+        if (local) {
+          const publicSpan = { start: segment.start + name.start, end: segment.start + name.end }
+          methods.push({
+            ...local,
+            name: name.value,
+            span: publicSpan,
+            detail: local.detail.replace(new RegExp(`^${escapeRegExp(local.name)}\\b`), name.value),
+            signature: local.signature.replace(new RegExp(`^${escapeRegExp(local.name)}\\b`), name.value),
+            documentation: trivia.documentation,
+            sourceLocation: {
+              uri,
+              lineStarts,
+              span: local.span,
+            },
+          })
+        }
+        cursor = findMemberEnd(segment.content, valueStart, objectEnd) + 1
+        continue
+      }
+
+      const local = localFunctions.get(name.value)
+      if (local) {
+        const publicSpan = { start: segment.start + name.start, end: segment.start + name.end }
+        methods.push({
+          ...local,
+          span: publicSpan,
+          documentation: trivia.documentation ?? local.documentation,
+          sourceLocation: {
+            uri,
+            lineStarts,
+            span: local.span,
+          },
+        })
+      }
+      cursor = findMemberEnd(segment.content, afterName, objectEnd) + 1
+    }
+
+    index = objectEnd + 1
+  }
+
+  return dedupeMethods(methods)
+}
+
+function dedupeMethods(methods: MethodInfo[]): MethodInfo[] {
+  const seen = new Set<string>()
+  const results: MethodInfo[] = []
+  for (const method of methods) {
+    const key = `${method.name}\0${method.span.start}\0${method.span.end}`
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    results.push(method)
+  }
+  return results
+}
+
 function parseProvides(segments: ScriptSegment[], staticKeys: Map<string, StaticKeyInfo>): ProvideInfo[] {
   const provides: ProvideInfo[] = []
   for (const segment of segments) {
@@ -1325,16 +1696,20 @@ export function parseVue3Script(sfc: ParsedSfc, workspaceRoots: string[] = [], c
     : undefined
   const props = resolvedType?.props ?? []
   const staticKeys = parseStaticKeys(sfc.uri, sfc.lineStarts, segments, imports, workspaceRoots, cache)
+  const emits = parseSetupModels(setupSegment, parseSetupEmits(setupSegment))
 
   return {
     ...emptyScriptIndex(imports),
     componentName: parseDefineOptionsName(setupSegment),
     components: parseSetupComponents(sfc.uri, setupSegment, setupImports, workspaceRoots),
+    staticComponentNames: setupSegment ? collectStaticComponentNameBindings(setupSegment.content) : [],
     props,
-    emits: parseSetupEmits(setupSegment),
+    methods: parseDefineExposeMethods(setupSegment, sfc.uri, sfc.lineStarts),
+    emits,
     provides: parseProvides(segments, staticKeys),
     injects: parseInjects(segments, staticKeys),
     vue3PropType: resolvedType?.typeInfo,
     vue3PropUsages: collectVue3PropUsages(defineProps, props, setupSegment, sfc.template),
+    slots: parseDefineSlots(setupSegment),
   }
 }

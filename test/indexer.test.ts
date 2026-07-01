@@ -164,6 +164,52 @@ describe('Vue2 indexer', () => {
     expect(childUsage.attrs.some((attr) => ['class', 'style', 'key', 'v-if'].includes(attr.name))).toBe(false)
   })
 
+  it('支持 Vue2 slot 定义和父组件 slot 使用关系', () => {
+    const index = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-slots-'))
+    const childUri = path.join(root, 'Child.vue')
+    const parentUri = path.join(root, 'Parent.vue')
+
+    index.indexContent(childUri, `
+<template>
+  <section>
+    <slot />
+    <slot name="footer" />
+    <slot name="actionBar" />
+  </section>
+</template>
+<script>
+export default { name: 'Child' }
+</script>
+`)
+    index.indexContent(parentUri, `
+<template>
+  <Child>
+    <Wrapper>
+      <template slot="footer">Nested footer should belong to Wrapper</template>
+    </Wrapper>
+    <template slot = "footer">Footer</template>
+    <button slot = "action-bar">Action</button>
+  </Child>
+</template>
+<script>
+import Child from './Child.vue'
+export default { components: { Child } }
+</script>
+`)
+
+    const child = index.getFile(childUri)!
+    const parent = index.getFile(parentUri)!
+
+    expect(child.scriptIndex.slots.map((slot) => slot.name)).toEqual(['default', 'footer', 'actionBar'])
+    expect(parent.templateIndex.components[0].slots.map((slot) => slot.normalizedName)).toEqual(['default', 'footer', 'action-bar'])
+    expect(index.findTemplateSlotUsages(childUri, 'default')).toHaveLength(1)
+    expect(index.findTemplateSlotUsages(childUri, 'footer')).toHaveLength(1)
+    expect(index.findTemplateSlotUsages(childUri, 'actionBar')).toHaveLength(1)
+    expect(index.findSlotDefinitions(childUri, 'default').map(({ slot }) => slot.name)).toEqual(['default'])
+    expect(index.findSlotDefinitions(childUri, 'action-bar').map(({ slot }) => slot.name)).toEqual(['actionBar'])
+  })
+
   it('支持带修饰符的 template 事件监听', () => {
     const index = new WorkspaceIndex()
     const content = `
@@ -1445,6 +1491,269 @@ const service = inject(injectedServiceKey)
     expect(index.findInjectUsages(providerUri, symbolKey).map((usage) => usage.file.uri)).toEqual([consumerUri])
   })
 
+  it('支持 Vue3 defineModel、defineSlots、动态组件静态 map 和 defineExpose 反查索引', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-component-relations-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const userUri = path.join(root, 'src/UserPanel.vue')
+    const orderUri = path.join(root, 'src/OrderPanel.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<template><section /></template>
+<script setup lang="ts">
+defineModel<boolean>('visible')
+const modelValue = defineModel<string>()
+
+defineSlots<{
+  footer?: () => any
+  default?: () => any
+}>()
+
+function open() {}
+const close = () => {}
+
+defineExpose({ open, close })
+</script>
+`)
+    writeText(userUri, '<template><div /></template><script setup lang="ts"></script>')
+    writeText(orderUri, '<template><div /></template><script setup lang="ts"></script>')
+    writeText(parentUri, `
+<template>
+  <Child ref="childRef" v-model:visible="visible" v-model="title">
+    <UserPanel>
+      <template #footer>Nested footer should belong to UserPanel</template>
+    </UserPanel>
+    <template #footer>Footer</template>
+  </Child>
+  <component :is="componentMap[type]" />
+</template>
+<script setup lang="ts">
+import { ref } from 'vue'
+import Child from './Child.vue'
+import UserPanel from './UserPanel.vue'
+import OrderPanel from './OrderPanel.vue'
+
+const visible = ref(false)
+const title = ref('')
+const type = ref<'user' | 'order'>('user')
+const childRef = ref<InstanceType<typeof Child>>()
+const componentMap = {
+  user: UserPanel,
+  order: OrderPanel,
+}
+
+childRef.value?.open()
+childRef.value?.close()
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const child = index.getFile(childUri)!
+    const parent = index.getFile(parentUri)!
+
+    expect(child.scriptIndex.emits.map((emit) => emit.eventName).sort()).toEqual(['update:modelValue', 'update:visible'])
+    expect(index.findTemplateEventUsages(childUri, 'update:visible')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(childUri, 'update:modelValue')).toHaveLength(1)
+    expect(child.scriptIndex.slots.map((slot) => slot.name)).toEqual(['footer', 'default'])
+    expect(index.findTemplateSlotUsages(childUri, 'footer')).toHaveLength(1)
+    expect(child.scriptIndex.methods.map((method) => method.name).sort()).toEqual(['close', 'open'])
+    expect(index.findRefMethodUsages(childUri, 'open')).toHaveLength(1)
+    expect(index.findRefMethodUsages(childUri, 'close')).toHaveLength(1)
+    expect(parent.templateIndex.components.find((component) => component.tag === 'component')?.dynamicTags?.sort()).toEqual(['OrderPanel', 'UserPanel'])
+    expect(index.findComponentUsages(userUri)).toHaveLength(2)
+    expect(index.findComponentUsages(orderUri)).toHaveLength(1)
+  })
+
+  it('支持 Vue3 template slot 定义、defineExpose public 成员和 TSX 命令式 ref 调用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-template-slots-expose-tsx-'))
+    const buttonUri = path.join(root, 'src/components/common-button/index.vue')
+    const dialogUri = path.join(root, 'src/pages/components/coin-out-dialog/index.vue')
+    const parentUri = path.join(root, 'src/pages/home/index.vue')
+    const commandUri = path.join(root, 'src/pages/components/coin-out-dialog/command.tsx')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(buttonUri, `
+<template>
+  <button>
+    <slot name="left-icon"></slot>
+    <slot />
+  </button>
+</template>
+<script setup lang="ts">
+const reset = () => {}
+
+defineExpose({
+  reset,
+})
+</script>
+`)
+    writeText(dialogUri, `
+<template><section /></template>
+<script setup lang="ts">
+type CoinOutOptions = { coinNum: number }
+
+defineExpose({
+  open(props: CoinOutOptions) {
+    return props.coinNum
+  },
+})
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <CommonButton ref="buttonRef">
+    <template #left-icon>
+      <i />
+    </template>
+  </CommonButton>
+</template>
+<script setup lang="ts">
+import { ref, useTemplateRef } from 'vue'
+import CommonButton from '../../components/common-button/index.vue'
+
+const buttonRef = ref<InstanceType<typeof CommonButton>>()
+const templateButton = useTemplateRef<InstanceType<typeof CommonButton>>('buttonRef')
+
+buttonRef.value?.reset()
+templateButton.value?.reset()
+</script>
+`)
+    writeText(commandUri, `
+import type { App } from 'vue'
+import { createApp, h } from 'vue'
+import CoinOutDialog from './index.vue'
+
+class CoinOutDialogManager {
+  private app: App<Element> | null = null
+  private container: HTMLElement | null = null
+  private instance: { open: (options: { coinNum: number }) => number } | null = null
+
+  public create() {
+    this.app = createApp({
+      render() {
+        return h(CoinOutDialog, {
+          ref: 'dialogRef',
+        })
+      },
+    })
+    const vm = this.app.mount(this.container!)
+    this.instance = vm.$refs.dialogRef as { open: (options: { coinNum: number }) => number }
+
+    return this.instance.open({ coinNum: 1 })
+  }
+}
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const button = index.getFile(buttonUri)!
+    const command = index.getFile(commandUri)!
+
+    expect(button.scriptIndex.slots.map((slot) => slot.name)).toEqual(['left-icon', 'default'])
+    expect(index.findTemplateSlotUsages(buttonUri, 'left-icon').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findRefMethodUsages(buttonUri, 'reset').map((usage) => usage.file.uri).sort()).toEqual([parentUri, parentUri])
+    expect(index.findRefMethodUsagesFromSource(buttonUri, button.content.indexOf('const reset') + 'const '.length).map((usage) => usage.file.uri).sort()).toEqual([parentUri, parentUri])
+    expect(command).toBeTruthy()
+    expect(index.resolveRefComponent(command, 'dialogRef')).toBe(dialogUri)
+    expect(index.findRefMethodUsages(dialogUri, 'open').map((usage) => usage.file.uri)).toEqual([commandUri])
+  })
+
+  it('Vue3 TSX 命令式 ref 索引在保存和删除后会清理旧关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-tsx-ref-cleanup-'))
+    const dialogUri = path.join(root, 'src/Dialog.vue')
+    const commandUri = path.join(root, 'src/command.tsx')
+    const commandContent = `
+import { h } from 'vue'
+import Dialog from './Dialog.vue'
+
+export function renderDialog(vm: any) {
+  h(Dialog, { ref: 'dialogRef' })
+  const instance = vm.$refs.dialogRef
+  instance.open()
+}
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(dialogUri, `
+<template><div /></template>
+<script setup lang="ts">
+defineExpose({
+  open() {},
+})
+</script>
+`)
+    writeText(commandUri, commandContent)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findRefMethodUsages(dialogUri, 'open').map((usage) => usage.file.uri)).toEqual([commandUri])
+
+    writeText(commandUri, 'export const stable = true\n')
+    await index.syncGlobalComponentFile(commandUri)
+
+    expect(index.getFile(commandUri)).toBeUndefined()
+    expect(index.findRefMethodUsages(dialogUri, 'open')).toEqual([])
+
+    writeText(commandUri, commandContent)
+    await index.syncGlobalComponentFile(commandUri)
+    expect(index.findRefMethodUsages(dialogUri, 'open').map((usage) => usage.file.uri)).toEqual([commandUri])
+
+    fs.unlinkSync(commandUri)
+    await index.syncGlobalComponentFile(commandUri)
+
+    expect(index.getFile(commandUri)).toBeUndefined()
+    expect(index.findRefMethodUsages(dialogUri, 'open')).toEqual([])
+
+    writeText(commandUri, commandContent)
+    await index.syncGlobalComponentFile(commandUri)
+    expect(index.findRefMethodUsages(dialogUri, 'open').map((usage) => usage.file.uri)).toEqual([commandUri])
+
+    await index.removeGlobalComponentFile(commandUri)
+
+    expect(index.getFile(commandUri)).toBeUndefined()
+    expect(index.findRefMethodUsages(dialogUri, 'open')).toEqual([])
+  })
+
+  it('Vue3 useTemplateRef 换行声明可识别且注释不会产生 ref 方法误绑定', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-template-ref-comment-'))
+    const numberPadUri = path.join(root, 'src/NumberPad.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(numberPadUri, `
+<template><div /></template>
+<script setup lang="ts">
+defineExpose({
+  resetInput() {},
+})
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <NumberPad ref="numberPadRef" />
+</template>
+<script setup lang="ts">
+import { ref, useTemplateRef } from 'vue'
+import NumberPad from './NumberPad.vue'
+
+// const fakeRef = useTemplateRef<InstanceType<typeof NumberPad>>('numberPadRef')
+const fakeRef = ref()
+fakeRef.value?.resetInput()
+const numberPadRef =
+  useTemplateRef<InstanceType<typeof NumberPad>>('numberPadRef')
+numberPadRef.value?.resetInput()
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findRefMethodUsages(numberPadUri, 'resetInput').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
   it('支持 Vue3 v-bind $attrs 透传的模板事件关系', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-forwarded-attrs-'))
     const childUri = path.join(root, 'src/PositiveScan.vue')
@@ -1602,6 +1911,135 @@ export const serviceKey = {}
     expect(afterConsumer.scriptIndex.injects).toEqual([])
     expect(index.findInjectUsages(providerUri, symbolKey)).toEqual([])
     expect(index.hasVue3Source(keyUri)).toBe(false)
+  })
+
+  it('Vue2 全局组件与 require.context 结果不变时不会重建已索引 Vue 文件', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-stable-global-refresh-'))
+    const registerUri = path.join(root, 'src/register.js')
+    const autoUri = path.join(root, 'src/auto-components.js')
+    const childUri = path.join(root, 'src/components/AutoChild.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+
+    writeText(registerUri, `
+import AutoChild from './components/AutoChild.vue'
+Vue.component(AutoChild.name, AutoChild)
+`)
+    writeText(autoUri, `
+const files = require.context('./components', true, /\\.vue$/)
+files.keys().forEach((key) => Vue.component(files(key).default.name, files(key).default))
+`)
+    writeText(childUri, `
+<template><div /></template>
+<script>
+export default {
+  name: 'AutoChild',
+  props: { title: String },
+}
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <AutoChild title="hello" />
+</template>
+<script>
+export default {}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root)
+    const beforeParent = index.getFile(parentUri)!
+
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+
+    writeText(autoUri, `
+const files = require.context('./components', true, /\\.vue$/)
+// 保存注册文件但 require.context 结果不变
+files.keys().forEach((key) => Vue.component(files(key).default.name, files(key).default))
+`)
+    await index.syncGlobalComponentFile(autoUri)
+
+    expect(index.getFile(parentUri)).toBe(beforeParent)
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+
+    writeText(registerUri, `
+import AutoChild from './components/AutoChild.vue'
+// 保存普通全局注册文件但解析结果不变
+Vue.component(AutoChild.name, AutoChild)
+`)
+    await index.syncGlobalComponentFile(registerUri)
+
+    expect(index.getFile(parentUri)).toBe(beforeParent)
+    expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+  })
+
+  it('Vue2 EventBus 名称变化时仍会重建已索引 Vue 文件', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-eventbus-refresh-'))
+    const mainUri = path.join(root, 'src/main.js')
+    const usageUri = path.join(root, 'src/EventBusUsage.vue')
+
+    writeText(mainUri, 'Vue.prototype.$bus = new Vue()\n')
+    writeText(usageUri, `
+<template><div /></template>
+<script>
+export default {
+  mounted() {
+    this.$eventBus.$emit('ready')
+  },
+}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root)
+    const beforeUsage = index.getFile(usageUri)!
+
+    expect(index.getEventBusNames()).toEqual(['$bus'])
+    expect(index.findEventBusEmits('$eventBus', 'ready')).toHaveLength(0)
+
+    writeText(mainUri, 'Vue.prototype.$eventBus = new Vue()\n')
+    await index.syncGlobalComponentFile(mainUri)
+
+    expect(index.getFile(usageUri)).not.toBe(beforeUsage)
+    expect(index.getEventBusNames()).toEqual(['$eventBus'])
+    expect(index.findEventBusEmits('$eventBus', 'ready')).toHaveLength(1)
+  })
+
+  it('Vue2 跨 workspace import 的 EventBus 注册文件保存后仍会保留关系', async () => {
+    const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-eventbus-app-'))
+    const sharedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-eventbus-shared-'))
+    const busUri = path.join(sharedRoot, 'src/bus.js')
+    const appMainUri = path.join(appRoot, 'src/main.js')
+    const usageUri = path.join(appRoot, 'src/EventBusUsage.vue')
+    const relativeBusImport = path.relative(path.dirname(appMainUri), busUri).replace(/\\/g, '/')
+
+    writeText(busUri, 'Vue.prototype.$sharedBus = new Vue()\n')
+    writeText(appMainUri, `import '${relativeBusImport}'\n`)
+    writeText(usageUri, `
+<template><div /></template>
+<script>
+export default {
+  mounted() {
+    this.$sharedBus.$emit('ready')
+  },
+}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(sharedRoot)
+    await index.indexWorkspace(appRoot)
+    const beforeUsage = index.getFile(usageUri)!
+
+    expect(index.getEventBusNames()).toEqual(['$sharedBus'])
+    expect(index.findEventBusEmits('$sharedBus', 'ready')).toHaveLength(1)
+
+    writeText(busUri, '// shared bus comment changed\nVue.prototype.$sharedBus = new Vue()\n')
+    await index.syncGlobalComponentFile(busUri)
+
+    expect(index.getEventBusNames()).toEqual(['$sharedBus'])
+    expect(index.findEventBusEmits('$sharedBus', 'ready')).toHaveLength(1)
+    expect(index.getFile(usageUri)).toBe(beforeUsage)
   })
 
   it('混合 workspace 刷新 Event Bus 时不会扫描 Vue3 root', async () => {

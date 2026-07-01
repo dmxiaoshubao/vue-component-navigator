@@ -84,6 +84,7 @@ export const warningMessages: string[] = []
 export const quickPickCalls: Array<{ items: any[], options?: any }> = []
 export const shownDocuments: Array<{ uri: Uri, options?: any }> = []
 export const providerRegistrations: string[] = []
+export const providerSelectors: any[] = []
 export const codeLensProviders: any[] = []
 export const configurationValues = new Map<string, any>()
 
@@ -105,6 +106,7 @@ export function resetMockState(): void {
   quickPickCalls.length = 0
   shownDocuments.length = 0
   providerRegistrations.length = 0
+  providerSelectors.length = 0
   codeLensProviders.length = 0
   configurationValues.clear()
   workspace.workspaceFolders = []
@@ -112,24 +114,29 @@ export function resetMockState(): void {
 }
 
 export const languages = {
-  registerDefinitionProvider: () => {
+  registerDefinitionProvider: (selector: any) => {
     providerRegistrations.push('definition')
+    providerSelectors.push(selector)
     return disposable()
   },
-  registerCompletionItemProvider: () => {
+  registerCompletionItemProvider: (selector: any) => {
     providerRegistrations.push('completion')
+    providerSelectors.push(selector)
     return disposable()
   },
-  registerHoverProvider: () => {
+  registerHoverProvider: (selector: any) => {
     providerRegistrations.push('hover')
+    providerSelectors.push(selector)
     return disposable()
   },
-  registerReferenceProvider: () => {
+  registerReferenceProvider: (selector: any) => {
     providerRegistrations.push('reference')
+    providerSelectors.push(selector)
     return disposable()
   },
-  registerCodeLensProvider: (_selector: any, provider: any) => {
+  registerCodeLensProvider: (selector: any, provider: any) => {
     providerRegistrations.push('codeLens')
+    providerSelectors.push(selector)
     codeLensProviders.push(provider)
     return disposable()
   },

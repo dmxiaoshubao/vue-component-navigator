@@ -164,6 +164,14 @@ export interface ComposableReturnUsage {
   sourceLocation?: SourceLocation
 }
 
+export interface SlotInfo {
+  name: string
+  span: TextSpan
+  detail: string
+  documentation?: string
+  sourceLocation?: SourceLocation
+}
+
 export interface ScriptIndex {
   componentName?: string
   imports: ImportInfo[]
@@ -179,6 +187,7 @@ export interface ScriptIndex {
   vue3PropType?: Vue3PropTypeInfo
   vue3PropUsages: Vue3PropUsage[]
   composableReturnUsages: ComposableReturnUsage[]
+  slots: SlotInfo[]
 }
 
 export interface TemplateAttrUsage {
@@ -194,14 +203,23 @@ export interface TemplateComponentUsage {
   dynamicTags?: string[]
   span: TextSpan
   attrs: TemplateAttrUsage[]
+  slots: TemplateSlotUsage[]
   forwardsAttrs?: boolean
   forwardsListeners?: boolean
+}
+
+export interface TemplateSlotUsage {
+  name: string
+  normalizedName: string
+  span: TextSpan
+  fullSpan: TextSpan
 }
 
 export interface TemplateIndex {
   components: TemplateComponentUsage[]
   emits: EmitInfo[]
   eventBusCalls: EventBusCall[]
+  slots: SlotInfo[]
 }
 
 export interface VueFileIndex {

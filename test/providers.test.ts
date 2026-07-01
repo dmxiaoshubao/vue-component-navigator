@@ -853,6 +853,62 @@ export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
     expect(hover.contents.isTrusted).toBe(false)
   })
 
+  it('Vue2 slot 定义和使用的 definition、hover、reference 可用', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-slot-providers-'))
+    const childUri = path.join(root, 'Child.vue')
+    const parentUri = path.join(root, 'Parent.vue')
+    const childContent = `
+<template>
+  <section>
+    <slot />
+    <slot name="footer" />
+  </section>
+</template>
+<script>
+export default { name: 'Child' }
+</script>
+`
+    const parentContent = `
+<template>
+  <Child>
+    <span>Default</span>
+    <template slot="footer">Footer</template>
+  </Child>
+</template>
+<script>
+import Child from './Child.vue'
+export default { components: { Child } }
+</script>
+`
+
+    localIndex.indexContent(childUri, childContent)
+    localIndex.indexContent(parentUri, parentContent)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const childDocument = new TestDocument(childUri, childContent) as any
+    const parentDocument = new TestDocument(parentUri, parentContent) as any
+
+    const slotDefinitionOffset = childContent.indexOf('footer') + 1
+    const defaultSlotDefinitionOffset = childContent.indexOf('<slot />') + '<'.length + 1
+    const defaultSlotUsageOffset = parentContent.indexOf('<span>') + '<'.length + 1
+    const slotUsageOffset = parentContent.indexOf('slot="footer"') + 'slot="'.length + 1
+    const references = referenceProvider.provideReferences(childDocument, positionAt(childContent, slotDefinitionOffset)) as any[]
+    const defaultReferences = referenceProvider.provideReferences(childDocument, positionAt(childContent, defaultSlotDefinitionOffset)) as any[]
+    const definition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, slotUsageOffset)) as any
+    const defaultDefinition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, defaultSlotUsageOffset)) as any
+    const hover = hoverProvider.provideHover(childDocument, positionAt(childContent, slotDefinitionOffset)) as any
+    const defaultHover = hoverProvider.provideHover(childDocument, positionAt(childContent, defaultSlotDefinitionOffset)) as any
+
+    expect(references.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(defaultReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(definition.uri.fsPath).toBe(childUri)
+    expect(defaultDefinition.uri.fsPath).toBe(childUri)
+    expect(hoverText(hover)).toContain('Used by 1 slot usage')
+    expect(hoverText(defaultHover)).toContain('Used by 1 slot usage')
+  })
+
   it('provide 和 inject 支持双向定义、悬浮和引用', () => {
     const providerUri = path.join(fixtureRoot, 'ProvideSource.vue')
     const consumerUri = path.join(fixtureRoot, 'InjectConsumer.vue')
@@ -1418,6 +1474,190 @@ const onConfirm = () => {}
     expect(hoverText(propHover)).toContain('Used by 3 prop usages')
     expect(typeDefinition.uri.fsPath).toBe(typeUri)
     expect(eventDefinition.map((location) => location.uri.fsPath)).toEqual([childUri])
+  })
+
+  it('Vue3 defineModel、defineSlots 和 defineExpose 的 provider 关系可用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-component-contract-providers-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const childContent = `
+<template><section /></template>
+<script setup lang="ts">
+defineModel<boolean>('visible')
+
+defineSlots<{
+  footer?: () => any
+}>()
+
+function open() {}
+
+defineExpose({ open })
+</script>
+`
+    const parentContent = `
+<template>
+  <Child ref="childRef" v-model:visible="visible">
+    <template #footer>Footer</template>
+  </Child>
+</template>
+<script setup lang="ts">
+import { ref } from 'vue'
+import Child from './Child.vue'
+
+const visible = ref(false)
+const childRef = ref<InstanceType<typeof Child>>()
+
+childRef.value?.open()
+</script>
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, childContent)
+    writeText(parentUri, parentContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const childDocument = new TestDocument(childUri, childContent) as any
+    const parentDocument = new TestDocument(parentUri, parentContent) as any
+
+    const modelReferences = referenceProvider.provideReferences(childDocument, positionAt(childContent, childContent.indexOf("'visible'") + 1)) as any[]
+    const modelDefinition = asArray(definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('v-model:visible') + 'v-model:'.length + 1)) as any)
+    const slotReferences = referenceProvider.provideReferences(childDocument, positionAt(childContent, childContent.indexOf('footer') + 1)) as any[]
+    const slotDefinition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('#footer') + 1)) as any
+    const slotHover = hoverProvider.provideHover(childDocument, positionAt(childContent, childContent.indexOf('footer') + 1)) as any
+    const exposeReferences = referenceProvider.provideReferences(childDocument, positionAt(childContent, childContent.indexOf('open()') + 1)) as any[]
+    const exposeHover = hoverProvider.provideHover(childDocument, positionAt(childContent, childContent.indexOf('open()') + 1)) as any
+
+    expect(modelReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(modelDefinition.map((location) => location.uri.fsPath)).toEqual([childUri])
+    expect(slotReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(slotDefinition.uri.fsPath).toBe(childUri)
+    expect(hoverText(slotHover)).toContain('Used by 1 slot usage')
+    expect(exposeReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(hoverText(exposeHover)).toContain('Used by 1 ref method')
+  })
+
+  it('Vue3 template slot、useTemplateRef 泛型和 TSX 命令式 ref 的 provider 关系可用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-real-ref-provider-'))
+    const buttonUri = path.join(root, 'src/components/common-button/index.vue')
+    const numberPadUri = path.join(root, 'src/pages/components/number-pad/index.vue')
+    const dialogUri = path.join(root, 'src/pages/components/coin-out-dialog/index.vue')
+    const parentUri = path.join(root, 'src/pages/home/components/member-store-take-coin-dialog/index.vue')
+    const commandUri = path.join(root, 'src/pages/components/coin-out-dialog/command.tsx')
+
+    const buttonContent = `
+<template>
+  <button>
+    <slot name="left-icon"></slot>
+  </button>
+</template>
+<script setup lang="ts">
+const reset = () => {}
+
+defineExpose({
+  reset,
+})
+</script>
+`
+    const numberPadContent = `
+<template><div /></template>
+<script setup lang="ts">
+defineExpose({
+  resetInput() {},
+})
+</script>
+`
+    const dialogContent = `
+<template><section /></template>
+<script setup lang="ts">
+type CoinOutOptions = { coinNum: number }
+
+defineExpose({
+  open(props: CoinOutOptions) {
+    return props.coinNum
+  },
+})
+</script>
+`
+    const parentContent = `
+<template>
+  <CommonButton ref="buttonRef">
+    <template #left-icon>
+      <i />
+    </template>
+  </CommonButton>
+  <NumberPad ref="numberPadRef" />
+</template>
+<script setup lang="ts">
+import { ref, useTemplateRef } from 'vue'
+import CommonButton from '../../../../components/common-button/index.vue'
+import NumberPad from '../../../components/number-pad/index.vue'
+
+const buttonRef = ref<InstanceType<typeof CommonButton>>()
+const numberPadRef = useTemplateRef<InstanceType<typeof NumberPad>>('numberPadRef')
+
+buttonRef.value?.reset()
+numberPadRef.value?.resetInput()
+</script>
+`
+    const commandContent = `
+import type { App } from 'vue'
+import { createApp, h } from 'vue'
+import CoinOutDialog from './index.vue'
+
+class CoinOutDialogManager {
+  private app: App<Element> | null = null
+  private container: HTMLElement | null = null
+  private instance: { open: (options: { coinNum: number }) => number } | null = null
+
+  public create() {
+    this.app = createApp({
+      render() {
+        return h(CoinOutDialog, {
+          ref: 'dialogRef',
+        })
+      },
+    })
+    const vm = this.app.mount(this.container!)
+    this.instance = vm.$refs.dialogRef as { open: (options: { coinNum: number }) => number }
+
+    return this.instance.open({ coinNum: 1 })
+  }
+}
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(buttonUri, buttonContent)
+    writeText(numberPadUri, numberPadContent)
+    writeText(dialogUri, dialogContent)
+    writeText(parentUri, parentContent)
+    writeText(commandUri, commandContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const buttonDocument = new TestDocument(buttonUri, buttonContent) as any
+    const parentDocument = new TestDocument(parentUri, parentContent) as any
+    const commandDocument = new TestDocument(commandUri, commandContent, 'typescriptreact') as any
+
+    const slotReferences = referenceProvider.provideReferences(buttonDocument, positionAt(buttonContent, buttonContent.indexOf('left-icon') + 1)) as any[]
+    const exposeReferences = referenceProvider.provideReferences(buttonDocument, positionAt(buttonContent, buttonContent.indexOf('reset,') + 1)) as any[]
+    const exposeHover = hoverProvider.provideHover(buttonDocument, positionAt(buttonContent, buttonContent.indexOf('reset,') + 1)) as any
+    const resetDefinition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('reset()') + 1)) as any
+    const resetInputDefinition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('resetInput()') + 1)) as any
+    const commandDefinition = definitionProvider.provideDefinition(commandDocument, positionAt(commandContent, commandContent.indexOf('open({') + 1)) as any
+
+    expect(slotReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(exposeReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(hoverText(exposeHover)).toContain('Used by 1 ref method')
+    expect(resetDefinition.uri.fsPath).toBe(buttonUri)
+    expect(resetInputDefinition.uri.fsPath).toBe(numberPadUri)
+    expect(commandDefinition.uri.fsPath).toBe(dialogUri)
   })
 
   it('Vue3 provide/inject 支持带泛型的静态字符串 key', async () => {

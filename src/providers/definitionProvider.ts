@@ -84,7 +84,7 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
       return prop ? toLocation(file, prop.span, prop.sourceLocation) : undefined
     }
 
-    const refAccess = file.vueVersion === 2 ? findRefMethodAccessInFile(file, offset) : undefined
+    const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
       const definitions = uniqueLocations(findResolvedRefComponents(this.index, file, refAccess.refName).flatMap((childUri) => {
         const child = this.index.getFile(childUri)
@@ -132,6 +132,17 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
               .map(({ file, emit }) => toLocation(file, emit.eventSpan, emit.sourceLocation))
           }))
         }
+      }
+
+      for (const slot of component.slots) {
+        if (!containsOffsetStrict(slot.span, offset)) {
+          continue
+        }
+        const definitions = children.flatMap((child) => {
+          return this.index.findSlotDefinitions(child.uri, slot.normalizedName)
+            .map(({ file, slot }) => toLocation(file, slot.span, slot.sourceLocation))
+        })
+        return locationResult(uniqueLocations(definitions))
       }
     }
 
