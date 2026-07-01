@@ -23,6 +23,7 @@ interface ReturnedMember {
 interface DestructuredComposableMember {
   name: string
   localName: string
+  nameSpan: TextSpan
 }
 
 type ComposableReturnDefinitions = Map<string, Map<string, ComposableReturnDefinition>>
@@ -81,6 +82,12 @@ export function parseComposableReturnUsages(uri: string, sfc: ParsedSfc, imports
           if (definition) {
             definitionsByLocalName.set(member.localName, definition)
             returnedNameByLocalName.set(member.localName, member.name)
+            results.push({
+              composableName: imported.localName,
+              name: member.name,
+              span: shiftSpan(member.nameSpan, segment.start),
+              sourceLocation: definition.sourceLocation,
+            })
           }
         }
 
@@ -444,7 +451,7 @@ function parseDestructuredMembers(content: string, masked: string, objectStart: 
       }
     }
 
-    members.push({ name: name.value, localName })
+    members.push({ name: name.value, localName, nameSpan: { start: name.start, end: name.end } })
     cursor = findTopLevelCommaOrEnd(masked, name.end, objectEnd)
   }
 

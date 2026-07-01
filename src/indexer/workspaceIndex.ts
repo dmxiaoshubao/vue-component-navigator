@@ -2923,6 +2923,14 @@ function hasVue3StandaloneScriptRelations(content: string): boolean {
     || content.includes('$refs')
     || content.includes('useTemplateRef')
     || /\bh\s*\(/.test(content)
+    || hasComposableReturnUsageShape(content)
+}
+
+function hasComposableReturnUsageShape(content: string): boolean {
+  const searchableContent = maskStringsAndComments(content)
+  // 新增普通脚本文件可能只消费 hook 返回成员，也需要进入 Vue3 关系索引。
+  return /\bimport\b/.test(searchableContent)
+    && /\b(?:const|let|var)\s*\{[\s\S]*?\}\s*=\s*[A-Za-z_$][\w$]*\s*\(/.test(searchableContent)
 }
 
 function isInsideDirectory(file: string, directory: string): boolean {

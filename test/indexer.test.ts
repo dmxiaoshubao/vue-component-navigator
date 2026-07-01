@@ -1717,6 +1717,44 @@ defineExpose({
     expect(index.findRefMethodUsages(dialogUri, 'open')).toEqual([])
   })
 
+  it('Vue3 新增普通脚本消费文件会参与 hook 返回成员反向引用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-hook-new-script-consumer-'))
+    const hookUri = path.join(root, 'src/hooks/use-verify.ts')
+    const consumerUri = path.join(root, 'src/verify-command.ts')
+    const hookContent = `
+const useVerify = () => {
+  const runVerifyWithCode = async (code: string) => code
+
+  return {
+    runVerifyWithCode,
+  }
+}
+
+export default useVerify
+`
+    const consumerContent = `
+import useVerify from './hooks/use-verify'
+
+const { runVerifyWithCode } = useVerify()
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(hookUri, hookContent)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    const sourceOffset = hookContent.indexOf('runVerifyWithCode =') + 1
+    expect(index.findComposableReturnUsagesFromSource(hookUri, sourceOffset)).toEqual([])
+
+    writeText(consumerUri, consumerContent)
+    await index.syncGlobalComponentFile(consumerUri)
+
+    const usages = index.findComposableReturnUsagesFromSource(hookUri, sourceOffset)
+    expect(usages).toHaveLength(1)
+    expect(usages[0].file.uri).toBe(consumerUri)
+  })
+
   it('Vue3 useTemplateRef 换行声明可识别且注释不会产生 ref 方法误绑定', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-template-ref-comment-'))
     const numberPadUri = path.join(root, 'src/NumberPad.vue')

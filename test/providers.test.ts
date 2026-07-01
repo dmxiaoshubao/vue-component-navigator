@@ -2047,9 +2047,9 @@ runTask(runVerifyWithCode, { code: 'second' })
     const references = referenceProvider.provideReferences(hookDocument, methodPosition) as any[]
     const hover = hoverProvider.provideHover(hookDocument, methodPosition) as any
 
-    expect(references).toHaveLength(2)
-    expect(references.map((location) => location.uri.fsPath)).toEqual([pageUri, pageUri])
-    expect(hoverText(hover)).toContain('Used by 2 hook usages')
+    expect(references).toHaveLength(3)
+    expect(references.map((location) => location.uri.fsPath)).toEqual([pageUri, pageUri, pageUri])
+    expect(hoverText(hover)).toContain('Used by 3 hook usages')
     expect(hoverText(hover)).toContain('- [index.vue:')
     expect(hoverText(hover)).not.toContain('No hook usages found')
   })
@@ -2106,8 +2106,54 @@ runVerifyWithCode('code')
 
     const references = referenceProvider.provideReferences(hookDocument, positionAt(nextHookContent, nextHookContent.indexOf('runVerifyWithCode =') + 1)) as any[]
 
-    expect(references).toHaveLength(1)
+    expect(references).toHaveLength(2)
     expect(references[0].uri.fsPath).toBe(pageUri)
+  })
+
+  it('Vue3 hook 返回方法仅被另一个 hook 解构时也可在源码处 hover', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-hook-destructure-hover-'))
+    const hookUri = path.join(root, 'src/pages/channel-verify/hooks/use-test-create.ts')
+    const consumerUri = path.join(root, 'src/pages/channel-verify/hooks/use-verify.ts')
+    const hookContent = `
+const useTestCreate = () => {
+  const test = () => {
+    console.log('hello')
+  }
+  return { test }
+}
+
+export default useTestCreate
+`
+    const consumerContent = `
+import useTestCreate from './use-test-create'
+
+const useVerify = () => {
+  const { test } = useTestCreate()
+
+  return {}
+}
+
+export default useVerify
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(hookUri, hookContent)
+    writeText(consumerUri, consumerContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hookDocument = new TestDocument(hookUri, hookContent, 'typescript') as any
+    const methodPosition = positionAt(hookContent, hookContent.indexOf('test =') + 1)
+
+    const hover = hoverProvider.provideHover(hookDocument, methodPosition) as any
+    const references = referenceProvider.provideReferences(hookDocument, methodPosition) as any[]
+
+    expect(references).toHaveLength(1)
+    expect(references[0].uri.fsPath).toBe(consumerUri)
+    expect(hoverText(hover)).toContain('Used by 1 hook usage')
+    expect(hoverText(hover)).toContain('- [use-verify.ts:')
   })
 
   it('Vue3 hook 返回方法不会把后续同名局部变量算成反向引用', async () => {
@@ -2150,7 +2196,7 @@ runVerifyWithCode('local')
 
     const references = referenceProvider.provideReferences(hookDocument, positionAt(hookContent, hookContent.indexOf('runVerifyWithCode =') + 1)) as any[]
 
-    expect(references).toHaveLength(1)
+    expect(references).toHaveLength(2)
     expect(references[0].uri.fsPath).toBe(pageUri)
   })
 
