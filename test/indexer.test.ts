@@ -1293,11 +1293,11 @@ export default {
 
     writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.4.0' } }))
     writeText(typeUri, `
-export type ConfirmDialogProps = {
+export type ConfirmDialogProps<T = string> = {
   show: boolean
   /** 确认之前的回调，返回 false 则不关闭弹窗 */
   beforeConfirm?: () => Promise<boolean> | boolean | void
-  title?: string
+  title?: T
 }
 `)
     writeText(childUri, `
@@ -1316,7 +1316,7 @@ import type { ConfirmDialogProps as DialogProps } from './type'
 
 defineOptions({ name: 'confirm-dialog' })
 
-const props = withDefaults(defineProps<DialogProps>(), {
+const props = withDefaults(defineProps<DialogProps<string>>(), {
   title: '',
 })
 const emits = defineEmits<{
@@ -1384,7 +1384,8 @@ app.component('GlobalDialog', ConfirmDialog)
 
     expect(index.resolveComponent(parent, 'ConfirmDialog')).toBe(childUri)
     expect(index.resolveComponent(parent, 'GlobalDialog')).toBeUndefined()
-    expect(index.findTemplatePropUsages(childUri, 'beforeConfirm')).toHaveLength(0)
+    expect(index.findPropDefinitions(childUri, 'before-confirm').map(({ file }) => file.uri)).toEqual([childUri])
+    expect(index.findTemplatePropUsages(childUri, 'beforeConfirm').map((usage) => usage.file.uri)).toEqual([parentUri])
     expect(index.findTemplateEventUsages(childUri, 'confirm')).toHaveLength(1)
     expect(findEmit(child, 'confirm')).toHaveLength(1)
     expect(index.findRefMethodUsages(childUri, 'open')).toHaveLength(0)
@@ -1395,6 +1396,83 @@ app.component('GlobalDialog', ConfirmDialog)
     expect(consumer.scriptIndex.injects.map((inject) => [inject.localName, inject.key])).toEqual([
       ['service', 'service'],
     ])
+  })
+
+  it('支持 Vue3 defineEmits/defineSlots 命名泛型类型和导入类型源重建', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-named-contract-types-'))
+    const emitTypeUri = path.join(root, 'src/contracts/emits.ts')
+    const slotTypeUri = path.join(root, 'src/contracts/slots.ts')
+    const childUri = path.join(root, 'src/TypedChild.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const slotTypeContent = `
+export type ContractSlots<T> = {
+  default?: (props: { item: T }) => any
+  /** 操作区 */
+  actions?: (props: { item: T }) => any
+}
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(emitTypeUri, `
+export interface ContractEmits<T> {
+  /** 保存 */
+  save: [payload: T]
+  (event: 'cancel'): void
+}
+`)
+    writeText(slotTypeUri, slotTypeContent)
+    writeText(childUri, `
+<template><section /></template>
+<script setup lang="ts">
+import type { ContractEmits } from './contracts/emits'
+import type { ContractSlots } from './contracts/slots'
+
+type Row = { id: number }
+
+const emit = defineEmits<ContractEmits<Row>>()
+defineSlots<ContractSlots<Row>>()
+
+function save(row: Row) {
+  emit('save', row)
+}
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <TypedChild @save="onSave" @cancel="onCancel">
+    <template #actions>Actions</template>
+  </TypedChild>
+</template>
+<script setup lang="ts">
+import TypedChild from './TypedChild.vue'
+
+const onSave = () => {}
+const onCancel = () => {}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const child = index.getFile(childUri)!
+
+    expect(child.scriptIndex.emits.map((emit) => emit.eventName).sort()).toEqual(['cancel', 'save'])
+    expect(child.scriptIndex.emits.find((emit) => emit.eventName === 'save')?.sourceLocation?.uri).toBe(emitTypeUri)
+    expect(child.scriptIndex.emits.find((emit) => emit.eventName === 'cancel')?.sourceLocation?.uri).toBe(emitTypeUri)
+    expect(index.findEventDefinitions(childUri, 'save')[0]?.emit.sourceLocation?.uri).toBe(emitTypeUri)
+    expect(index.findTemplateEventUsages(childUri, 'save').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplateEventUsages(childUri, 'cancel').map((usage) => usage.file.uri)).toEqual([parentUri])
+
+    expect(child.scriptIndex.slots.map((slot) => slot.name).sort()).toEqual(['actions', 'default'])
+    expect(child.scriptIndex.slots.find((slot) => slot.name === 'actions')?.sourceLocation?.uri).toBe(slotTypeUri)
+    expect(index.findSlotDefinitions(childUri, 'actions')[0]?.slot.sourceLocation?.uri).toBe(slotTypeUri)
+    expect(index.findTemplateSlotUsages(childUri, 'actions').map((usage) => usage.file.uri)).toEqual([parentUri])
+
+    writeText(slotTypeUri, slotTypeContent.replace('actions?', 'footer?'))
+    await index.syncGlobalComponentFile(slotTypeUri)
+
+    expect(index.getFile(childUri)?.scriptIndex.slots.map((slot) => slot.name).sort()).toEqual(['default', 'footer'])
+    expect(index.findSlotDefinitions(childUri, 'actions')).toEqual([])
+    expect(index.findSlotDefinitions(childUri, 'footer')[0]?.slot.sourceLocation?.uri).toBe(slotTypeUri)
   })
 
   it('支持 inline props、声明式 emits、v-model 事件和 InjectionKey 静态关系', async () => {
@@ -1566,6 +1644,212 @@ childRef.value?.close()
     expect(index.findComponentUsages(orderUri)).toHaveLength(1)
   })
 
+  it('支持 Vue3 defineExpose 内联函数和 ref 转发反向索引', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-expose-inline-forward-'))
+    const formUri = path.join(root, 'src/CheckoutForm.vue')
+    const orderUri = path.join(root, 'src/CheckoutOrder.vue')
+    const dialogUri = path.join(root, 'src/CheckoutDialog.vue')
+    const formContent = `
+<template><div /></template>
+<script setup lang="ts">
+const exposedCount = 1
+
+function setShoppingGuideId(id: number) {
+  return id
+}
+
+defineExpose({
+  submit: async (): Promise<{ remark: string }> => ({ remark: 'ok' }),
+  setShoppingGuideId,
+  reset: function () {
+    return true
+  },
+  async load() {
+    return 1
+  },
+  exposedCount: (exposedCount),
+})
+</script>
+`
+    const orderContent = `
+<template>
+  <CheckoutForm ref="checkoutFormRef" />
+</template>
+<script setup lang="ts">
+import { ref } from 'vue'
+import CheckoutForm from './CheckoutForm.vue'
+
+const checkoutFormRef = ref<InstanceType<typeof CheckoutForm>>()
+
+defineExpose({
+  submit: () => checkoutFormRef.value!.submit(),
+  setShoppingGuideId: (id: number): void => {
+    ;(checkoutFormRef.value as InstanceType<typeof CheckoutForm>).setShoppingGuideId(id)
+  },
+  reset: function () {
+    return (checkoutFormRef.value as InstanceType<typeof CheckoutForm>)?.reset()
+  },
+  load: async () => checkoutFormRef.value!.load(),
+  getReceiptChecked: () => true,
+})
+</script>
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(formUri, formContent)
+    writeText(orderUri, orderContent)
+    writeText(dialogUri, `
+<template>
+  <CheckoutOrder ref="checkoutOrderRef" />
+</template>
+<script setup lang="ts">
+import { ref } from 'vue'
+import CheckoutOrder from './CheckoutOrder.vue'
+
+const checkoutOrderRef = ref<InstanceType<typeof CheckoutOrder>>()
+
+checkoutOrderRef.value?.submit()
+checkoutOrderRef.value?.setShoppingGuideId(1)
+checkoutOrderRef.value?.reset()
+checkoutOrderRef.value?.load()
+checkoutOrderRef.value?.getReceiptChecked()
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const form = index.getFile(formUri)!
+    const order = index.getFile(orderUri)!
+
+    expect(form.scriptIndex.methods.map((method) => method.name).sort()).toEqual(['load', 'reset', 'setShoppingGuideId', 'submit'])
+    expect(order.scriptIndex.methods.map((method) => method.name).sort()).toEqual(['getReceiptChecked', 'load', 'reset', 'setShoppingGuideId', 'submit'])
+    expect(index.findRefMethodUsages(formUri, 'submit').map((usage) => usage.file.uri)).toEqual([orderUri])
+    expect(index.findRefMethodUsages(formUri, 'setShoppingGuideId').map((usage) => usage.file.uri)).toEqual([orderUri])
+    expect(index.findRefMethodUsages(formUri, 'reset').map((usage) => usage.file.uri)).toEqual([orderUri])
+    expect(index.findRefMethodUsages(formUri, 'load').map((usage) => usage.file.uri)).toEqual([orderUri])
+    expect(index.findRefMethodUsages(orderUri, 'submit').map((usage) => usage.file.uri)).toEqual([dialogUri])
+    expect(index.findRefMethodUsages(orderUri, 'setShoppingGuideId').map((usage) => usage.file.uri)).toEqual([dialogUri])
+    expect(index.findRefMethodUsages(orderUri, 'reset').map((usage) => usage.file.uri)).toEqual([dialogUri])
+    expect(index.findRefMethodUsages(orderUri, 'load').map((usage) => usage.file.uri)).toEqual([dialogUri])
+    expect(index.findRefMethodUsagesFromSource(formUri, formContent.indexOf('submit:') + 1).map((usage) => usage.file.uri)).toEqual([orderUri])
+    expect(index.findRefMethodUsagesFromSource(formUri, formContent.indexOf('load') + 1).map((usage) => usage.file.uri)).toEqual([orderUri])
+    expect(index.findRefMethodUsagesFromSource(orderUri, orderContent.indexOf('submit:') + 1).map((usage) => usage.file.uri)).toEqual([dialogUri])
+    expect(index.findRefMethodUsagesFromSource(orderUri, orderContent.indexOf('load:') + 1).map((usage) => usage.file.uri)).toEqual([dialogUri])
+  })
+
+  it('支持 Vue3 defineExpose composable 转发模板 ref 方法反向索引', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-expose-composable-forward-'))
+    const commonListUri = path.join(root, 'src/components/common-list/index.vue')
+    const forwardUri = path.join(root, 'src/components/common-list/hooks/use-forward-list-ref.ts')
+    const productListUri = path.join(root, 'src/ProductList.vue')
+    const secondProductListUri = path.join(root, 'src/SecondProductList.vue')
+    const pageUri = path.join(root, 'src/Page.vue')
+    const secondPageUri = path.join(root, 'src/SecondPage.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(commonListUri, `
+<template><section /></template>
+<script setup lang="ts" generic="T extends Record<string, any>, R extends Record<string, any>, K extends keyof R = 'list'">
+type ListRef<T extends Record<string, any>> = {
+  onRefresh: (params?: T, refreshing?: boolean) => void
+  onLoad: (params?: T) => void
+}
+
+defineExpose<ListRef<T>>({
+  onRefresh: (params?: T) => {
+    return params
+  },
+  onLoad: (params?: T) => {
+    return params
+  },
+})
+</script>
+`)
+    writeText(forwardUri, `
+import type { Ref } from 'vue'
+
+type ListRef<T extends Record<string, any>> = {
+  onRefresh: (params?: T, refreshing?: boolean) => void
+  onLoad: (params?: T) => void
+}
+
+export const useForwardListRef = <T extends Record<string, any>>(
+  targetRef: Ref<ListRef<T> | undefined>,
+): ListRef<T> => ({
+  onLoad: params => targetRef.value!.onLoad(params),
+  onRefresh: (params, refreshing) => (targetRef.value as ListRef<T>).onRefresh(params, refreshing),
+})
+`)
+    writeText(productListUri, `
+<template>
+  <CommonList ref="listRef" />
+</template>
+<script setup lang="ts">
+import { ref } from 'vue'
+import CommonList from './components/common-list/index.vue'
+import { useForwardListRef } from './components/common-list/hooks/use-forward-list-ref'
+
+type ProductListRequest = { page: number }
+
+const listRef = ref()
+
+defineExpose(useForwardListRef<ProductListRequest>(listRef))
+</script>
+`)
+    writeText(secondProductListUri, `
+<template>
+  <CommonList ref="listRef" />
+</template>
+<script setup lang="ts">
+import { ref } from 'vue'
+import CommonList from './components/common-list/index.vue'
+import { useForwardListRef } from './components/common-list/hooks/use-forward-list-ref'
+
+const listRef = ref()
+
+defineExpose(useForwardListRef(listRef))
+</script>
+`)
+    writeText(pageUri, `
+<template>
+  <ProductList ref="listRef" />
+</template>
+<script setup lang="ts">
+import { ref } from 'vue'
+import ProductList from './ProductList.vue'
+
+const listRef = ref()
+
+listRef.value?.onRefresh({})
+listRef.value?.onLoad({})
+</script>
+`)
+    writeText(secondPageUri, `
+<template>
+  <SecondProductList ref="listRef" />
+</template>
+<script setup lang="ts">
+import { ref } from 'vue'
+import SecondProductList from './SecondProductList.vue'
+
+const listRef = ref()
+
+listRef.value?.onRefresh({})
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const commonList = index.getFile(commonListUri)!
+
+    expect(commonList.scriptIndex.methods.map((method) => method.name).sort()).toEqual(['onLoad', 'onRefresh'])
+    expect(index.findRefMethodUsages(commonListUri, 'onRefresh').map((usage) => usage.file.uri).sort()).toEqual([pageUri, secondPageUri].sort())
+    expect(index.findRefMethodUsages(commonListUri, 'onLoad').map((usage) => usage.file.uri)).toEqual([pageUri])
+    expect(index.findRefMethodUsages(productListUri, 'onRefresh').map((usage) => usage.file.uri)).toEqual([pageUri])
+    expect(index.findRefMethodUsages(productListUri, 'onLoad').map((usage) => usage.file.uri)).toEqual([pageUri])
+    expect(index.findRefMethodUsages(secondProductListUri, 'onRefresh').map((usage) => usage.file.uri)).toEqual([secondPageUri])
+  })
+
   it('支持 Vue3 template slot 定义、defineExpose public 成员和 TSX 命令式 ref 调用', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-template-slots-expose-tsx-'))
     const buttonUri = path.join(root, 'src/components/common-button/index.vue')
@@ -1617,6 +1901,8 @@ const buttonRef = ref<InstanceType<typeof CommonButton>>()
 const templateButton = useTemplateRef<InstanceType<typeof CommonButton>>('buttonRef')
 
 buttonRef.value?.reset()
+buttonRef.value!.reset()
+;(buttonRef.value as InstanceType<typeof CommonButton>).reset()
 templateButton.value?.reset()
 </script>
 `)
@@ -1653,8 +1939,8 @@ class CoinOutDialogManager {
 
     expect(button.scriptIndex.slots.map((slot) => slot.name)).toEqual(['left-icon', 'default'])
     expect(index.findTemplateSlotUsages(buttonUri, 'left-icon').map((usage) => usage.file.uri)).toEqual([parentUri])
-    expect(index.findRefMethodUsages(buttonUri, 'reset').map((usage) => usage.file.uri).sort()).toEqual([parentUri, parentUri])
-    expect(index.findRefMethodUsagesFromSource(buttonUri, button.content.indexOf('const reset') + 'const '.length).map((usage) => usage.file.uri).sort()).toEqual([parentUri, parentUri])
+    expect(index.findRefMethodUsages(buttonUri, 'reset').map((usage) => usage.file.uri).sort()).toEqual([parentUri, parentUri, parentUri, parentUri])
+    expect(index.findRefMethodUsagesFromSource(buttonUri, button.content.indexOf('const reset') + 'const '.length).map((usage) => usage.file.uri).sort()).toEqual([parentUri, parentUri, parentUri, parentUri])
     expect(command).toBeTruthy()
     expect(index.resolveRefComponent(command, 'dialogRef')).toBe(dialogUri)
     expect(index.findRefMethodUsages(dialogUri, 'open').map((usage) => usage.file.uri)).toEqual([commandUri])
@@ -1722,8 +2008,8 @@ defineExpose({
     const hookUri = path.join(root, 'src/hooks/use-verify.ts')
     const consumerUri = path.join(root, 'src/verify-command.ts')
     const hookContent = `
-const useVerify = () => {
-  const runVerifyWithCode = async (code: string) => code
+const useVerify = <T extends string = string>() => {
+  const runVerifyWithCode = async (code: T) => code
 
   return {
     runVerifyWithCode,
@@ -1735,7 +2021,7 @@ export default useVerify
     const consumerContent = `
 import useVerify from './hooks/use-verify'
 
-const { runVerifyWithCode } = useVerify()
+const { runVerifyWithCode } = useVerify<string>()
 `
 
     writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
@@ -1840,6 +2126,353 @@ const onFetchStart = () => {}
     expect(index.findEventDefinitions(middleUri, 'fetchStart').map(({ file }) => file.uri)).toEqual([childUri])
     expect(index.findTemplateEventUsages(childUri, 'fetchStart').map((usage) => usage.file.uri)).toEqual([parentUri])
     expect(index.findTemplateEventUsages(childUri, 'fetch-start').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
+  it('支持 Vue3 v-bind $attrs 透传的模板 prop 关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-forwarded-props-'))
+    const childUri = path.join(root, 'src/PositiveScan.vue')
+    const middleUri = path.join(root, 'src/MemberLogin.vue')
+    const parentUri = path.join(root, 'src/Dialog.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<template><section>{{ props.classifyId }} {{ props.operateType }}</section></template>
+<script setup lang="ts">
+const props = defineProps<{
+  classifyId: string
+  operateType?: number
+}>()
+</script>
+`)
+    writeText(middleUri, `
+<template>
+  <PositiveScan v-bind="$attrs" />
+</template>
+<script setup lang="ts">
+import PositiveScan from './PositiveScan.vue'
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <MemberLogin :classify-id="classifyId" :operateType="operateType" />
+</template>
+<script setup lang="ts">
+import MemberLogin from './MemberLogin.vue'
+
+const classifyId = '1'
+const operateType = 2
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findPropDefinitions(middleUri, 'classifyId').map(({ file }) => file.uri)).toEqual([childUri])
+    expect(index.findPropDefinitions(middleUri, 'operateType').map(({ file }) => file.uri)).toEqual([childUri])
+    expect(index.findTemplatePropUsages(childUri, 'classifyId').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplatePropUsages(childUri, 'operateType').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
+  it('支持 Vue3 v-bind 对象的静态模板 prop 关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-object-bind-props-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<script setup lang="ts">
+defineProps<{
+  title: string
+  userId: number
+}>()
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <Child v-bind="plainProps" />
+  <Child v-bind="refProps" />
+  <Child v-bind="computedProps" />
+</template>
+<script setup lang="ts">
+import { computed, ref } from 'vue'
+import Child from './Child.vue'
+
+const plainProps = {
+  title: 'plain',
+  'user-id': 1,
+  class: 'ignored',
+  onClick: () => {},
+} as const
+const refProps = ref({
+  title: 'ref',
+})
+const computedProps = computed(() => ({
+  title: 'computed',
+}))
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findTemplatePropUsages(childUri, 'title').map((usage) => usage.file.uri)).toEqual([parentUri, parentUri, parentUri])
+    expect(index.findTemplatePropUsages(childUri, 'userId').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
+  it('Vue3 v-bind 对象只读取顶层绑定并支持带泛型类型标注的变量', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-bind-top-level-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<script setup lang="ts">
+defineProps<{
+  title?: string
+  label?: string
+}>()
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <Child v-bind="typedProps" />
+  <Child v-bind="functionTypedProps" />
+  <Child v-bind="nestedProps" />
+</template>
+<script setup lang="ts">
+import Child from './Child.vue'
+
+type ChildProps = {
+  title?: string
+}
+
+const typedProps: Partial<ChildProps> = {
+  title: 'typed',
+}
+
+const functionTypedProps: (() => Partial<ChildProps>) extends unknown ? Partial<ChildProps> : never = {
+  label: 'function typed',
+}
+
+function build() {
+  const nestedProps = {
+    label: 'nested',
+  }
+  return nestedProps
+}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findTemplatePropUsages(childUri, 'title').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplatePropUsages(childUri, 'label').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
+  it('Vue3 v-bind 对象支持多变量声明和带类型标注的 rest 透传', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-bind-declaration-boundaries-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<script setup lang="ts">
+defineProps<{
+  label?: string
+  hidden?: string
+}>()
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <Child v-bind="multiProps" />
+  <Child v-bind="forwardedProps" />
+</template>
+<script setup lang="ts">
+import Child from './Child.vue'
+
+const ignoredProps = { hidden: 'ignored' }, multiProps = {
+  label: 'multi',
+}
+
+const props = withDefaults(defineProps<{
+  title?: string
+  label?: string
+  hidden?: string
+}>(), {})
+const { title, ...forwardedProps }: Partial<typeof props> = props
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findTemplatePropUsages(childUri, 'label').map((usage) => usage.file.uri)).toEqual([parentUri, parentUri])
+    expect(index.findTemplatePropUsages(childUri, 'hidden').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
+  it('支持 Vue3 useAttrs 别名和 mergeProps 的模板 prop 透传关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-attrs-merge-props-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const attrsMiddleUri = path.join(root, 'src/AttrsMiddle.vue')
+    const mergeMiddleUri = path.join(root, 'src/MergeMiddle.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<script setup lang="ts">
+defineProps<{
+  title?: string
+  label?: string
+}>()
+</script>
+`)
+    writeText(attrsMiddleUri, `
+<template>
+  <Child v-bind="forwardedAttrs" />
+</template>
+<script setup lang="ts">
+import { computed, useAttrs } from 'vue'
+import Child from './Child.vue'
+
+const attrs = useAttrs()
+const forwardedAttrs = computed(() => ({ ...attrs }))
+</script>
+`)
+    writeText(mergeMiddleUri, `
+<template>
+  <Child v-bind="mergeProps($attrs, props)" />
+</template>
+<script setup lang="ts">
+import { mergeProps } from 'vue'
+import Child from './Child.vue'
+
+const props = defineProps<{
+  title?: string
+}>()
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <AttrsMiddle :label="label" />
+  <MergeMiddle :title="title" :label="label" />
+</template>
+<script setup lang="ts">
+import AttrsMiddle from './AttrsMiddle.vue'
+import MergeMiddle from './MergeMiddle.vue'
+
+const title = 'title'
+const label = 'label'
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findTemplatePropUsages(childUri, 'label').map((usage) => usage.file.uri)).toEqual([parentUri, parentUri])
+    expect(index.findTemplatePropUsages(childUri, 'title').map((usage) => usage.file.uri)).toEqual([mergeMiddleUri])
+    expect(index.findTemplatePropUsages(mergeMiddleUri, 'title').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
+  it('Vue3 useAttrs 透传在保存后会重建 prop 反向索引', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-attrs-incremental-props-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const middleUri = path.join(root, 'src/Middle.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const initialMiddleContent = `
+<template>
+  <Child />
+</template>
+<script setup lang="ts">
+import Child from './Child.vue'
+</script>
+`
+    const updatedMiddleContent = `
+<template>
+  <Child v-bind="attrs" />
+</template>
+<script setup lang="ts">
+import { useAttrs } from 'vue'
+import Child from './Child.vue'
+
+const attrs = useAttrs()
+</script>
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<script setup lang="ts">
+defineProps<{
+  label?: string
+}>()
+</script>
+`)
+    writeText(middleUri, initialMiddleContent)
+    writeText(parentUri, `
+<template>
+  <Middle :label="label" />
+</template>
+<script setup lang="ts">
+import Middle from './Middle.vue'
+
+const label = 'label'
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findTemplatePropUsages(childUri, 'label')).toHaveLength(0)
+
+    index.syncContent(middleUri, updatedMiddleContent)
+
+    expect(index.findTemplatePropUsages(childUri, 'label').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
+  it('Vue3 v-bind $attrs 不透传当前组件已声明的 prop', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-forwarded-declared-prop-'))
+    const childUri = path.join(root, 'src/PositiveScan.vue')
+    const middleUri = path.join(root, 'src/MemberLogin.vue')
+    const parentUri = path.join(root, 'src/Dialog.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<script setup lang="ts">
+defineProps<{
+  classifyId: string
+}>()
+</script>
+`)
+    writeText(middleUri, `
+<template>
+  <PositiveScan v-bind="$attrs" />
+</template>
+<script setup lang="ts">
+import PositiveScan from './PositiveScan.vue'
+
+defineProps<{
+  classifyId: string
+}>()
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <MemberLogin :classify-id="classifyId" />
+</template>
+<script setup lang="ts">
+import MemberLogin from './MemberLogin.vue'
+
+const classifyId = '1'
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findPropDefinitions(middleUri, 'classifyId').map(({ file }) => file.uri)).toEqual([middleUri])
+    expect(index.findTemplatePropUsages(middleUri, 'classifyId').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplatePropUsages(childUri, 'classifyId')).toHaveLength(0)
   })
 
   it('Vue3 v-bind $attrs 不透传当前组件已声明的事件', async () => {

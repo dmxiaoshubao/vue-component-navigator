@@ -25,6 +25,20 @@ interface TypeMemberResult {
   props: PropInfo[]
 }
 
+interface TypeObjectResolution {
+  content: string
+  objectStart: number
+  objectEnd: number
+  segmentStart: number
+  location: Omit<SourceLocation, 'span'>
+  typeSpan: TextSpan
+}
+
+interface TypeFileContent {
+  lineStarts: number[]
+  segments: ScriptSegment[]
+}
+
 interface StaticKeyInfo {
   key: string
   label: string
@@ -347,82 +361,131 @@ function readVueScriptContent(uri: string, content: string): Array<{ content: st
     .map((block) => ({ content: block.content, start: block.start }))
 }
 
-function resolveTypeMembers(uri: string, lineStarts: number[], segments: ScriptSegment[], imports: ImportInfo[], defineProps: DefinePropsInfo, workspaceRoots: string[]): TypeMemberResult | undefined {
+function readTypeFileContent(targetUri: string, cache: Map<string, TypeFileContent | undefined>): TypeFileContent | undefined {
+  if (cache.has(targetUri)) {
+    return cache.get(targetUri)
+  }
+
+  try {
+    const content = fsSync.readFileSync(targetUri, 'utf8')
+    const result = {
+      lineStarts: createLineStarts(content),
+      segments: readVueScriptContent(targetUri, content),
+    }
+    cache.set(targetUri, result)
+    return result
+  } catch {
+    cache.set(targetUri, undefined)
+    return undefined
+  }
+}
+
+function shiftSpan(span: TextSpan, offset: number): TextSpan {
+  return { start: offset + span.start, end: offset + span.end }
+}
+
+function shiftSourceLocation(sourceLocation: SourceLocation | undefined, offset: number): SourceLocation | undefined {
+  return sourceLocation
+    ? { ...sourceLocation, span: shiftSpan(sourceLocation.span, offset) }
+    : undefined
+}
+
+function shiftPropInfo(prop: PropInfo, offset: number): PropInfo {
+  return {
+    ...prop,
+    span: shiftSpan(prop.span, offset),
+    sourceLocation: shiftSourceLocation(prop.sourceLocation, offset),
+  }
+}
+
+function readNamedGenericTypeReference(content: string, genericContentStart: number, genericEnd: number, segmentStart: number): { typeName: string, typeSpan: TextSpan } | undefined {
+  const typeName = readIdentifier(content, genericContentStart)
+  if (!typeName) {
+    return undefined
+  }
+
+  let typeEnd = skipTrivia(content, typeName.end)
+  if (content[typeEnd] === '<') {
+    const typeArgumentEnd = findMatchingTypeArgument(content, typeEnd)
+    if (typeArgumentEnd === -1 || typeArgumentEnd > genericEnd) {
+      return undefined
+    }
+    typeEnd = skipTrivia(content, typeArgumentEnd + 1)
+  }
+  if (typeEnd !== genericEnd) {
+    return undefined
+  }
+
+  return {
+    typeName: typeName.value,
+    typeSpan: { start: segmentStart + typeName.start, end: segmentStart + typeName.end },
+  }
+}
+
+function resolveTypeObject(uri: string, lineStarts: number[], segments: ScriptSegment[], imports: ImportInfo[], typeName: string, workspaceRoots: string[], typeFileCache: Map<string, TypeFileContent | undefined>): TypeObjectResolution | undefined {
+  const imported = imports.find((item) => item.localName === typeName)
+  const targetTypeName = imported?.importedName ?? typeName
+  const targetUri = imported?.source
+    ? resolveImportPathWithExtensions(uri, imported.source, workspaceRoots, ['.ts', '.vue'])
+    : undefined
+
+  if (targetUri) {
+    const source = readTypeFileContent(targetUri, typeFileCache)
+    if (!source) {
+      return undefined
+    }
+    for (const segment of source.segments) {
+      const found = findTypeObject(segment.content, targetTypeName)
+      if (!found) {
+        continue
+      }
+      return {
+        content: segment.content,
+        objectStart: found.objectStart,
+        objectEnd: found.objectEnd,
+        segmentStart: segment.start,
+        location: { uri: targetUri, lineStarts: source.lineStarts },
+        typeSpan: shiftSpan(found.typeSpan, segment.start),
+      }
+    }
+  }
+
+  for (const segment of segments) {
+    const found = findTypeObject(segment.content, typeName)
+    if (!found) {
+      continue
+    }
+    return {
+      content: segment.content,
+      objectStart: found.objectStart,
+      objectEnd: found.objectEnd,
+      segmentStart: segment.start,
+      location: { uri, lineStarts },
+      typeSpan: shiftSpan(found.typeSpan, segment.start),
+    }
+  }
+
+  return undefined
+}
+
+function resolveTypeMembers(uri: string, lineStarts: number[], segments: ScriptSegment[], imports: ImportInfo[], defineProps: DefinePropsInfo, workspaceRoots: string[], typeFileCache: Map<string, TypeFileContent | undefined>): TypeMemberResult | undefined {
   if (defineProps.inlineProps) {
     return { props: defineProps.inlineProps }
   }
   if (!defineProps.typeName || !defineProps.typeSpan) {
     return undefined
   }
-  const imported = imports.find((item) => item.localName === defineProps.typeName)
-  const targetTypeName = imported?.importedName ?? defineProps.typeName
-  const targetUri = imported?.source
-    ? resolveImportPathWithExtensions(uri, imported.source, workspaceRoots, ['.ts', '.vue'])
-    : undefined
 
-  if (targetUri && fsSync.existsSync(targetUri)) {
-    const content = fsSync.readFileSync(targetUri, 'utf8')
-    const sourceLineStarts = createLineStarts(content)
-    for (const segment of readVueScriptContent(targetUri, content)) {
-      const found = findTypeObject(segment.content, targetTypeName)
-      if (!found) {
-        continue
-      }
-      const location = { uri: targetUri, lineStarts: sourceLineStarts }
-      const typeSpan = { start: segment.start + found.typeSpan.start, end: segment.start + found.typeSpan.end }
-      return {
-        typeInfo: {
-          name: defineProps.typeName,
-          span: defineProps.typeSpan,
-          sourceLocation: { ...location, span: typeSpan },
-        },
-        props: parseTypeMembers(segment.content, found.objectStart, found.objectEnd, {
-          uri: targetUri,
-          lineStarts: sourceLineStarts,
-        }).map((prop) => ({
-          ...prop,
-          span: { start: segment.start + prop.span.start, end: segment.start + prop.span.end },
-          sourceLocation: prop.sourceLocation
-            ? {
-                ...prop.sourceLocation,
-                span: {
-                  start: segment.start + prop.sourceLocation.span.start,
-                  end: segment.start + prop.sourceLocation.span.end,
-                },
-              }
-            : undefined,
-        })),
-      }
-    }
-  }
-
-  for (const segment of segments) {
-    const found = findTypeObject(segment.content, defineProps.typeName)
-    if (!found) {
-      continue
-    }
-    const location = { uri, lineStarts }
-    const typeSpan = { start: segment.start + found.typeSpan.start, end: segment.start + found.typeSpan.end }
+  const resolved = resolveTypeObject(uri, lineStarts, segments, imports, defineProps.typeName, workspaceRoots, typeFileCache)
+  if (resolved) {
     return {
       typeInfo: {
         name: defineProps.typeName,
         span: defineProps.typeSpan,
-        sourceLocation: { ...location, span: typeSpan },
+        sourceLocation: { ...resolved.location, span: resolved.typeSpan },
       },
-      props: parseTypeMembers(segment.content, found.objectStart, found.objectEnd, location)
-        .map((prop) => ({
-          ...prop,
-          span: { start: segment.start + prop.span.start, end: segment.start + prop.span.end },
-          sourceLocation: prop.sourceLocation
-            ? {
-                ...prop.sourceLocation,
-                span: {
-                  start: segment.start + prop.sourceLocation.span.start,
-                  end: segment.start + prop.sourceLocation.span.end,
-                },
-              }
-            : undefined,
-        })),
+      props: parseTypeMembers(resolved.content, resolved.objectStart, resolved.objectEnd, resolved.location)
+        .map((prop) => shiftPropInfo(prop, resolved.segmentStart)),
     }
   }
 
@@ -510,15 +573,15 @@ function parseDefineProps(segment: ScriptSegment): DefinePropsInfo | undefined {
       }
     }
 
-    const typeName = readIdentifier(content, genericContentStart)
-    if (!typeName || skipTrivia(content, typeName.end) !== genericEnd) {
+    const typeReference = readNamedGenericTypeReference(content, genericContentStart, genericEnd, segment.start)
+    if (!typeReference) {
       index = genericEnd + 1
       continue
     }
 
     return {
-      typeName: typeName.value,
-      typeSpan: { start: segment.start + typeName.start, end: segment.start + typeName.end },
+      typeName: typeReference.typeName,
+      typeSpan: typeReference.typeSpan,
       callEnd,
       objectName: objectAssignment?.[1],
       destructured,
@@ -1087,7 +1150,7 @@ function parseSetupEmitCalls(segment: ScriptSegment | undefined): ScriptIndex['e
   return emits
 }
 
-function parseObjectEmitDeclarations(content: string, objectStart: number, objectEnd: number, segmentStart: number, callSpan: TextSpan): ScriptIndex['emits'] {
+function parseObjectEmitDeclarations(content: string, objectStart: number, objectEnd: number, segmentStart: number, callSpan: TextSpan, location?: Omit<SourceLocation, 'span'>): ScriptIndex['emits'] {
   const emits: ScriptIndex['emits'] = []
   let index = objectStart + 1
 
@@ -1107,10 +1170,13 @@ function parseObjectEmitDeclarations(content: string, objectStart: number, objec
       for (let cursor = index + 1; cursor < signatureEnd; cursor += 1) {
         const literal = readStringLiteral(content, cursor)
         if (literal) {
+          const eventSpan = shiftSpan({ start: literal.start, end: literal.end }, segmentStart)
           emits.push({
             eventName: literal.value,
-            eventSpan: { start: segmentStart + literal.start, end: segmentStart + literal.end },
+            eventSpan,
             callSpan,
+            sourceLocation: location ? { ...location, span: eventSpan } : undefined,
+            declared: true,
           })
           break
         }
@@ -1135,10 +1201,13 @@ function parseObjectEmitDeclarations(content: string, objectStart: number, objec
       continue
     }
     const memberEnd = findMemberEnd(content, afterName, objectEnd)
+    const eventSpan = shiftSpan({ start: name.start, end: name.end }, segmentStart)
     emits.push({
       eventName: name.value,
-      eventSpan: { start: segmentStart + name.start, end: segmentStart + name.end },
+      eventSpan,
       callSpan,
+      sourceLocation: location ? { ...location, span: eventSpan } : undefined,
+      declared: true,
     })
     index = memberEnd + 1
   }
@@ -1156,6 +1225,7 @@ function parseArrayEmitDeclarations(content: string, arrayStart: number, segment
         eventName: literal.value,
         eventSpan: { start: segmentStart + literal.start, end: segmentStart + literal.end },
         callSpan,
+        declared: true,
       })
       index = literal.end
       continue
@@ -1169,7 +1239,7 @@ function parseArrayEmitDeclarations(content: string, arrayStart: number, segment
   return emits
 }
 
-function parseDefineEmitsDeclarations(segment: ScriptSegment | undefined): ScriptIndex['emits'] {
+function parseDefineEmitsDeclarations(segment: ScriptSegment | undefined, uri: string, lineStarts: number[], segments: ScriptSegment[], imports: ImportInfo[], workspaceRoots: string[], typeFileCache: Map<string, TypeFileContent | undefined>): ScriptIndex['emits'] {
   if (!segment) {
     return []
   }
@@ -1201,6 +1271,17 @@ function parseDefineEmitsDeclarations(segment: ScriptSegment | undefined): Scrip
               end: callEnd,
             }))
           }
+        } else {
+          const typeReference = readNamedGenericTypeReference(segment.content, genericContentStart, genericEnd, segment.start)
+          const resolved = typeReference
+            ? resolveTypeObject(uri, lineStarts, segments, imports, typeReference.typeName, workspaceRoots, typeFileCache)
+            : undefined
+          if (resolved) {
+            emits.push(...parseObjectEmitDeclarations(resolved.content, resolved.objectStart, resolved.objectEnd, resolved.segmentStart, {
+              start: segment.start + defineIndex,
+              end: callEnd,
+            }, resolved.location))
+          }
         }
       }
     } else {
@@ -1228,13 +1309,19 @@ function parseDefineEmitsDeclarations(segment: ScriptSegment | undefined): Scrip
   return emits
 }
 
-function parseSetupEmits(segment: ScriptSegment | undefined): ScriptIndex['emits'] {
+function parseSetupEmits(segment: ScriptSegment | undefined, uri: string, lineStarts: number[], segments: ScriptSegment[], imports: ImportInfo[], workspaceRoots: string[], typeFileCache: Map<string, TypeFileContent | undefined>): ScriptIndex['emits'] {
   const calls = parseSetupEmitCalls(segment)
+  const declarations = parseDefineEmitsDeclarations(segment, uri, lineStarts, segments, imports, workspaceRoots, typeFileCache)
+  const declarationByName = new Map(declarations.map((emit) => [emit.eventName, emit]))
   const calledNames = new Set(calls.map((emit) => emit.eventName))
-  const declarations = parseDefineEmitsDeclarations(segment)
   return [
     ...declarations.filter((emit) => !calledNames.has(emit.eventName)),
-    ...calls,
+    ...calls.map((emit) => {
+      const declaration = declarationByName.get(emit.eventName)
+      return declaration
+        ? { ...emit, sourceLocation: declaration.sourceLocation, declared: declaration.declared }
+        : emit
+    }),
   ]
 }
 
@@ -1282,6 +1369,7 @@ function parseDefineModelDeclarations(segment: ScriptSegment | undefined): Scrip
       eventName: `update:${modelName}`,
       eventSpan,
       callSpan: { start: segment.start + defineIndex, end: callEnd },
+      declared: true,
     })
     index = defineIndex + 'defineModel'.length
   }
@@ -1297,7 +1385,18 @@ function parseSetupModels(segment: ScriptSegment | undefined, emits: ScriptIndex
   ]
 }
 
-function parseDefineSlots(segment: ScriptSegment | undefined): SlotInfo[] {
+function parseSlotTypeMembers(content: string, objectStart: number, objectEnd: number, segmentStart: number, location?: Omit<SourceLocation, 'span'>): SlotInfo[] {
+  return parseTypeMembers(content, objectStart, objectEnd, location ?? { uri: '', lineStarts: [] })
+    .map((slot) => ({
+      name: slot.name,
+      span: shiftSpan(slot.span, segmentStart),
+      detail: slot.detail,
+      documentation: slot.documentation,
+      sourceLocation: location ? shiftSourceLocation(slot.sourceLocation, segmentStart) : undefined,
+    }))
+}
+
+function parseDefineSlots(segment: ScriptSegment | undefined, uri: string, lineStarts: number[], segments: ScriptSegment[], imports: ImportInfo[], workspaceRoots: string[], typeFileCache: Map<string, TypeFileContent | undefined>): SlotInfo[] {
   if (!segment) {
     return []
   }
@@ -1325,13 +1424,15 @@ function parseDefineSlots(segment: ScriptSegment | undefined): SlotInfo[] {
     if (segment.content[genericContentStart] === '{') {
       const objectEnd = findMatchingBracket(segment.content, genericContentStart)
       if (skipTrivia(segment.content, objectEnd + 1) === genericEnd) {
-        slots.push(...parseTypeMembers(segment.content, genericContentStart, objectEnd, { uri: '', lineStarts: [] })
-          .map((slot) => ({
-            name: slot.name,
-            span: { start: segment.start + slot.span.start, end: segment.start + slot.span.end },
-            detail: slot.detail,
-            documentation: slot.documentation,
-          })))
+        slots.push(...parseSlotTypeMembers(segment.content, genericContentStart, objectEnd, segment.start))
+      }
+    } else {
+      const typeReference = readNamedGenericTypeReference(segment.content, genericContentStart, genericEnd, segment.start)
+      const resolved = typeReference
+        ? resolveTypeObject(uri, lineStarts, segments, imports, typeReference.typeName, workspaceRoots, typeFileCache)
+        : undefined
+      if (resolved) {
+        slots.push(...parseSlotTypeMembers(resolved.content, resolved.objectStart, resolved.objectEnd, resolved.segmentStart, resolved.location))
       }
     }
 
@@ -1371,6 +1472,20 @@ function readFunctionSignature(content: string, name: string, start: number, end
   return `${asyncPrefix ? 'async ' : ''}${name}${params}`
 }
 
+function readFunctionExpressionSignature(content: string, name: string, start: number, end: number): string | undefined {
+  let cursor = skipTrivia(content, start)
+  const asyncToken = readIdentifier(content, cursor)
+  if (asyncToken?.value === 'async') {
+    cursor = skipTrivia(content, asyncToken.end)
+  }
+
+  const functionToken = readIdentifier(content, cursor)
+  if (functionToken?.value !== 'function') {
+    return undefined
+  }
+  return readFunctionSignature(content, name, start, end)
+}
+
 function readArrowFunctionSignature(content: string, name: string, start: number, end: number): string | undefined {
   let cursor = skipTrivia(content, start)
   let asyncPrefix = false
@@ -1378,6 +1493,14 @@ function readArrowFunctionSignature(content: string, name: string, start: number
   if (asyncToken?.value === 'async') {
     asyncPrefix = true
     cursor = skipTrivia(content, asyncToken.end)
+  }
+
+  if (content[cursor] === '<') {
+    const genericEnd = findMatchingTypeArgument(content, cursor)
+    if (genericEnd === -1 || genericEnd >= end) {
+      return undefined
+    }
+    cursor = skipTrivia(content, genericEnd + 1)
   }
 
   let params = ''
@@ -1394,7 +1517,65 @@ function readArrowFunctionSignature(content: string, name: string, start: number
     cursor = skipTrivia(content, arg.end)
   }
 
-  return content.startsWith('=>', cursor) && cursor < end ? `${asyncPrefix ? 'async ' : ''}${name}${params}` : undefined
+  return findArrowAfterParams(content, cursor, end) !== undefined ? `${asyncPrefix ? 'async ' : ''}${name}${params}` : undefined
+}
+
+function findArrowAfterParams(content: string, start: number, end: number): number | undefined {
+  let depth = 0
+
+  for (let index = skipTrivia(content, start); index < end; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    if (depth === 0 && content.startsWith('=>', index)) {
+      return index
+    }
+
+    const char = content[index]
+    if (char === '{' || char === '[' || char === '(' || char === '<') {
+      depth += 1
+      continue
+    }
+    if (char === '}' || char === ']' || char === ')' || char === '>') {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth === 0 && (char === ',' || char === ';')) {
+      return undefined
+    }
+  }
+
+  return undefined
+}
+
+function readObjectMethodSignature(content: string, name: string, start: number, end: number): string | undefined {
+  let cursor = skipTrivia(content, start)
+  let asyncPrefix = false
+  const asyncToken = readIdentifier(content, cursor)
+  if (asyncToken?.value === 'async') {
+    asyncPrefix = true
+    cursor = skipTrivia(content, asyncToken.end)
+  }
+
+  const memberName = readTypeMemberName(content, cursor)
+  if (!memberName || memberName.value !== name) {
+    return undefined
+  }
+
+  cursor = skipTrivia(content, memberName.rawEnd ?? memberName.end)
+  if (content[cursor] !== '(' || cursor >= end) {
+    return undefined
+  }
+
+  const paramsEnd = findMatchingBracket(content, cursor)
+  if (paramsEnd >= end) {
+    return undefined
+  }
+  const params = content.slice(cursor, paramsEnd + 1).replace(/\s+/g, ' ')
+  return `${asyncPrefix ? 'async ' : ''}${name}${params}`
 }
 
 function collectLocalFunctionDefinitions(segment: ScriptSegment): Map<string, MethodInfo> {
@@ -1531,17 +1712,33 @@ function parseDefineExposeMethods(segment: ScriptSegment | undefined, uri: strin
         continue
       }
 
-      const afterName = skipTrivia(segment.content, name.rawEnd ?? name.end)
+      let publicName = name
+      const methodStart = name.start
+      let afterName = skipTrivia(segment.content, name.rawEnd ?? name.end)
+      if (name.value === 'async' && segment.content[afterName] !== '(' && segment.content[afterName] !== ':') {
+        const asyncMethodName = readTypeMemberName(segment.content, afterName)
+        const afterAsyncMethodName = asyncMethodName ? skipTrivia(segment.content, asyncMethodName.rawEnd ?? asyncMethodName.end) : -1
+        if (asyncMethodName && segment.content[afterAsyncMethodName] === '(') {
+          publicName = asyncMethodName
+          afterName = afterAsyncMethodName
+        }
+      }
+
       if (segment.content[afterName] === '(') {
         const memberEnd = findMemberEnd(segment.content, afterName, objectEnd)
-        const publicSpan = { start: segment.start + name.start, end: segment.start + name.end }
-        const signature = readFunctionSignature(segment.content, name.value, afterName, memberEnd) ?? `${name.value}()`
+        const publicSpan = { start: segment.start + publicName.start, end: segment.start + publicName.end }
+        const signature = readObjectMethodSignature(segment.content, publicName.value, methodStart, memberEnd) ?? `${publicName.value}()`
         methods.push({
-          name: name.value,
+          name: publicName.value,
           span: publicSpan,
           detail: signature,
           signature,
           documentation: trivia.documentation,
+          sourceLocation: {
+            uri,
+            lineStarts,
+            span: publicSpan,
+          },
         })
         cursor = memberEnd + 1
         continue
@@ -1549,10 +1746,11 @@ function parseDefineExposeMethods(segment: ScriptSegment | undefined, uri: strin
 
       if (segment.content[afterName] === ':') {
         const valueStart = skipTrivia(segment.content, afterName + 1)
+        const memberEnd = findMemberEnd(segment.content, valueStart, objectEnd)
+        const publicSpan = { start: segment.start + name.start, end: segment.start + name.end }
         const valueName = readIdentifier(segment.content, valueStart)
         const local = valueName ? localFunctions.get(valueName.value) : undefined
         if (local) {
-          const publicSpan = { start: segment.start + name.start, end: segment.start + name.end }
           methods.push({
             ...local,
             name: name.value,
@@ -1566,8 +1764,25 @@ function parseDefineExposeMethods(segment: ScriptSegment | undefined, uri: strin
               span: local.span,
             },
           })
+        } else {
+          const signature = readFunctionExpressionSignature(segment.content, name.value, valueStart, memberEnd)
+            ?? readArrowFunctionSignature(segment.content, name.value, valueStart, memberEnd)
+          if (signature) {
+            methods.push({
+              name: name.value,
+              span: publicSpan,
+              detail: signature,
+              signature,
+              documentation: trivia.documentation,
+              sourceLocation: {
+                uri,
+                lineStarts,
+                span: publicSpan,
+              },
+            })
+          }
         }
-        cursor = findMemberEnd(segment.content, valueStart, objectEnd) + 1
+        cursor = memberEnd + 1
         continue
       }
 
@@ -1691,12 +1906,13 @@ export function parseVue3Script(sfc: ParsedSfc, workspaceRoots: string[] = [], c
   const imports = segments.flatMap((segment) => parseImports(segment.content))
   const setupImports = setupSegment ? parseImports(setupSegment.content) : []
   const defineProps = setupSegment ? parseDefineProps(setupSegment) : undefined
+  const typeFileCache = new Map<string, TypeFileContent | undefined>()
   const resolvedType = defineProps
-    ? resolveTypeMembers(sfc.uri, sfc.lineStarts, segments, imports, defineProps, workspaceRoots)
+    ? resolveTypeMembers(sfc.uri, sfc.lineStarts, segments, imports, defineProps, workspaceRoots, typeFileCache)
     : undefined
   const props = resolvedType?.props ?? []
   const staticKeys = parseStaticKeys(sfc.uri, sfc.lineStarts, segments, imports, workspaceRoots, cache)
-  const emits = parseSetupModels(setupSegment, parseSetupEmits(setupSegment))
+  const emits = parseSetupModels(setupSegment, parseSetupEmits(setupSegment, sfc.uri, sfc.lineStarts, segments, imports, workspaceRoots, typeFileCache))
 
   return {
     ...emptyScriptIndex(imports),
@@ -1710,6 +1926,6 @@ export function parseVue3Script(sfc: ParsedSfc, workspaceRoots: string[] = [], c
     injects: parseInjects(segments, staticKeys),
     vue3PropType: resolvedType?.typeInfo,
     vue3PropUsages: collectVue3PropUsages(defineProps, props, setupSegment, sfc.template),
-    slots: parseDefineSlots(setupSegment),
+    slots: parseDefineSlots(setupSegment, sfc.uri, sfc.lineStarts, segments, imports, workspaceRoots, typeFileCache),
   }
 }

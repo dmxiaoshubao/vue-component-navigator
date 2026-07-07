@@ -1,7 +1,7 @@
 import * as vscode from 'vscode'
 import type { SourceLocation, TextSpan, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findIndexedTemplatePropUsages, findInject, findMethod, findProp, findProvideAtOffset, findResolvedRefComponents, hasRegisteredComponent } from '../indexer/relationResolver'
+import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findIndexedTemplatePropUsages, findInject, findProp, findProvideAtOffset, findResolvedRefComponents, hasRegisteredComponent } from '../indexer/relationResolver'
 import { containsOffsetStrict, createLineStarts, positionToOffset, spanToRange } from '../utils/position'
 
 function toRange(file: VueFileIndex, span: TextSpan): vscode.Range {
@@ -87,9 +87,8 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
     const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
       const definitions = uniqueLocations(findResolvedRefComponents(this.index, file, refAccess.refName).flatMap((childUri) => {
-        const child = this.index.getFile(childUri)
-        const method = child ? findMethod(child, refAccess.methodName) : undefined
-        return child && method ? [toLocation(child, method.span, method.sourceLocation)] : []
+        return this.index.findRefMethodDefinitions(childUri, refAccess.methodName)
+          .map(({ file, method }) => toLocation(file, method.span, method.sourceLocation))
       }))
       return locationResult(definitions)
     }
@@ -183,9 +182,8 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
   private provideSourceDefinition(sourceUri: string, offset: number): vscode.Definition | undefined {
     const refDefinitions = uniqueLocations(this.index.findSourceRefMethodCalls(sourceUri, offset).flatMap(({ file, call }) => {
       return findResolvedRefComponents(this.index, file, call.refName).flatMap((childUri) => {
-        const child = this.index.getFile(childUri)
-        const method = child ? findMethod(child, call.methodName) : undefined
-        return child && method ? [toLocation(child, method.span, method.sourceLocation)] : []
+        return this.index.findRefMethodDefinitions(childUri, call.methodName)
+          .map(({ file, method }) => toLocation(file, method.span, method.sourceLocation))
       })
     }))
     if (refDefinitions.length > 0) {

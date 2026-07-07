@@ -4,9 +4,9 @@
 
 > English documentation: [README.md](./README.md)
 
-这个插件主要处理 Vue 项目里容易断开的静态关系。Vue 2 继续支持 `$refs`、组件 props/events、slots、`provide` / `inject`、mixins、全局组件，以及常见的 Event Bus。Vue 3 支持范围更聚焦，当前覆盖 `defineProps`、`defineEmits`、`defineModel`、`defineSlots`、`defineExpose`、静态动态组件和静态 `provide` / `inject` 这类类型化组件契约。
+这个插件主要处理 Vue 项目里容易断开的静态关系。它是 Vue 官方工具的补充，不会替代官方扩展；局部组件标签名的定义跳转会交给 Vue 语言扩展处理，避免同一个位置出现重复结果。
 
-它不会替代 Vue 官方工具。比如局部组件标签名的定义跳转会交给官方扩展处理，避免同一个位置出现重复结果。
+当前文档对应功能版本：`1.3.0`。
 
 ## 功能演示
 
@@ -15,7 +15,6 @@
 展示从 `this.$refs.child.open()` 跳到子组件方法，并展示方法补全和 hover。
 
 ##### ![$refs 跳转](docs/gifs/refs-navigation.gif)
-
 
 ### Props 和 Events
 
@@ -29,210 +28,53 @@
 
 ##### ![Event Bus](docs/gifs/event-bus.gif)
 
-
 ### `provide` / `inject`
 
 展示静态 `inject` key 跳到最近的静态 provider，以及 provider 反查 consumer。
 
 ##### ![provide inject](docs/gifs/provide-inject.gif)
 
+## 功能矩阵
 
-## 支持的场景
+| 能力             | 支持的关系                                                                               | Vue 2                                                        | Vue 3                                                                                           |
+| ---------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| 编辑器动作       | 已索引关系上的定义跳转、引用查询、hover、补全和 CodeLens。                               | 支持                                                         | 支持已索引的静态关系                                                                            |
+| 组件用法         | 静态组件 import、异步组件 import、简单别名、用法 CodeLens，以及静态 `.vue` import 用法。 | 支持                                                         | 支持 `<script setup>` 局部 import 和静态动态组件 map                                            |
+| Props            | 模板 prop 使用到子组件 prop 定义，包括 `$attrs` wrapper 透传。                           | 支持                                                         | `defineProps` 内联类型、命名类型、导入类型、命名泛型类型成员、组件内部 prop 使用、`$attrs` / `useAttrs()` / `mergeProps()` 透传、静态对象 `v-bind` |
+| Events / emits   | 模板监听到组件事件声明和 emit 调用点。                                                   | `this.$emit(...)` 和 `$listeners` wrapper 透传               | `defineEmits` 内联对象/数组、调用签名、命名/导入/泛型类型成员，以及 emit 调用                   |
+| Models           | model 使用到组件 model 契约。                                                            | 静态可见时通过 prop 和 event 关系覆盖                        | `defineModel()` 和 `defineModel('name')` 到 `v-model` / `v-model:name`                          |
+| Slots            | slot 定义到父组件 slot 使用。                                                            | legacy `<slot name>` 和 `slot="..."` 关系                    | `defineSlots` 内联类型、命名类型、导入类型、命名泛型类型成员到 `#name` / `v-slot:name`          |
+| Template refs    | ref 方法调用到子组件方法。                                                               | `this.$refs.name.method()` 的补全、hover、定义跳转和引用查询 | `ref.value?.method()`、非空断言、类型断言、TSX/h refs 和 `useTemplateRef<T>()`                  |
+| Exposed methods  | 暴露的公开方法到父组件 ref 调用。                                                        | 通过 `$refs` 访问的组件 methods                              | `defineExpose` 本地函数、对象方法、async 方法、函数表达式、内联箭头函数和 composable 转发       |
+| Composables      | 返回成员到消费端解构使用。                                                               | 不适用                                                       | 静态 composable / hook 返回成员反向引用                                                         |
+| Provide / inject | 静态 provider key 到 consumer。                                                          | 静态字符串 key                                               | 静态字符串、静态 `Symbol` key 和 `InjectionKey` 关系                                            |
+| Mixins           | workspace 文件中的静态 imported mixin 成员。                                             | 支持 `.js`、`.ts`、`.vue` 文件                               | 非目标能力                                                                                      |
+| Event Bus        | 静态事件名跳转、补全、hover 和引用查询。                                                 | 从配置入口识别到 bus 后支持                                  | 非目标能力                                                                                      |
+| 全局组件         | 静态全局注册到组件用法。                                                                 | `Vue.component(...)`                                         | 非目标能力                                                                                      |
+| 第三方组件 refs  | 已知组件库 ref 方法。                                                                    | Element UI、Vant 等 ref 方法，例如表单校验和输入框 focus     | 非目标能力                                                                                      |
+| 类型感知导航     | 通过 TypeScript 声明识别组件契约成员。                                                   | 限于静态 Options API 模式                                    | `defineProps`、`defineEmits`、`defineSlots`、`defineExpose`、typed template refs 和导入类型声明 |
+| 路径别名         | 从最近的 `jsconfig.json` 或 `tsconfig.json` 读取 workspace 路径别名。                    | 支持                                                         | 支持                                                                                            |
 
-- `$refs` 方法跳转、补全、hover 和引用查询。
-- 模板 prop 跳到子组件 prop 定义。
-- 模板事件和子组件 `this.$emit(...)` 互相跳转。
-- 在组件 `<template>` 标签处显示组件用法 CodeLens，并支持 template 标签和静态 `.vue` import 用法的点击跳转。
-- Vue 2 通过 `v-bind="$attrs"` / `v-on="$listeners"` wrapper 透传的 prop 和 listener 导航，包括可静态解析的动态组件候选。
-- Vue 2 子组件 `<slot name="...">` 定义和父组件 `slot="..."` 使用之间的关系。
-- Vue 2 Event Bus 静态字符串事件名导航。
-- 静态 `provide` / `inject` key 跳转和补全。
-- 静态局部组件 import、异步组件 import、简单别名。
-- workspace 内 `.js`、`.ts`、`.vue` 文件中的静态 mixin。
-- `Vue.component(...)` 这类静态全局组件注册。
-- 已支持第三方库的 `$refs` 方法类型，例如 Element UI 的 `el-form.validate()` 和 Vant 的 `van-field.focus()`。
-- Vue 3 `<script setup>` 中的局部组件 import。
-- Vue 3 `defineProps<Props>()` / `defineProps<{ ... }>()` 的类型成员与组件内部静态 prop 使用。
-- Vue 3 `defineEmits` 声明和 `emit('confirm')` 这类调用与父组件模板监听的关系。
-- Vue 3 通过 `v-bind="$attrs"` 透传的 listener 与子组件 `defineEmits` 声明关系。
-- Vue 3 `defineModel()` / `defineModel('show')` 与父组件 `v-model` / `v-model:show` 使用的关系。
-- Vue 3 `defineSlots<{ ... }>()` 与父组件 `#slot` / `v-slot:slot` 使用的关系。
-- Vue 3 `defineExpose({ open })` 与父组件 `childRef.value?.open()` 这类 template ref 调用的关系。
-- Vue 3 `<component :is="componentMap[type]" />` 使用的静态动态组件 map 候选。
-- Vue 3 composable / hook 返回成员从源码定义到消费端解构使用的反向引用。
-- Vue 3 静态 `provide('key', value)` / `inject('key')` 和 `InjectionKey` / `Symbol` key 关系。
-- 从最近的 `jsconfig.json` 或 `tsconfig.json` 读取 `@/` 这类路径别名。
+## Vue 3 静态 Prop 关系
 
-## 关系示例
+Vue 3 prop 导航会在能够静态证明关系时，把父模板中的 prop 使用链接到子组件 `defineProps` 声明。
 
-### Vue 3 `defineModel` 和父组件 `v-model`
+支持的模板形式包括：
 
-子组件可以用 `defineModel` 声明 model 契约。在子组件 model 定义处 hover 或查找引用，可以看到父组件的 `v-model` 使用；父组件 `v-model` 使用处也可以跳回子组件契约。
+- 直接 prop，例如 `<Child :title="title" />`，并支持 kebab/camel case 变体。
+- 通过 `<Child v-bind="$attrs" />` 做 wrapper 透传。
+- 通过 `useAttrs()` 创建别名后再 `v-bind`，包括简单的 `computed(() => ({ ...attrs }))` 包装。
+- `mergeProps($attrs, props)`，前提是每个参数都能被静态解析。
+- 静态对象 `v-bind`，包括对象字面量，以及被 `ref`、`shallowRef`、`reactive`、`shallowReactive`、`readonly`、`markRaw` 或简单 `computed` 箭头返回包装的对象。
+- `defineProps()` / `withDefaults(defineProps(), ...)` 的顶层别名。
+- 顶层 rest 绑定，例如 `const { title, ...forwardedProps } = props`，也支持解构模式上的类型标注。
+- 同一条声明里的多个 declarator，例如 `const ignored = {}, childProps = { title: 'ok' }`。
 
-```vue
-<!-- Child.vue -->
-<script setup lang="ts">
-defineModel<boolean>('visible')
-const modelValue = defineModel<string>()
-</script>
-```
-
-```vue
-<!-- Parent.vue -->
-<template>
-  <Child v-model:visible="visible" v-model="title" />
-</template>
-```
-
-### Vue 3 `defineSlots` 和父组件 slot 使用
-
-`defineSlots` 声明的 slot 契约会和父组件 `#name` / `v-slot:name` 使用关联。扫描时只把直接子节点里的 slot 模板归属给当前组件，嵌套组件里的 slot 不会误算到外层组件。
-
-```vue
-<!-- Child.vue -->
-<script setup lang="ts">
-defineSlots<{
-  footer?: () => any
-  default?: () => any
-}>()
-</script>
-```
-
-```vue
-<!-- Parent.vue -->
-<template>
-  <Child>
-    <template #footer>Footer</template>
-  </Child>
-</template>
-```
-
-### Vue 3 `defineExpose` 和 template ref
-
-子组件暴露的方法会和父组件 template ref 调用关联。扩展只索引能匹配到子组件 `defineExpose` 的方法；普通 `.value` ref 不会被当作组件方法调用。
-
-```vue
-<!-- Child.vue -->
-<script setup lang="ts">
-function open() {}
-
-defineExpose({ open })
-</script>
-```
-
-```vue
-<!-- Parent.vue -->
-<script setup lang="ts">
-import { ref } from 'vue'
-import Child from './Child.vue'
-
-const childRef = ref<InstanceType<typeof Child>>()
-
-childRef.value?.open()
-</script>
-
-<template>
-  <Child ref="childRef" />
-</template>
-```
-
-Vue 3.5 的 `useTemplateRef` 名称也支持：
-
-```vue
-<script setup lang="ts">
-const panel = useTemplateRef<InstanceType<typeof Child>>('childRef')
-
-panel.value?.open()
-</script>
-
-<template>
-  <Child ref="childRef" />
-</template>
-```
-
-### Vue 3 静态动态组件 map
-
-`<script setup>` 中的静态对象 map 被 `<component :is="...">` 使用时，会参与组件用法关系。
-
-```vue
-<script setup lang="ts">
-import UserPanel from './UserPanel.vue'
-import OrderPanel from './OrderPanel.vue'
-
-const componentMap = {
-  user: UserPanel,
-  order: OrderPanel,
-}
-</script>
-
-<template>
-  <component :is="componentMap[type]" />
-</template>
-```
-
-`UserPanel` 和 `OrderPanel` 都会被识别为可能的动态组件用法。
-
-### Vue 3 composable 返回成员使用
-
-Composable 返回成员可以从源码定义反查到消费端解构后的使用位置。在 hook 源码里的 `runVerifyWithCode` 上 hover 或查找引用，可以看到哪些消费文件调用了这个返回成员。
-
-```ts
-// hooks/use-verify.ts
-const useVerify = () => {
-  const runVerifyWithCode = async (code: string) => code
-
-  return {
-    runVerifyWithCode,
-  }
-}
-
-export default useVerify
-```
-
-```vue
-<!-- VerifyPanel.vue -->
-<script setup lang="ts">
-import useVerify from './hooks/use-verify'
-
-const { runVerifyWithCode } = useVerify()
-
-runVerifyWithCode('code')
-</script>
-```
-
-### Vue 2 slots
-
-Vue 2 子组件 slot 定义会和父组件 legacy slot 使用关联。在子组件 `<slot name="...">` 处 hover 或查找引用可以看到父组件使用，父组件 `slot="..."` 也可以跳回子组件 slot 定义。
-
-```vue
-<!-- Child.vue -->
-<template>
-  <section>
-    <slot />
-    <slot name="footer" />
-    <slot name="actionBar" />
-  </section>
-</template>
-```
-
-```vue
-<!-- Parent.vue -->
-<template>
-  <Child>
-    <template slot="footer">Footer</template>
-    <button slot="action-bar">Action</button>
-  </Child>
-</template>
-```
+扫描器只追踪组件脚本块里的顶层绑定。运行时分支、导入对象值、动态属性名、复杂 TypeScript 类型展开不会被求值。
 
 ## Event Bus 入口
 
-Event Bus 名称需要能从 Vue prototype 注册中识别，例如：
-
-```js
-Vue.prototype.$bus = new Vue()
-Vue.prototype.$eventBus = new Vue()
-```
+Event Bus 名称需要能从入口文件里的 Vue prototype 注册中识别。
 
 默认会检查这些入口：
 
@@ -241,23 +83,7 @@ Vue.prototype.$eventBus = new Vue()
 - `src/main.ts`
 - `src/index.ts`
 
-如果项目入口不在这些文件里，可以显式配置：
-
-```json
-{
-  "vueComponentNavigator.entry": "src/bootstrap.js"
-}
-```
-
-也可以配置多个入口：
-
-```json
-{
-  "vueComponentNavigator.entry": ["src/bootstrap.js", "@/entry"]
-}
-```
-
-入口路径支持 workspace 相对路径，也支持 `jsconfig.json` / `tsconfig.json` 中 `compilerOptions.baseUrl` 和 `compilerOptions.paths` 定义的别名。
+如果项目入口不在这些文件里，可以把 `vueComponentNavigator.entry` 设置为 workspace 相对路径、别名路径，或路径数组。入口路径支持 `jsconfig.json` / `tsconfig.json` 中 `compilerOptions.baseUrl` 和 `compilerOptions.paths` 定义的别名。
 
 扫描范围只包括入口文件本身，以及入口直接字面量 `import`、`import()`、`require()` 的一层文件。不会继续递归扫整个项目。
 
@@ -265,20 +91,23 @@ Vue.prototype.$eventBus = new Vue()
 
 ## 命令
 
-| 命令 | 说明 |
-| --- | --- |
-| `Vue Component Navigator: Show Status` | 查看索引状态，以及当前文件是否已被索引。 |
+| 命令                                         | 说明                                                    |
+| -------------------------------------------- | ------------------------------------------------------- |
+| `Vue Component Navigator: Show Status`       | 查看索引状态，以及当前文件是否已被索引。                |
 | `Vue Component Navigator: Reindex Workspace` | 手动重建 workspace 索引。大型重构或配置变更后可以使用。 |
 
 ## 配置
 
-| 配置 | 说明 |
-| --- | --- |
+| 配置                          | 说明                                             |
+| ----------------------------- | ------------------------------------------------ |
 | `vueComponentNavigator.entry` | Event Bus 注册入口文件。支持字符串或字符串数组。 |
 
 ## 边界
 
 - Vue 2 和 Vue 3 workspace 会按检测到的 Vue 主版本分别索引，两套能力边界保持隔离。
 - 忽略 workspace 外部文件。
+- 动态组件名、计算得出的 `provide` / `inject` key、运行时事件名和动态 Event Bus 名称不在支持范围内。
+- conditional、mapped、intersection 等复杂 TypeScript 类型展开会保持有限支持。
+- 静态对象 `v-bind` 会保持保守策略。如果值来自运行时控制流、导入对象或无法在本地解析的函数返回，会被忽略。
 
 解析策略会尽量保守。静态证明不了的关系，不返回猜测结果。

@@ -12,7 +12,7 @@ import { parseScript } from './scriptParser'
 import { parseTemplate } from './templateParser'
 import { createVue3ScriptParseCache, parseVue3Script } from './vue3ScriptParser'
 import { createLineStarts, positionToOffset } from '../utils/position'
-import { matchesName, toKebabCase } from '../utils/casing'
+import { matchesName, toCamelCase, toKebabCase } from '../utils/casing'
 import { maskStringsAndComments, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
 export interface IndexCancellationToken {
@@ -37,6 +37,14 @@ interface ScriptComponentUsageImport {
   fallbackSpan: TextSpan
   spans: TextSpan[]
 }
+
+interface ForwardedRefMethodNameCacheEntry {
+  mtimeMs: number
+  size: number
+  methodsByExportName: Map<string, string[]>
+}
+
+type ForwardedRefMethodNameCache = Map<string, ForwardedRefMethodNameCacheEntry>
 
 function emptyScriptIndex(): ScriptIndex {
   return {
@@ -75,6 +83,7 @@ export class WorkspaceIndex {
   private readonly eventBusListeners = new Map<string, EventBusUsageInfo[]>()
   private readonly eventBusEventNames = new Map<string, Set<string>>()
   private readonly refMethodUsages = new Map<string, UsageInfo[]>()
+  private readonly refMethodForwards = new Map<string, UsageInfo[]>()
   private readonly vue3PropInternalUsages = new Map<string, UsageInfo[]>()
   private readonly provideDefinitions = new Map<string, UsageInfo[]>()
   private readonly injectUsages = new Map<string, UsageInfo[]>()
@@ -82,6 +91,7 @@ export class WorkspaceIndex {
   private readonly sourcePropTypes: SourceRelationMap<{ file: VueFileIndex, type: Vue3PropTypeInfo }> = new Map()
   private readonly sourceMethods: SourceRelationMap<{ file: VueFileIndex, method: MethodInfo }> = new Map()
   private readonly sourceEmits: SourceRelationMap<{ file: VueFileIndex, emit: ScriptIndex['emits'][number] }> = new Map()
+  private readonly sourceSlots: SourceRelationMap<{ file: VueFileIndex, slot: SlotInfo }> = new Map()
   private readonly sourceEventBusCalls: SourceRelationMap<{ file: VueFileIndex, call: EventBusCall }> = new Map()
   private readonly sourceProvides: SourceRelationMap<{ file: VueFileIndex, provide: ProvideInfo }> = new Map()
   private readonly sourceInjects: SourceRelationMap<{ file: VueFileIndex, inject: InjectInfo }> = new Map()
@@ -95,7 +105,9 @@ export class WorkspaceIndex {
   private readonly mixinSourceUris = new Set<string>()
   private readonly vue3ScriptParseCache = createVue3ScriptParseCache()
   private readonly composableReturnParseCache: ComposableReturnParseCache = createComposableReturnParseCache()
+  private readonly forwardedRefMethodNameCache: ForwardedRefMethodNameCache = new Map()
   private usageKeysByFile = new WeakMap<VueFileIndex, Map<TrackedUsageMap, Set<string>>>()
+  private refMethodForwardKeysByFile = new WeakMap<VueFileIndex, Set<string>>()
   private sourceKeysByFile = new WeakMap<VueFileIndex, Set<string>>()
   private scriptImportKeysByFile = new WeakMap<VueFileIndex, Set<string>>()
   private injectUsageKeysByProvider = new WeakMap<VueFileIndex, Set<string>>()
@@ -118,6 +130,7 @@ export class WorkspaceIndex {
     this.mixinSourceUris.clear()
     this.vue3ScriptParseCache.clear()
     this.composableReturnParseCache.clear()
+    this.forwardedRefMethodNameCache.clear()
     this.clearReverseIndexes()
   }
 
@@ -169,6 +182,14 @@ export class WorkspaceIndex {
     this.composableReturnParseCache.clear()
     for (const [uri, entry] of other.composableReturnParseCache) {
       this.composableReturnParseCache.set(uri, entry)
+    }
+    this.forwardedRefMethodNameCache.clear()
+    for (const [uri, entry] of other.forwardedRefMethodNameCache) {
+      this.forwardedRefMethodNameCache.set(uri, {
+        mtimeMs: entry.mtimeMs,
+        size: entry.size,
+        methodsByExportName: new Map([...entry.methodsByExportName].map(([name, methods]) => [name, [...methods]])),
+      })
     }
     this.rebuildReverseIndexes()
   }
@@ -339,7 +360,10 @@ export class WorkspaceIndex {
             ...findRefMethodCalls(searchableContent),
             ...mixed.refMethodCalls,
           ]
-        : findVue3TemplateRefMethodCalls(sfc.content),
+        : [
+            ...findVue3TemplateRefMethodCalls(sfc.content),
+            ...findVue3DefineExposeForwardedRefMethodCalls(uri, sfc, scriptIndex.imports, this.workspaceRoots, this.forwardedRefMethodNameCache),
+          ],
     }
     this.files.set(uri, file)
     if (this.isBulkIndexing) {
@@ -526,6 +550,7 @@ export class WorkspaceIndex {
     const hasVue3ImportConsumers = vueVersion === 3 && this.vue3ScriptImportConsumers.has(uri)
     if (vueVersion === 3) {
       this.composableReturnParseCache.delete(uri)
+      this.forwardedRefMethodNameCache.delete(uri)
     }
     const content = await readTextIfExists(uri)
     if (content !== undefined) {
@@ -572,6 +597,7 @@ export class WorkspaceIndex {
     this.removeScriptComponentUsageFile(uri)
     if (this.vueVersionForUri(uri) === 3) {
       this.composableReturnParseCache.delete(uri)
+      this.forwardedRefMethodNameCache.delete(uri)
       this.remove(uri)
       this.rebuildVue3ScriptImportConsumers(uri)
       return
@@ -667,6 +693,10 @@ export class WorkspaceIndex {
     return dedupePropDefinitions(this.findPropDefinitionsRecursive(childUri, propName, new Set<string>()))
   }
 
+  findRefMethodDefinitions(childUri: string, methodName: string): Array<{ file: VueFileIndex, method: MethodInfo }> {
+    return dedupeMethodDefinitions(this.findRefMethodDefinitionsRecursive(childUri, methodName, new Set<string>()))
+  }
+
   findEventBusEmits(busName: string, eventName: string): EventBusUsageInfo[] {
     return dedupeUsages(this.eventBusEmits.get(eventBusKey(busName, eventName)) ?? [])
   }
@@ -680,7 +710,20 @@ export class WorkspaceIndex {
   }
 
   findRefMethodUsages(childUri: string, methodName: string): UsageInfo[] {
-    return dedupeUsages(this.refMethodUsages.get(usageKey(childUri, methodName)) ?? [])
+    return dedupeUsages(this.findRefMethodUsagesRecursive(childUri, methodName, new Set<string>()))
+  }
+
+  private findRefMethodUsagesRecursive(childUri: string, methodName: string, visited: Set<string>): UsageInfo[] {
+    const key = usageKey(childUri, methodName)
+    if (visited.has(key)) {
+      return []
+    }
+    visited.add(key)
+
+    return [
+      ...(this.refMethodUsages.get(key) ?? []),
+      ...(this.refMethodForwards.get(key) ?? []).flatMap((forward) => this.findRefMethodUsagesRecursive(forward.file.uri, methodName, visited)),
+    ]
   }
 
   findInjectUsages(providerUri: string, provideKey: string): UsageInfo[] {
@@ -1178,6 +1221,7 @@ export class WorkspaceIndex {
     this.eventBusListeners.clear()
     this.eventBusEventNames.clear()
     this.refMethodUsages.clear()
+    this.refMethodForwards.clear()
     this.vue3PropInternalUsages.clear()
     this.provideDefinitions.clear()
     this.injectUsages.clear()
@@ -1185,6 +1229,7 @@ export class WorkspaceIndex {
     this.sourcePropTypes.clear()
     this.sourceMethods.clear()
     this.sourceEmits.clear()
+    this.sourceSlots.clear()
     this.sourceEventBusCalls.clear()
     this.sourceProvides.clear()
     this.sourceInjects.clear()
@@ -1194,6 +1239,7 @@ export class WorkspaceIndex {
     this.vue3ScriptImportConsumers.clear()
     this.parentComponents.clear()
     this.usageKeysByFile = new WeakMap()
+    this.refMethodForwardKeysByFile = new WeakMap()
     this.sourceKeysByFile = new WeakMap()
     this.scriptImportKeysByFile = new WeakMap()
     this.injectUsageKeysByProvider = new WeakMap()
@@ -1237,6 +1283,15 @@ export class WorkspaceIndex {
   private addUsage<T extends UsageInfo>(map: Map<string, T[]>, key: string, usage: T): void {
     addUsage(map, key, usage)
     this.trackUsage(map, key, usage.file)
+  }
+
+  private addRefMethodForward(childUri: string, methodName: string, usage: UsageInfo): void {
+    const key = usageKey(childUri, methodName)
+    addUsage(this.refMethodForwards, key, usage)
+
+    const keys = this.refMethodForwardKeysByFile.get(usage.file) ?? new Set<string>()
+    keys.add(key)
+    this.refMethodForwardKeysByFile.set(usage.file, keys)
   }
 
   private addUsageIfMissing<T extends UsageInfo>(map: Map<string, T[]>, key: string, usage: T): boolean {
@@ -1287,6 +1342,9 @@ export class WorkspaceIndex {
     }
     for (const emit of file.scriptIndex.emits) {
       this.addSourceRelation(this.sourceEmits, emit.sourceLocation, { file, emit })
+    }
+    for (const slot of file.scriptIndex.slots) {
+      this.addSourceRelation(this.sourceSlots, slot.sourceLocation, { file, slot })
     }
     for (const call of file.scriptIndex.eventBusCalls) {
       this.addSourceRelation(this.sourceEventBusCalls, call.sourceLocation, { file, call })
@@ -1371,6 +1429,7 @@ export class WorkspaceIndex {
       removeSourceRelationItem(this.sourcePropTypes, key, file)
       removeSourceRelationItem(this.sourceMethods, key, file)
       removeSourceRelationItem(this.sourceEmits, key, file)
+      removeSourceRelationItem(this.sourceSlots, key, file)
       removeSourceRelationItem(this.sourceEventBusCalls, key, file)
       removeSourceRelationItem(this.sourceProvides, key, file)
       removeSourceRelationItem(this.sourceInjects, key, file)
@@ -1400,6 +1459,18 @@ export class WorkspaceIndex {
       }
     }
     this.scriptImportKeysByFile.delete(file)
+  }
+
+  private removeFileRefMethodForwards(file: VueFileIndex): void {
+    const keys = this.refMethodForwardKeysByFile.get(file)
+    if (!keys) {
+      return
+    }
+
+    for (const key of keys) {
+      removeFileUsageAtKey(this.refMethodForwards, key, file)
+    }
+    this.refMethodForwardKeysByFile.delete(file)
   }
 
   private removeTrackedProviderUsages(file: VueFileIndex): void {
@@ -1475,13 +1546,18 @@ export class WorkspaceIndex {
       for (const attr of component.attrs) {
         for (const childUri of childUris) {
           if (attr.kind === 'prop') {
-            const child = this.getFile(childUri)
-            if (child?.vueVersion === 3) {
-              continue
-            }
             this.addUsage(this.propUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
           } else if (attr.kind === 'event') {
             this.addUsage(this.eventUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
+          }
+        }
+      }
+
+      for (const bind of component.binds) {
+        const resolved = resolveTemplateBindExpression(file, bind.expression)
+        for (const propName of resolved.propNames) {
+          for (const childUri of childUris) {
+            this.addUsage(this.propUsages, usageKey(childUri, propName), { file, span: bind.span })
           }
         }
       }
@@ -1496,10 +1572,14 @@ export class WorkspaceIndex {
     for (const call of file.refMethodCalls) {
       for (const childUri of this.resolveRefComponents(file, call.refName)) {
         const child = this.getFile(childUri)
-        if (file.vueVersion === 3 && !child?.scriptIndex.methods.some((method) => method.name === call.methodName)) {
+        if (file.vueVersion === 3 && !hasVue3RefMethod(child, call.methodName)) {
           continue
         }
-        this.addUsage(this.refMethodUsages, usageKey(childUri, call.methodName), { file, span: call.methodSpan, sourceLocation: call.sourceLocation })
+        if (call.forwarded) {
+          this.addRefMethodForward(childUri, call.methodName, { file, span: call.methodSpan, sourceLocation: call.sourceLocation })
+        } else {
+          this.addUsage(this.refMethodUsages, usageKey(childUri, call.methodName), { file, span: call.methodSpan, sourceLocation: call.sourceLocation })
+        }
       }
     }
 
@@ -1521,7 +1601,7 @@ export class WorkspaceIndex {
           continue
         }
         for (const component of file.templateIndex.components) {
-          if (!component.forwardsListeners) {
+          if (!componentForwardsListeners(file, component)) {
             continue
           }
           const childUris = this.resolveTemplateComponentUris(file, component)
@@ -1544,15 +1624,12 @@ export class WorkspaceIndex {
       changed = false
       const incomingProps = this.collectIncomingTemplatePropUsages()
       for (const file of this.files.values()) {
-        if (file.vueVersion !== 2) {
-          continue
-        }
         const fileIncomingProps = incomingProps.get(file.uri)
         if (!fileIncomingProps?.length) {
           continue
         }
         for (const component of file.templateIndex.components) {
-          if (!component.forwardsAttrs) {
+          if (!componentForwardsAttrs(file, component)) {
             continue
           }
           const childUris = this.resolveTemplateComponentUris(file, component)
@@ -1561,10 +1638,6 @@ export class WorkspaceIndex {
               continue
             }
             for (const childUri of childUris) {
-              const child = this.getFile(childUri)
-              if (child?.vueVersion === 3) {
-                continue
-              }
               changed = this.addUsageIfMissing(this.propUsages, usageKey(childUri, propName), usage) || changed
             }
           }
@@ -1583,8 +1656,12 @@ export class WorkspaceIndex {
       return []
     }
 
-    const definitions = file.scriptIndex.emits
+    const matchingEmits = file.scriptIndex.emits
       .filter((emit) => matchesName(emit.eventName, eventName))
+    const preferredEmits = matchingEmits.some((emit) => emit.declared)
+      ? matchingEmits.filter((emit) => emit.declared)
+      : matchingEmits
+    const definitions = preferredEmits
       .map((emit) => ({ file, emit }))
 
     if (file.vueVersion === 3 && definitions.length > 0) {
@@ -1592,7 +1669,7 @@ export class WorkspaceIndex {
     }
 
     for (const component of file.templateIndex.components) {
-      if (!component.forwardsListeners) {
+      if (!componentForwardsListeners(file, component)) {
         continue
       }
       for (const forwardedChildUri of this.resolveTemplateComponentUris(file, component)) {
@@ -1609,7 +1686,7 @@ export class WorkspaceIndex {
     }
     seen.add(childUri)
     const file = this.getFile(childUri)
-    if (!file || file.vueVersion === 3) {
+    if (!file) {
       return []
     }
 
@@ -1617,15 +1694,44 @@ export class WorkspaceIndex {
       .filter((prop) => matchesName(prop.name, propName))
       .map((prop) => ({ file, prop }))
 
-    if (file.vueVersion !== 2 || definitions.length > 0) {
+    if (definitions.length > 0) {
       return definitions
     }
+
     for (const component of file.templateIndex.components) {
-      if (!component.forwardsAttrs) {
+      if (!componentForwardsAttrs(file, component)) {
         continue
       }
       for (const forwardedChildUri of this.resolveTemplateComponentUris(file, component)) {
         definitions.push(...this.findPropDefinitionsRecursive(forwardedChildUri, propName, seen))
+      }
+    }
+
+    return definitions
+  }
+
+  private findRefMethodDefinitionsRecursive(childUri: string, methodName: string, seen: Set<string>): Array<{ file: VueFileIndex, method: MethodInfo }> {
+    const key = usageKey(childUri, methodName)
+    if (seen.has(key)) {
+      return []
+    }
+    seen.add(key)
+
+    const file = this.getFile(childUri)
+    if (!file) {
+      return []
+    }
+
+    const definitions = file.scriptIndex.methods
+      .filter((method) => method.name === methodName)
+      .map((method) => ({ file, method }))
+
+    for (const call of file.refMethodCalls) {
+      if (!call.forwarded || call.methodName !== methodName) {
+        continue
+      }
+      for (const forwardedChildUri of this.resolveRefComponents(file, call.refName)) {
+        definitions.push(...this.findRefMethodDefinitionsRecursive(forwardedChildUri, methodName, seen))
       }
     }
 
@@ -1637,7 +1743,7 @@ export class WorkspaceIndex {
   }
 
   private hasAnyForwardedAttrs(): boolean {
-    return [...this.files.values()].some((file) => file.vueVersion === 2 && hasForwardedAttrs(file))
+    return [...this.files.values()].some((file) => hasForwardedAttrs(file))
   }
 
   private collectIncomingTemplateEventUsages(): Map<string, Array<{ eventName: string, usage: UsageInfo }>> {
@@ -2002,6 +2108,7 @@ export class WorkspaceIndex {
   private removeReverseIndex(file: VueFileIndex): void {
     this.removeFileSourceRelations(file)
     this.removeFileScriptImportConsumers(file)
+    this.removeFileRefMethodForwards(file)
     this.removeTrackedFileUsages(file)
     removeEventBusEventNames(this.eventBusEventNames, this.eventBusEmits, this.eventBusListeners, file)
     this.removeTrackedProviderUsages(file)
@@ -2160,6 +2267,22 @@ function dedupePropDefinitions(definitions: Array<{ file: VueFileIndex, prop: Pr
   for (const definition of definitions) {
     const uri = definition.prop.sourceLocation?.uri ?? definition.file.uri
     const span = definition.prop.sourceLocation?.span ?? definition.prop.span
+    const key = `${uri}\0${span.start}\0${span.end}`
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    results.push(definition)
+  }
+  return results
+}
+
+function dedupeMethodDefinitions(definitions: Array<{ file: VueFileIndex, method: MethodInfo }>): Array<{ file: VueFileIndex, method: MethodInfo }> {
+  const seen = new Set<string>()
+  const results: Array<{ file: VueFileIndex, method: MethodInfo }> = []
+  for (const definition of definitions) {
+    const uri = definition.method.sourceLocation?.uri ?? definition.file.uri
+    const span = definition.method.sourceLocation?.span ?? definition.method.span
     const key = `${uri}\0${span.start}\0${span.end}`
     if (seen.has(key)) {
       continue
@@ -2353,6 +2476,14 @@ function readIdentifierEnd(content: string, index: number): number {
   return index
 }
 
+function readIdentifierAt(content: string, index: number): { value: string, start: number, end: number } | undefined {
+  if (!isIdentifierStart(content[index])) {
+    return undefined
+  }
+  const end = readIdentifierEnd(content, index + 1)
+  return { value: content.slice(index, end), start: index, end }
+}
+
 function defaultEventBusEntryCandidates(root: string): string[] {
   const src = path.join(root, 'src')
   return [
@@ -2425,7 +2556,7 @@ export function findRefMethodAccess(content: string, offset: number): RefMethodA
 }
 
 export function findRefMethodAccessInFile(file: VueFileIndex, offset: number): RefMethodAccess | undefined {
-  return file.refMethodCalls.find((call) => offset >= call.methodSpan.start && offset <= call.methodSpan.end)
+  return file.refMethodCalls.find((call) => !call.forwarded && offset >= call.methodSpan.start && offset <= call.methodSpan.end)
     ?? findRefMethodAccessInSearchableContent(file.searchableContent, offset)
 }
 
@@ -2453,7 +2584,7 @@ function findVue3TemplateRefMethodCalls(content: string): RefMethodAccess[] {
   const templateRefNames = collectUseTemplateRefNames(content)
   const refAliases = collectVue3RefAliases(searchableContent)
   const results: RefMethodAccess[] = []
-  const pattern = /\b([A-Za-z_$][\w$]*)\s*\.\s*value\s*(?:\.|\?\.)\s*([A-Za-z_$][\w$]*)/g
+  const pattern = /\b([A-Za-z_$][\w$]*)\s*\.\s*value\s*!?\s*(?:\.|\?\.)\s*([A-Za-z_$][\w$]*)/g
   let match: RegExpExecArray | null
 
   while ((match = pattern.exec(searchableContent))) {
@@ -2464,6 +2595,17 @@ function findVue3TemplateRefMethodCalls(content: string): RefMethodAccess[] {
       refName: templateRefNames.get(localName) ?? localName,
       methodName,
       methodSpan,
+    })
+  }
+
+  const assertionPattern = /\(\s*([A-Za-z_$][\w$]*)\s*\.\s*value\s*!?\s+as\s+[^)]*\)\s*(?:\.|\?\.)\s*([A-Za-z_$][\w$]*)/g
+  while ((match = assertionPattern.exec(searchableContent))) {
+    const [, localName, methodName] = match
+    const methodStart = match.index + match[0].lastIndexOf(methodName)
+    results.push({
+      refName: templateRefNames.get(localName) ?? localName,
+      methodName,
+      methodSpan: { start: methodStart, end: methodStart + methodName.length },
     })
   }
 
@@ -2484,6 +2626,322 @@ function findVue3TemplateRefMethodCalls(content: string): RefMethodAccess[] {
   }
 
   return results
+}
+
+function hasVue3RefMethod(file: VueFileIndex | undefined, methodName: string): boolean {
+  return Boolean(file?.scriptIndex.methods.some((method) => method.name === methodName)
+    || file?.refMethodCalls.some((call) => call.forwarded && call.methodName === methodName))
+}
+
+interface DefineExposeForwardCall {
+  calleeName: string
+  refName: string
+  callSpan: TextSpan
+}
+
+function findVue3DefineExposeForwardedRefMethodCalls(uri: string, sfc: ParsedSfc, imports: ImportInfo[], workspaceRoots: string[], cache: ForwardedRefMethodNameCache): RefMethodAccess[] {
+  const segment = sfc.scriptSetup
+  if (!segment) {
+    return []
+  }
+
+  const results: RefMethodAccess[] = []
+  const calls = findDefineExposeForwardCalls(segment.content, segment.start)
+  const methodsByComposable = new Map<string, string[]>()
+
+  for (const call of calls) {
+    const imported = imports.find((item) => item.localName === call.calleeName && isComposableImport(item))
+    if (!imported) {
+      continue
+    }
+
+    const sourceUri = resolveComposableImport(uri, imported.source, workspaceRoots)
+    if (!sourceUri) {
+      continue
+    }
+
+    const cacheKey = `${sourceUri}\0${imported.importedName ?? imported.localName}`
+    let methodNames = methodsByComposable.get(cacheKey)
+    if (!methodNames) {
+      methodNames = readForwardedRefMethodNames(sourceUri, imported.importedName ?? imported.localName, cache)
+      methodsByComposable.set(cacheKey, methodNames)
+    }
+
+    for (const methodName of methodNames) {
+      results.push({
+        refName: call.refName,
+        methodName,
+        methodSpan: call.callSpan,
+        forwarded: true,
+      })
+    }
+  }
+
+  return results
+}
+
+function findDefineExposeForwardCalls(content: string, offset: number): DefineExposeForwardCall[] {
+  const searchableContent = maskStringsAndComments(content)
+  const results: DefineExposeForwardCall[] = []
+
+  for (let index = 0; index < searchableContent.length; index += 1) {
+    if (!isCodeTokenAt(searchableContent, 'defineExpose', index)) {
+      continue
+    }
+
+    let cursor = skipWhitespace(searchableContent, index + 'defineExpose'.length)
+    cursor = skipTypeArguments(searchableContent, cursor)
+    cursor = skipWhitespace(searchableContent, cursor)
+    if (searchableContent[cursor] !== '(') {
+      continue
+    }
+
+    cursor = skipWhitespace(searchableContent, cursor + 1)
+    const callee = readIdentifierAt(searchableContent, cursor)
+    if (!callee) {
+      continue
+    }
+
+    cursor = skipWhitespace(searchableContent, callee.end)
+    cursor = skipTypeArguments(searchableContent, cursor)
+    cursor = skipWhitespace(searchableContent, cursor)
+    if (searchableContent[cursor] !== '(') {
+      continue
+    }
+
+    const ref = readIdentifierAt(searchableContent, skipWhitespace(searchableContent, cursor + 1))
+    if (!ref) {
+      continue
+    }
+
+    results.push({
+      calleeName: callee.value,
+      refName: ref.value,
+      callSpan: { start: offset + callee.start, end: offset + callee.end },
+    })
+  }
+
+  return results
+}
+
+function readForwardedRefMethodNames(uri: string, exportName: string, cache: ForwardedRefMethodNameCache): string[] {
+  try {
+    const stats = fsSync.statSync(uri)
+    const cached = cache.get(uri)
+    if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+      const cachedMethods = cached.methodsByExportName.get(exportName)
+      if (cachedMethods) {
+        return cachedMethods
+      }
+    }
+
+    const content = fsSync.readFileSync(uri, 'utf8')
+    const methodNames = readForwardedRefMethodNamesFromContent(content, exportName)
+    const methodsByExportName = cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size
+      ? cached.methodsByExportName
+      : new Map<string, string[]>()
+    methodsByExportName.set(exportName, methodNames)
+    cache.set(uri, {
+      mtimeMs: stats.mtimeMs,
+      size: stats.size,
+      methodsByExportName,
+    })
+    return methodNames
+  } catch {
+    return []
+  }
+}
+
+function readForwardedRefMethodNamesFromContent(content: string, exportName: string): string[] {
+  const range = findComposableFunctionRange(content, exportName)
+  if (!range) {
+    return []
+  }
+
+  const methods = new Set<string>()
+  const searchableContent = maskStringsAndComments(content)
+  const escapedParam = escapeRegExp(range.paramName)
+  const pattern = new RegExp(`\\b${escapedParam}\\s*\\.\\s*value\\s*!?\\s*(?:\\.|\\?\\.)\\s*([A-Za-z_$][\\w$]*)`, 'g')
+  pattern.lastIndex = range.bodyStart
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(searchableContent)) && match.index < range.bodyEnd) {
+    methods.add(match[1])
+  }
+
+  const assertionPattern = new RegExp(`\\(\\s*${escapedParam}\\s*\\.\\s*value\\s*!?\\s+as\\s+[^)]*\\)\\s*(?:\\.|\\?\\.)\\s*([A-Za-z_$][\\w$]*)`, 'g')
+  assertionPattern.lastIndex = range.bodyStart
+  while ((match = assertionPattern.exec(searchableContent)) && match.index < range.bodyEnd) {
+    methods.add(match[1])
+  }
+
+  return [...methods]
+}
+
+function findComposableFunctionRange(content: string, exportName: string): { paramName: string, bodyStart: number, bodyEnd: number } | undefined {
+  const searchableContent = maskStringsAndComments(content)
+  return findVariableComposableFunctionRange(searchableContent, exportName)
+    ?? findDeclaredComposableFunctionRange(searchableContent, exportName)
+}
+
+function findVariableComposableFunctionRange(content: string, exportName: string): { paramName: string, bodyStart: number, bodyEnd: number } | undefined {
+  const pattern = new RegExp(`\\b(?:export\\s+)?(?:const|let|var)\\s+${escapeRegExp(exportName)}\\s*=`, 'g')
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(content))) {
+    const valueStart = skipWhitespace(content, pattern.lastIndex)
+    const header = readArrowFunctionHeader(content, valueStart)
+    if (!header) {
+      continue
+    }
+
+    const arrow = findArrowAfterFunctionHeader(content, header.end)
+    if (arrow === -1) {
+      continue
+    }
+
+    const body = readArrowFunctionBodyRange(content, arrow + 2)
+    if (body) {
+      return { paramName: header.paramName, ...body }
+    }
+  }
+
+  return undefined
+}
+
+function findDeclaredComposableFunctionRange(content: string, exportName: string): { paramName: string, bodyStart: number, bodyEnd: number } | undefined {
+  const pattern = new RegExp(`\\b(?:export\\s+)?(?:async\\s+)?function\\s+${escapeRegExp(exportName)}\\s*`, 'g')
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(content))) {
+    let paramsStart = skipWhitespace(content, pattern.lastIndex)
+    paramsStart = skipTypeArguments(content, paramsStart)
+    paramsStart = skipWhitespace(content, paramsStart)
+    if (content[paramsStart] !== '(') {
+      continue
+    }
+
+    const param = readIdentifierAt(content, skipWhitespace(content, paramsStart + 1))
+    const paramsEnd = findMatchingBracket(content, paramsStart)
+    const bodyStart = skipWhitespace(content, paramsEnd + 1)
+    if (!param || content[bodyStart] !== '{') {
+      continue
+    }
+
+    return {
+      paramName: param.value,
+      bodyStart,
+      bodyEnd: findMatchingBracket(content, bodyStart),
+    }
+  }
+
+  return undefined
+}
+
+function readArrowFunctionHeader(content: string, start: number): { paramName: string, end: number } | undefined {
+  let cursor = skipWhitespace(content, start)
+  if (isCodeTokenAt(content, 'async', cursor)) {
+    cursor = skipWhitespace(content, cursor + 'async'.length)
+  }
+  cursor = skipTypeArguments(content, cursor)
+  cursor = skipWhitespace(content, cursor)
+
+  if (content[cursor] === '(') {
+    const param = readIdentifierAt(content, skipWhitespace(content, cursor + 1))
+    const paramsEnd = findMatchingBracket(content, cursor)
+    if (!param) {
+      return undefined
+    }
+    return { paramName: param.value, end: paramsEnd + 1 }
+  }
+
+  const param = readIdentifierAt(content, cursor)
+  if (!param) {
+    return undefined
+  }
+  return { paramName: param.value, end: param.end }
+}
+
+function findArrowAfterFunctionHeader(content: string, start: number): number {
+  let parenDepth = 0
+  let bracketDepth = 0
+  let braceDepth = 0
+  let angleDepth = 0
+
+  for (let index = skipWhitespace(content, start); index < content.length; index += 1) {
+    if (content.startsWith('=>', index) && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
+      return index
+    }
+
+    const char = content[index]
+    if (char === ';' && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
+      return -1
+    }
+    if (char === '(') {
+      parenDepth += 1
+    } else if (char === ')') {
+      parenDepth = Math.max(0, parenDepth - 1)
+    } else if (char === '[') {
+      bracketDepth += 1
+    } else if (char === ']') {
+      bracketDepth = Math.max(0, bracketDepth - 1)
+    } else if (char === '{') {
+      braceDepth += 1
+    } else if (char === '}') {
+      braceDepth = Math.max(0, braceDepth - 1)
+    } else if (char === '<') {
+      angleDepth += 1
+    } else if (char === '>') {
+      angleDepth = Math.max(0, angleDepth - 1)
+    }
+  }
+
+  return -1
+}
+
+function readArrowFunctionBodyRange(content: string, start: number): { bodyStart: number, bodyEnd: number } | undefined {
+  const bodyStart = skipWhitespace(content, start)
+  if (content[bodyStart] === '{') {
+    return { bodyStart, bodyEnd: findMatchingBracket(content, bodyStart) }
+  }
+
+  if (content[bodyStart] === '(') {
+    return { bodyStart, bodyEnd: findMatchingBracket(content, bodyStart) }
+  }
+
+  return { bodyStart, bodyEnd: findExpressionEnd(content, bodyStart) }
+}
+
+function findExpressionEnd(content: string, start: number): number {
+  let parenDepth = 0
+  let bracketDepth = 0
+  let braceDepth = 0
+  let angleDepth = 0
+
+  for (let index = start; index < content.length; index += 1) {
+    const char = content[index]
+    if (char === '(') {
+      parenDepth += 1
+    } else if (char === ')') {
+      parenDepth = Math.max(0, parenDepth - 1)
+    } else if (char === '[') {
+      bracketDepth += 1
+    } else if (char === ']') {
+      bracketDepth = Math.max(0, bracketDepth - 1)
+    } else if (char === '{') {
+      braceDepth += 1
+    } else if (char === '}') {
+      braceDepth = Math.max(0, braceDepth - 1)
+    } else if (char === '<') {
+      angleDepth += 1
+    } else if (char === '>') {
+      angleDepth = Math.max(0, angleDepth - 1)
+    } else if ((char === ';' || char === '\n') && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
+      return index
+    }
+  }
+
+  return content.length
 }
 
 function collectUseTemplateRefNames(content: string): Map<string, string> {
@@ -2649,6 +3107,7 @@ function parseVue3ScriptRefComponentUsages(content: string): TemplateComponentUs
         span: ref.span,
         fullSpan: ref.fullSpan,
       }],
+      binds: [],
       slots: [],
     })
     index = objectEnd
@@ -2804,6 +3263,10 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values)]
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 function addUsage<T extends UsageInfo>(map: Map<string, T[]>, key: string, usage: T): void {
   const usages = map.get(key)
   if (usages) {
@@ -2858,11 +3321,11 @@ function removeSourceRelationItem<T extends { file: VueFileIndex }>(map: SourceR
 }
 
 function hasForwardedListeners(file: VueFileIndex): boolean {
-  return file.templateIndex.components.some((component) => component.forwardsListeners)
+  return file.templateIndex.components.some((component) => componentForwardsListeners(file, component))
 }
 
 function hasForwardedAttrs(file: VueFileIndex): boolean {
-  return file.templateIndex.components.some((component) => component.forwardsAttrs)
+  return file.templateIndex.components.some((component) => componentForwardsAttrs(file, component))
 }
 
 function hasTemplateEventAttrs(file: VueFileIndex): boolean {
@@ -2870,7 +3333,10 @@ function hasTemplateEventAttrs(file: VueFileIndex): boolean {
 }
 
 function hasTemplatePropAttrs(file: VueFileIndex): boolean {
-  return file.templateIndex.components.some((component) => component.attrs.some((attr) => attr.kind === 'prop'))
+  return file.templateIndex.components.some((component) => {
+    return component.attrs.some((attr) => attr.kind === 'prop')
+      || component.binds.some((bind) => resolveTemplateBindExpression(file, bind.expression).propNames.length > 0)
+  })
 }
 
 function hasDeclaredProp(file: VueFileIndex, propName: string): boolean {
@@ -2879,6 +3345,713 @@ function hasDeclaredProp(file: VueFileIndex, propName: string): boolean {
 
 function hasDeclaredEmit(file: VueFileIndex, eventName: string): boolean {
   return file.scriptIndex.emits.some((emit) => matchesName(emit.eventName, eventName))
+}
+
+interface TemplateBindResolution {
+  propNames: string[]
+  forwardsAttrs: boolean
+}
+
+interface TemplateBindContext {
+  useAttrsNames: Set<string>
+  definePropsNames: Set<string>
+  initializers: Map<string, TemplateInitializer>
+  restBindings: Map<string, { sourceName: string, omitted: string[] }>
+}
+
+interface TemplateInitializer {
+  content: string
+  span: TextSpan
+}
+
+const templateBindContextCache = new WeakMap<VueFileIndex, TemplateBindContext>()
+
+function componentForwardsAttrs(file: VueFileIndex, component: TemplateComponentUsage): boolean {
+  return Boolean(component.forwardsAttrs)
+    || component.binds.some((bind) => resolveTemplateBindExpression(file, bind.expression).forwardsAttrs)
+}
+
+function componentForwardsListeners(file: VueFileIndex, component: TemplateComponentUsage): boolean {
+  return Boolean(component.forwardsListeners) || componentForwardsAttrs(file, component)
+}
+
+function emptyBindResolution(): TemplateBindResolution {
+  return { propNames: [], forwardsAttrs: false }
+}
+
+function mergeBindResolutions(items: TemplateBindResolution[]): TemplateBindResolution {
+  return {
+    propNames: uniqueStrings(items.flatMap((item) => item.propNames)),
+    forwardsAttrs: items.some((item) => item.forwardsAttrs),
+  }
+}
+
+function resolveTemplateBindExpression(file: VueFileIndex, expression: string, seen = new Set<string>()): TemplateBindResolution {
+  const normalized = stripOuterParens(expression.trim())
+  if (!normalized) {
+    return emptyBindResolution()
+  }
+
+  if (normalized === '$attrs') {
+    return { propNames: [], forwardsAttrs: true }
+  }
+
+  if (normalized.startsWith('{')) {
+    return resolveObjectBindExpression(file, normalized, 0, findMatchingBracket(normalized, 0), seen)
+  }
+
+  const call = readCallExpression(normalized)
+  if (call?.callee === 'mergeProps') {
+    return mergeBindResolutions(call.args.map((arg) => resolveTemplateBindExpression(file, arg, seen)))
+  }
+
+  const identifier = readIdentifierAt(normalized, 0)
+  if (identifier && identifier.end === normalized.length) {
+    return resolveTemplateBindIdentifier(file, identifier.value, seen)
+  }
+
+  if (identifier && normalized.slice(identifier.end).trim() === '.value') {
+    return resolveTemplateBindIdentifier(file, identifier.value, seen)
+  }
+
+  return emptyBindResolution()
+}
+
+function resolveTemplateBindIdentifier(file: VueFileIndex, name: string, seen: Set<string>): TemplateBindResolution {
+  const seenKey = `${file.uri}\0${name}`
+  if (seen.has(seenKey)) {
+    return emptyBindResolution()
+  }
+  seen.add(seenKey)
+
+  const context = getTemplateBindContext(file)
+  if (context.useAttrsNames.has(name)) {
+    return { propNames: [], forwardsAttrs: true }
+  }
+
+  if (context.definePropsNames.has(name)) {
+    return { propNames: file.scriptIndex.props.map((prop) => prop.name), forwardsAttrs: false }
+  }
+
+  const restProps = resolveRestPropsIdentifier(file, name, seen, context)
+  if (restProps) {
+    return restProps
+  }
+
+  const initializer = context.initializers.get(name)
+  if (!initializer) {
+    return emptyBindResolution()
+  }
+
+  return resolveInitializerBindExpression(file, readTemplateInitializer(initializer), seen)
+}
+
+function resolveInitializerBindExpression(file: VueFileIndex, initializer: string, seen: Set<string>): TemplateBindResolution {
+  const expression = stripTypeAssertion(stripOuterParens(initializer.trim()))
+  if (!expression) {
+    return emptyBindResolution()
+  }
+
+  if (expression.startsWith('{')) {
+    return resolveObjectBindExpression(file, expression, 0, findMatchingBracket(expression, 0), seen)
+  }
+
+  const call = readCallExpression(expression)
+  if (!call) {
+    return resolveTemplateBindExpression(file, expression, seen)
+  }
+
+  if (['ref', 'shallowRef', 'reactive', 'shallowReactive', 'readonly', 'markRaw'].includes(call.callee)) {
+    return call.args[0] ? resolveTemplateBindExpression(file, call.args[0], seen) : emptyBindResolution()
+  }
+
+  if (call.callee === 'computed') {
+    return call.args[0] ? resolveComputedBindExpression(file, call.args[0], seen) : emptyBindResolution()
+  }
+
+  if (call.callee === 'mergeProps') {
+    return mergeBindResolutions(call.args.map((arg) => resolveTemplateBindExpression(file, arg, seen)))
+  }
+
+  if (call.callee === 'useAttrs') {
+    return { propNames: [], forwardsAttrs: true }
+  }
+
+  return emptyBindResolution()
+}
+
+function resolveComputedBindExpression(file: VueFileIndex, expression: string, seen: Set<string>): TemplateBindResolution {
+  const arrow = findArrow(expression, 0)
+  if (arrow === -1) {
+    return emptyBindResolution()
+  }
+
+  const bodyStart = skipWhitespace(expression, arrow + 2)
+  if (expression[bodyStart] === '{') {
+    const bodyEnd = findMatchingBracket(expression, bodyStart)
+    const returned = findReturnedObjectExpression(expression, bodyStart, bodyEnd)
+    return returned
+      ? resolveTemplateBindExpression(file, returned, seen)
+      : emptyBindResolution()
+  }
+
+  return resolveTemplateBindExpression(file, expression.slice(bodyStart), seen)
+}
+
+function findArrow(content: string, start: number): number {
+  let parenDepth = 0
+  let bracketDepth = 0
+  let braceDepth = 0
+  let angleDepth = 0
+
+  for (let index = start; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    if (content.startsWith('=>', index) && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
+      return index
+    }
+
+    const char = content[index]
+    if (char === '(') {
+      parenDepth += 1
+    } else if (char === ')') {
+      parenDepth = Math.max(0, parenDepth - 1)
+    } else if (char === '[') {
+      bracketDepth += 1
+    } else if (char === ']') {
+      bracketDepth = Math.max(0, bracketDepth - 1)
+    } else if (char === '{') {
+      braceDepth += 1
+    } else if (char === '}') {
+      braceDepth = Math.max(0, braceDepth - 1)
+    } else if (char === '<') {
+      angleDepth += 1
+    } else if (char === '>') {
+      angleDepth = Math.max(0, angleDepth - 1)
+    }
+  }
+
+  return -1
+}
+
+function findReturnedObjectExpression(content: string, bodyStart: number, bodyEnd: number): string | undefined {
+  for (let index = bodyStart + 1; index < bodyEnd; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+    if (!isCodeTokenAt(content, 'return', index)) {
+      continue
+    }
+    const valueStart = skipWhitespace(content, index + 'return'.length)
+    return content.slice(valueStart, findExpressionEnd(content, valueStart)).trim()
+  }
+  return undefined
+}
+
+function resolveObjectBindExpression(file: VueFileIndex, content: string, objectStart: number, objectEnd: number, seen: Set<string>): TemplateBindResolution {
+  const propNames: string[] = []
+  const spreadResolutions: TemplateBindResolution[] = []
+  let cursor = objectStart + 1
+
+  while (cursor < objectEnd) {
+    cursor = skipWhitespace(content, cursor)
+    if (cursor >= objectEnd) {
+      break
+    }
+    if (content[cursor] === ',') {
+      cursor += 1
+      continue
+    }
+
+    if (content.startsWith('...', cursor)) {
+      const spreadStart = skipWhitespace(content, cursor + 3)
+      const spreadEnd = findTopLevelCommaOrEnd(content, spreadStart, objectEnd)
+      spreadResolutions.push(resolveTemplateBindExpression(file, content.slice(spreadStart, spreadEnd), seen))
+      cursor = spreadEnd + 1
+      continue
+    }
+
+    const key = readObjectBindKey(content, cursor)
+    if (!key) {
+      cursor = findTopLevelCommaOrEnd(content, cursor + 1, objectEnd) + 1
+      continue
+    }
+
+    if (isBindablePropName(key.value)) {
+      propNames.push(toCamelCase(key.value))
+    }
+    cursor = findTopLevelCommaOrEnd(content, key.rawEnd ?? key.end, objectEnd) + 1
+  }
+
+  return mergeBindResolutions([
+    { propNames, forwardsAttrs: false },
+    ...spreadResolutions,
+  ])
+}
+
+function readObjectBindKey(content: string, index: number): { value: string, start: number, end: number, rawEnd?: number } | undefined {
+  if (content[index] === '[') {
+    return undefined
+  }
+
+  const identifier = readIdentifierAt(content, index)
+  if (identifier) {
+    return identifier
+  }
+
+  const literal = readStringLiteral(content, index)
+  return literal
+    ? { value: literal.value, start: literal.start, end: literal.end, rawEnd: literal.end + 1 }
+    : undefined
+}
+
+function isBindablePropName(name: string): boolean {
+  return !['class', 'style', 'key', 'ref', 'is'].includes(name)
+    && !/^on[A-Z]/.test(name)
+}
+
+function resolveRestPropsIdentifier(file: VueFileIndex, name: string, seen: Set<string>, context: TemplateBindContext): TemplateBindResolution | undefined {
+  const rest = context.restBindings.get(name)
+  if (!rest) {
+    return undefined
+  }
+
+  const sourceResolution = resolveTemplateBindIdentifier(file, rest.sourceName, seen)
+  return {
+    propNames: sourceResolution.propNames.filter((propName) => !rest.omitted.some((omitted) => matchesName(omitted, propName))),
+    forwardsAttrs: sourceResolution.forwardsAttrs,
+  }
+}
+
+function readRestBinding(content: string, objectStart: number, objectEnd: number): { name: string, omitted: string[] } | undefined {
+  const omitted: string[] = []
+  let cursor = objectStart + 1
+
+  while (cursor < objectEnd) {
+    cursor = skipWhitespace(content, cursor)
+    if (content.startsWith('...', cursor)) {
+      const rest = readIdentifierAt(content, skipWhitespace(content, cursor + 3))
+      return rest ? { name: rest.value, omitted } : undefined
+    }
+
+    const key = readObjectBindKey(content, cursor)
+    if (key) {
+      omitted.push(key.value)
+      cursor = findTopLevelCommaOrEnd(content, key.rawEnd ?? key.end, objectEnd) + 1
+      continue
+    }
+    cursor += 1
+  }
+
+  return undefined
+}
+
+function getTemplateBindContext(file: VueFileIndex): TemplateBindContext {
+  const cached = templateBindContextCache.get(file)
+  if (cached) {
+    return cached
+  }
+
+  const context: TemplateBindContext = {
+    useAttrsNames: new Set(),
+    definePropsNames: new Set(),
+    initializers: new Map(),
+    restBindings: new Map(),
+  }
+
+  for (const segment of [file.script, file.scriptSetup]) {
+    if (!segment) {
+      continue
+    }
+    collectTemplateBindContextFromSegment(segment.content, context)
+  }
+
+  templateBindContextCache.set(file, context)
+  return context
+}
+
+function collectTemplateBindContextFromSegment(content: string, context: TemplateBindContext): void {
+  const masked = maskStringsAndComments(content)
+
+  collectTopLevelInitializers(content, masked, context)
+  collectTopLevelRestBindings(masked, context)
+
+  for (const [name, initializer] of context.initializers) {
+    const expression = stripTypeAssertion(stripOuterParens(readTemplateInitializer(initializer).trim()))
+    const call = readCallExpression(expression)
+    if (call?.callee === 'useAttrs') {
+      context.useAttrsNames.add(name)
+      continue
+    }
+    if (call?.callee === 'defineProps') {
+      context.definePropsNames.add(name)
+      continue
+    }
+    if (call?.callee === 'withDefaults' && call.args[0] && readCallExpression(stripOuterParens(call.args[0]))?.callee === 'defineProps') {
+      context.definePropsNames.add(name)
+    }
+  }
+}
+
+function collectTopLevelInitializers(content: string, masked: string, context: TemplateBindContext): void {
+  forEachTopLevelVariableDeclaration(masked, (declaration) => {
+    if (!declaration.name) {
+      return
+    }
+
+    const initializer = readVariableInitializerSpan(masked, declaration.afterName)
+    if (initializer !== undefined) {
+      context.initializers.set(declaration.name, { content, span: initializer })
+    }
+  })
+}
+
+function collectTopLevelRestBindings(masked: string, context: TemplateBindContext): void {
+  forEachTopLevelVariableDeclaration(masked, (declaration) => {
+    const objectStart = declaration.patternStart
+    if (masked[objectStart] !== '{') {
+      return
+    }
+
+    const objectEnd = declaration.patternEnd - 1
+    const rest = readRestBinding(masked, objectStart, objectEnd)
+    if (!rest) {
+      return
+    }
+
+    const initializer = readVariableInitializerSpan(masked, declaration.patternEnd)
+    if (!initializer) {
+      return
+    }
+
+    const source = readIdentifierAt(masked, initializer.start)
+    if (source) {
+      context.restBindings.set(rest.name, { sourceName: source.value, omitted: rest.omitted })
+    }
+  })
+}
+
+function readTemplateInitializer(initializer: TemplateInitializer): string {
+  return initializer.content.slice(initializer.span.start, initializer.span.end)
+}
+
+function readVariableInitializerSpan(masked: string, start: number): TextSpan | undefined {
+  let cursor = skipWhitespace(masked, start)
+  let parenDepth = 0
+  let bracketDepth = 0
+  let braceDepth = 0
+  let angleDepth = 0
+
+  while (cursor < masked.length) {
+    const char = masked[cursor]
+    if (masked.startsWith('=>', cursor)) {
+      cursor += 2
+      continue
+    }
+    if (char === '=' && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
+      const valueStart = skipWhitespace(masked, cursor + 1)
+      const valueEnd = findTopLevelExpressionEnd(masked, valueStart)
+      return { start: valueStart, end: valueEnd }
+    }
+    if ((char === '\n' || char === ';') && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
+      return undefined
+    }
+    if (char === '(') {
+      parenDepth += 1
+    } else if (char === ')') {
+      parenDepth = Math.max(0, parenDepth - 1)
+    } else if (char === '[') {
+      bracketDepth += 1
+    } else if (char === ']') {
+      bracketDepth = Math.max(0, bracketDepth - 1)
+    } else if (char === '{') {
+      braceDepth += 1
+    } else if (char === '}') {
+      braceDepth = Math.max(0, braceDepth - 1)
+    } else if (char === '<') {
+      angleDepth += 1
+    } else if (char === '>') {
+      angleDepth = Math.max(0, angleDepth - 1)
+    }
+    cursor += 1
+  }
+
+  return undefined
+}
+
+interface TopLevelVariableDeclaration {
+  name?: string
+  patternStart: number
+  patternEnd: number
+  afterName: number
+}
+
+function forEachTopLevelVariableDeclaration(content: string, callback: (declaration: TopLevelVariableDeclaration) => void): void {
+  let braceDepth = 0
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index]
+    if (char === '{') {
+      braceDepth += 1
+      continue
+    }
+    if (char === '}') {
+      braceDepth = Math.max(0, braceDepth - 1)
+      continue
+    }
+    if (braceDepth !== 0) {
+      continue
+    }
+
+    const keyword = readVariableDeclarationKeywordAt(content, index)
+    if (!keyword) {
+      continue
+    }
+
+    const afterKeyword = index + keyword.length
+    const statementEnd = findTopLevelVariableStatementEnd(content, afterKeyword)
+    let cursor = afterKeyword
+
+    while (cursor < statementEnd) {
+      cursor = skipWhitespace(content, cursor)
+      if (cursor >= statementEnd) {
+        break
+      }
+
+      const declaration = readTopLevelVariableDeclaration(content, cursor, statementEnd)
+      if (!declaration) {
+        break
+      }
+
+      callback(declaration)
+      const nextComma = findTopLevelCommaOrEnd(content, declaration.patternEnd, statementEnd)
+      if (nextComma >= statementEnd) {
+        break
+      }
+      cursor = nextComma + 1
+    }
+
+    index = statementEnd - 1
+  }
+}
+
+function readTopLevelVariableDeclaration(content: string, start: number, statementEnd: number): TopLevelVariableDeclaration | undefined {
+  if (content[start] === '{' || content[start] === '[') {
+    const patternEnd = findMatchingBracket(content, start) + 1
+    if (patternEnd > statementEnd) {
+      return undefined
+    }
+    return {
+      patternStart: start,
+      patternEnd,
+      afterName: patternEnd,
+    }
+  }
+
+  const name = readIdentifierAt(content, start)
+  if (!name) {
+    return undefined
+  }
+
+  return {
+    name: name.value,
+    patternStart: name.start,
+    patternEnd: name.end,
+    afterName: name.end,
+  }
+}
+
+function findTopLevelVariableStatementEnd(content: string, start: number): number {
+  let parenDepth = 0
+  let bracketDepth = 0
+  let braceDepth = 0
+  let angleDepth = 0
+
+  for (let index = start; index < content.length; index += 1) {
+    if (content.startsWith('=>', index)) {
+      index += 1
+      continue
+    }
+
+    const char = content[index]
+    if (char === '(') {
+      parenDepth += 1
+    } else if (char === ')') {
+      parenDepth = Math.max(0, parenDepth - 1)
+    } else if (char === '[') {
+      bracketDepth += 1
+    } else if (char === ']') {
+      bracketDepth = Math.max(0, bracketDepth - 1)
+    } else if (char === '{') {
+      braceDepth += 1
+    } else if (char === '}') {
+      braceDepth = Math.max(0, braceDepth - 1)
+    } else if (char === '<') {
+      angleDepth += 1
+    } else if (char === '>') {
+      angleDepth = Math.max(0, angleDepth - 1)
+    } else if ((char === ';' || char === '\n') && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
+      const previous = previousNonWhitespace(content, index - 1)
+      const next = skipWhitespace(content, index + 1)
+      if (content[previous] !== ',' && content[next] !== ',') {
+        return index
+      }
+    }
+  }
+
+  return content.length
+}
+
+function previousNonWhitespace(content: string, index: number): number {
+  while (index >= 0 && /\s/.test(content[index])) {
+    index -= 1
+  }
+  return index
+}
+
+function readVariableDeclarationKeywordAt(content: string, index: number): 'const' | 'let' | 'var' | undefined {
+  if (isCodeTokenAt(content, 'const', index)) {
+    return 'const'
+  }
+  if (isCodeTokenAt(content, 'let', index)) {
+    return 'let'
+  }
+  return isCodeTokenAt(content, 'var', index) ? 'var' : undefined
+}
+
+function skipHorizontalWhitespace(content: string, index: number): number {
+  while (index < content.length && /[^\S\r\n]/.test(content[index])) {
+    index += 1
+  }
+  return index
+}
+
+function findTopLevelExpressionEnd(content: string, start: number): number {
+  let parenDepth = 0
+  let bracketDepth = 0
+  let braceDepth = 0
+  let angleDepth = 0
+
+  for (let index = start; index < content.length; index += 1) {
+    if (content.startsWith('=>', index)) {
+      index += 1
+      continue
+    }
+
+    const char = content[index]
+    if (char === '(') {
+      parenDepth += 1
+    } else if (char === ')') {
+      parenDepth = Math.max(0, parenDepth - 1)
+    } else if (char === '[') {
+      bracketDepth += 1
+    } else if (char === ']') {
+      bracketDepth = Math.max(0, bracketDepth - 1)
+    } else if (char === '{') {
+      braceDepth += 1
+    } else if (char === '}') {
+      braceDepth = Math.max(0, braceDepth - 1)
+    } else if (char === '<') {
+      angleDepth += 1
+    } else if (char === '>') {
+      angleDepth = Math.max(0, angleDepth - 1)
+    } else if ((char === ';' || char === '\n') && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
+      return index
+    }
+  }
+
+  return content.length
+}
+
+function readCallExpression(expression: string): { callee: string, args: string[] } | undefined {
+  const callee = readIdentifierAt(expression, 0)
+  if (!callee) {
+    return undefined
+  }
+
+  let cursor = skipWhitespace(expression, callee.end)
+  cursor = skipTypeArguments(expression, cursor)
+  cursor = skipWhitespace(expression, cursor)
+  if (expression[cursor] !== '(') {
+    return undefined
+  }
+
+  const close = findMatchingBracket(expression, cursor)
+  return {
+    callee: callee.value,
+    args: splitTopLevelArguments(expression.slice(cursor + 1, close)),
+  }
+}
+
+function splitTopLevelArguments(content: string): string[] {
+  const args: string[] = []
+  let start = 0
+  let depth = 0
+
+  for (let index = 0; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = content[index]
+    if (char === '(' || char === '{' || char === '[' || char === '<') {
+      depth += 1
+    } else if (char === ')' || char === '}' || char === ']' || char === '>') {
+      depth = Math.max(0, depth - 1)
+    } else if (char === ',' && depth === 0) {
+      args.push(content.slice(start, index).trim())
+      start = index + 1
+    }
+  }
+
+  const last = content.slice(start).trim()
+  if (last) {
+    args.push(last)
+  }
+  return args
+}
+
+function findTopLevelCommaOrEnd(content: string, start: number, end: number): number {
+  let depth = 0
+  for (let index = start; index < end; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+    const char = content[index]
+    if (char === '(' || char === '{' || char === '[' || char === '<') {
+      depth += 1
+    } else if (char === ')' || char === '}' || char === ']' || char === '>') {
+      depth = Math.max(0, depth - 1)
+    } else if (char === ',' && depth === 0) {
+      return index
+    }
+  }
+  return end
+}
+
+function stripOuterParens(value: string): string {
+  let current = value
+  while (current.startsWith('(') && findMatchingBracket(current, 0) === current.length - 1) {
+    current = current.slice(1, -1).trim()
+  }
+  return current
+}
+
+function stripTypeAssertion(value: string): string {
+  return value
+    .replace(/\s+as\s+const\s*$/u, '')
+    .replace(/\s+as\s+[A-Za-z_$][\w$]*(?:<[\s\S]*>)?\s*$/u, '')
+    .trim()
 }
 
 function removeEventBusEventNames(
@@ -2929,8 +4102,34 @@ function hasVue3StandaloneScriptRelations(content: string): boolean {
 function hasComposableReturnUsageShape(content: string): boolean {
   const searchableContent = maskStringsAndComments(content)
   // 新增普通脚本文件可能只消费 hook 返回成员，也需要进入 Vue3 关系索引。
-  return /\bimport\b/.test(searchableContent)
-    && /\b(?:const|let|var)\s*\{[\s\S]*?\}\s*=\s*[A-Za-z_$][\w$]*\s*\(/.test(searchableContent)
+  if (!/\bimport\b/.test(searchableContent)) {
+    return false
+  }
+
+  const pattern = /\b(?:const|let|var)\s*\{/g
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(searchableContent))) {
+    const objectStart = searchableContent.indexOf('{', match.index)
+    const objectEnd = findMatchingBracket(searchableContent, objectStart)
+    const equal = skipWhitespace(searchableContent, objectEnd + 1)
+    if (searchableContent[equal] !== '=') {
+      continue
+    }
+
+    const callee = readIdentifierAt(searchableContent, skipWhitespace(searchableContent, equal + 1))
+    if (!callee) {
+      continue
+    }
+
+    let cursor = skipWhitespace(searchableContent, callee.end)
+    cursor = skipTypeArguments(searchableContent, cursor)
+    cursor = skipWhitespace(searchableContent, cursor)
+    if (searchableContent[cursor] === '(') {
+      return true
+    }
+  }
+
+  return false
 }
 
 function isInsideDirectory(file: string, directory: string): boolean {

@@ -401,7 +401,7 @@ function findComposableDestructures(content: string, masked: string): Map<string
       continue
     }
 
-    const open = skipTrivia(masked, callee.end)
+    const open = skipTrivia(masked, skipTypeArguments(masked, skipTrivia(masked, callee.end)))
     if (masked[open] !== '(') {
       continue
     }
@@ -684,6 +684,32 @@ function skipTrivia(content: string, index: number): number {
     cursor += 1
   }
   return cursor
+}
+
+function skipTypeArguments(content: string, index: number): number {
+  if (content[index] !== '<') {
+    return index
+  }
+
+  let depth = 0
+  for (let cursor = index; cursor < content.length; cursor += 1) {
+    if (content[cursor] === '<') {
+      depth += 1
+      continue
+    }
+    if (content[cursor] === '>') {
+      depth -= 1
+      if (depth === 0) {
+        return cursor + 1
+      }
+      continue
+    }
+    if (depth === 0 && content[cursor] === '(') {
+      return cursor
+    }
+  }
+
+  return index
 }
 
 function readIdentifier(content: string, index: number): { value: string, start: number, end: number } | undefined {

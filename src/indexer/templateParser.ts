@@ -1,4 +1,4 @@
-import type { EmitInfo, EventBusCall, SlotInfo, StaticComponentNameBinding, TemplateAttrUsage, TemplateComponentUsage, TemplateIndex, TemplateSlotUsage } from './types'
+import type { EmitInfo, EventBusCall, SlotInfo, StaticComponentNameBinding, TemplateAttrUsage, TemplateBindUsage, TemplateComponentUsage, TemplateIndex, TemplateSlotUsage } from './types'
 import { parseEventBusCalls } from './eventBusParser'
 import { toCamelCase, toKebabCase } from '../utils/casing'
 import { readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
@@ -127,6 +127,33 @@ function extractAttrs(openTag: string, openStart: number, vue3ModelEvents: boole
   }
 
   return attrs
+}
+
+function extractBindUsages(openTag: string, openStart: number): TemplateBindUsage[] {
+  const binds: TemplateBindUsage[] = []
+  const pattern = /\s(v-bind)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(openTag))) {
+    const rawValue = match[2]
+    if (!rawValue) {
+      continue
+    }
+
+    const fullStart = openStart + match.index + match[0].indexOf(match[1])
+    const rawValueStart = openStart + match.index + match[0].lastIndexOf(rawValue)
+    const quoted = (rawValue.startsWith('"') && rawValue.endsWith('"')) || (rawValue.startsWith('\'') && rawValue.endsWith('\''))
+    const expression = quoted ? rawValue.slice(1, -1) : rawValue
+    const expressionStart = rawValueStart + (quoted ? 1 : 0)
+
+    binds.push({
+      expression,
+      span: { start: expressionStart, end: expressionStart + expression.length },
+      fullSpan: { start: fullStart, end: fullStart + match[1].length },
+    })
+  }
+
+  return binds
 }
 
 function normalizeSlotAttr(rawName: string): { name: string, normalizedName: string, semanticOffset: number } | undefined {
@@ -367,7 +394,11 @@ function findMatchingCloseTag(template: string, tag: string, fromIndex: number):
   return undefined
 }
 
-function extractDefaultSlotUsage(template: string, templateStart: number, openEnd: number, closeStart: number): TemplateSlotUsage | undefined {
+function isComponentLikeSlotChild(tag: string, registeredTags: Set<string>): boolean {
+  return registeredTags.has(toKebabCase(tag)) || isLikelyComponentTag(tag)
+}
+
+function extractDefaultSlotUsage(template: string, templateStart: number, openEnd: number, closeStart: number, registeredTags: Set<string>): TemplateSlotUsage | undefined {
   let cursor = openEnd
   while (cursor < closeStart) {
     if (template.startsWith('<!--', cursor)) {
@@ -404,6 +435,15 @@ function extractDefaultSlotUsage(template: string, templateStart: number, openEn
       if (!tagMatch) {
         return undefined
       }
+      if (isComponentLikeSlotChild(tagMatch[1], registeredTags)) {
+        // 隐式默认插槽没有显式语法，避免把子组件标签名误当成父组件 slot 使用点。
+        return {
+          name: 'default',
+          normalizedName: 'default',
+          span: { start: templateStart + cursor, end: templateStart + cursor + 1 },
+          fullSpan: { start: templateStart + cursor, end: templateStart + cursor + 1 },
+        }
+      }
       return {
         name: 'default',
         normalizedName: 'default',
@@ -426,7 +466,7 @@ function extractDefaultSlotUsage(template: string, templateStart: number, openEn
   return undefined
 }
 
-function extractComponentSlotUsages(template: string, templateStart: number, rawTag: string, openTag: string, openStart: number, openEnd: number): TemplateSlotUsage[] {
+function extractComponentSlotUsages(template: string, templateStart: number, rawTag: string, openTag: string, openStart: number, openEnd: number, registeredTags: Set<string>): TemplateSlotUsage[] {
   const slots = extractSlotUsages(openTag, templateStart + openStart)
   if (isSelfClosingOpenTag(openTag)) {
     return slots
@@ -436,7 +476,7 @@ function extractComponentSlotUsages(template: string, templateStart: number, raw
   if (closeStart === undefined) {
     return slots
   }
-  const defaultSlot = extractDefaultSlotUsage(template, templateStart, openEnd, closeStart)
+  const defaultSlot = extractDefaultSlotUsage(template, templateStart, openEnd, closeStart, registeredTags)
   if (defaultSlot) {
     slots.push(defaultSlot)
   }
@@ -510,7 +550,8 @@ export function parseTemplate(content: string, templateStart: number, registered
     }
 
     const attrs = extractAttrs(openTag, templateStart + match.index, vue3ModelEvents)
-    const slots = extractComponentSlotUsages(content, templateStart, rawTag, openTag, match.index, openEnd)
+    const binds = extractBindUsages(openTag, templateStart + match.index)
+    const slots = extractComponentSlotUsages(content, templateStart, rawTag, openTag, match.index, openEnd, uniqueTags)
     components.push({
       tag: rawTag,
       dynamicTags,
@@ -519,6 +560,7 @@ export function parseTemplate(content: string, templateStart: number, registered
         end: templateStart + match.index + 1 + rawTag.length,
       },
       attrs,
+      binds,
       slots,
       forwardsAttrs: forwardsAttrs(openTag),
       forwardsListeners: forwardsListeners(openTag),

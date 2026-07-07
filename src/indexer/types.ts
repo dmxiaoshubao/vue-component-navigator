@@ -107,6 +107,7 @@ export interface EmitInfo {
   eventSpan: TextSpan
   callSpan: TextSpan
   sourceLocation?: SourceLocation
+  declared?: boolean
 }
 
 export type EventBusMethod = '$emit' | '$on' | '$once' | '$off'
@@ -198,11 +199,18 @@ export interface TemplateAttrUsage {
   fullSpan: TextSpan
 }
 
+export interface TemplateBindUsage {
+  expression: string
+  span: TextSpan
+  fullSpan: TextSpan
+}
+
 export interface TemplateComponentUsage {
   tag: string
   dynamicTags?: string[]
   span: TextSpan
   attrs: TemplateAttrUsage[]
+  binds: TemplateBindUsage[]
   slots: TemplateSlotUsage[]
   forwardsAttrs?: boolean
   forwardsListeners?: boolean
@@ -242,6 +250,7 @@ export interface RefMethodAccess {
   methodName: string
   methodSpan: TextSpan
   sourceLocation?: SourceLocation
+  forwarded?: boolean
 }
 
 export interface UsageInfo {

@@ -388,7 +388,7 @@ export function findRefMethodUsages(files: VueFileIndex[], childUri: string, met
 
   for (const file of files) {
     for (const call of file.refMethodCalls) {
-      if (call.methodName !== methodName || findRefComponent(file, call.refName) !== childUri) {
+      if (call.forwarded || call.methodName !== methodName || findRefComponent(file, call.refName) !== childUri) {
         continue
       }
       results.push({ file, span: call.methodSpan, sourceLocation: call.sourceLocation })

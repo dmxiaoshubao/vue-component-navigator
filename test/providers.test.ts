@@ -692,6 +692,58 @@ Vue.component('LateGlobalChild', LateGlobalChild)
     expect(definition).toBeUndefined()
   })
 
+  it('默认 slot 使用不抢占嵌套局部组件标签名', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-default-slot-component-child-'))
+    const childUri = path.join(root, 'Child.vue')
+    const nestedUri = path.join(root, 'Nested.vue')
+    const parentUri = path.join(root, 'Parent.vue')
+    const childContent = `
+<template>
+  <section><slot /></section>
+</template>
+<script>
+export default { name: 'Child' }
+</script>
+`
+    const nestedContent = `
+<template><div /></template>
+<script>
+export default { name: 'Nested' }
+</script>
+`
+    const parentContent = `
+<template>
+  <Child>
+    <Nested />
+  </Child>
+</template>
+<script>
+import Child from './Child.vue'
+import Nested from './Nested.vue'
+export default { components: { Child, Nested } }
+</script>
+`
+
+    localIndex.indexContent(childUri, childContent)
+    localIndex.indexContent(nestedUri, nestedContent)
+    localIndex.indexContent(parentUri, parentContent)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const parentDocument = new TestDocument(parentUri, parentContent) as any
+    const nestedTagOffset = parentContent.indexOf('Nested') + 1
+    const nestedOpenOffset = parentContent.indexOf('<Nested')
+    const defaultSlotUsages = localIndex.findTemplateSlotUsages(childUri, 'default')
+
+    const definition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, nestedTagOffset))
+    const hover = hoverProvider.provideHover(parentDocument, positionAt(parentContent, nestedTagOffset))
+
+    expect(defaultSlotUsages).toHaveLength(1)
+    expect(defaultSlotUsages[0].span).toEqual({ start: nestedOpenOffset, end: nestedOpenOffset + 1 })
+    expect(definition).toBeUndefined()
+    expect(hover).toBeUndefined()
+  })
+
   it('template prop 定义跳转和悬浮可用，未知 prop 不跳转', () => {
     const content = readFixture('Parent.vue')
     const document = new TestDocument(path.join(fixtureRoot, 'Parent.vue'), content) as any
@@ -848,7 +900,7 @@ export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
 
     expect(hoverText(hover)).toContain('Used by 2 ref methods')
     expect(hoverText(hover)).toContain('- [Parent.vue:39]')
-    expect(hoverText(hover)).toContain('methods.callChild')
+    expect(hoverText(hover)).not.toContain('methods.callChild')
     expect(hoverText(hover)).not.toContain('open(source)')
     expect(hover.contents.isTrusted).toBe(false)
   })
@@ -1466,13 +1518,18 @@ const onConfirm = () => {}
     const propReferences = referenceProvider.provideReferences(typeDocument, positionAt(typeContent, typeContent.indexOf('beforeConfirm') + 1)) as any[]
     const propHover = hoverProvider.provideHover(typeDocument, positionAt(typeContent, typeContent.indexOf('beforeConfirm') + 1)) as any
     const typeDefinition = definitionProvider.provideDefinition(childDocument, positionAt(childContent, childContent.lastIndexOf('ConfirmDialogProps') + 1)) as any
+    const templatePropDefinition = asArray(definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf(':beforeConfirm') + 2)) as any)
+    const templatePropHover = hoverProvider.provideHover(parentDocument, positionAt(parentContent, parentContent.indexOf(':beforeConfirm') + 2)) as any
     const eventDefinition = asArray(definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('@confirm') + 1)) as any)
 
     expect(propDefinition.uri.fsPath).toBe(typeUri)
     expect(propDefinition.range.start.line).toBeGreaterThan(0)
-    expect(propReferences.map((location) => location.uri.fsPath)).toEqual([childUri, childUri, childUri])
+    expect(propReferences.map((location) => location.uri.fsPath)).toEqual([parentUri, childUri, childUri, childUri])
     expect(hoverText(propHover)).toContain('Used by 3 prop usages')
     expect(typeDefinition.uri.fsPath).toBe(typeUri)
+    expect(templatePropDefinition.map((location) => location.uri.fsPath)).toEqual([typeUri])
+    expect(hoverText(templatePropHover)).toContain('Definition')
+    expect(hoverText(templatePropHover)).toContain('beforeConfirm')
     expect(eventDefinition.map((location) => location.uri.fsPath)).toEqual([childUri])
   })
 
@@ -1540,6 +1597,95 @@ childRef.value?.open()
     expect(hoverText(exposeHover)).toContain('Used by 1 ref method')
   })
 
+  it('Vue3 defineExpose composable 转发的 ref 方法 hover 可用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-expose-composable-forward-hover-'))
+    const commonListUri = path.join(root, 'src/components/common-list/index.vue')
+    const forwardUri = path.join(root, 'src/components/common-list/hooks/use-forward-list-ref.ts')
+    const productListUri = path.join(root, 'src/ProductList.vue')
+    const pageUri = path.join(root, 'src/Page.vue')
+    const commonListContent = `
+<template><section /></template>
+<script setup lang="ts" generic="T extends Record<string, any>, R extends Record<string, any>, K extends keyof R = 'list'">
+type ListRef<T extends Record<string, any>> = {
+  onRefresh: (params?: T, refreshing?: boolean) => void
+  onLoad: (params?: T) => void
+}
+
+defineExpose<ListRef<T>>({
+  onRefresh: (params?: T) => {
+    return params
+  },
+  onLoad: (params?: T) => {
+    return params
+  },
+})
+</script>
+`
+    const pageContent = `
+<template>
+  <ProductList ref="listRef" />
+</template>
+<script setup lang="ts">
+import { ref } from 'vue'
+import ProductList from './ProductList.vue'
+
+const listRef = ref()
+
+listRef.value?.onRefresh({})
+</script>
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(commonListUri, commonListContent)
+    writeText(forwardUri, `
+import type { Ref } from 'vue'
+
+type ListRef<T extends Record<string, any>> = {
+  onRefresh: (params?: T, refreshing?: boolean) => void
+  onLoad: (params?: T) => void
+}
+
+export const useForwardListRef = <T extends Record<string, any>>(
+  targetRef: Ref<ListRef<T> | undefined>,
+): ListRef<T> => ({
+  onLoad: params => targetRef.value?.onLoad(params),
+  onRefresh: (params, refreshing) => targetRef.value?.onRefresh(params, refreshing),
+})
+`)
+    writeText(productListUri, `
+<template>
+  <CommonList ref="listRef" />
+</template>
+<script setup lang="ts">
+import { ref } from 'vue'
+import CommonList from './components/common-list/index.vue'
+import { useForwardListRef } from './components/common-list/hooks/use-forward-list-ref'
+
+const listRef = ref()
+
+defineExpose(useForwardListRef(listRef))
+</script>
+`)
+    writeText(pageUri, pageContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const document = new TestDocument(commonListUri, commonListContent) as any
+    const pageDocument = new TestDocument(pageUri, pageContent) as any
+    const hover = hoverProvider.provideHover(document, positionAt(commonListContent, commonListContent.lastIndexOf('onRefresh:') + 1)) as any
+    const usageHover = hoverProvider.provideHover(pageDocument, positionAt(pageContent, pageContent.indexOf('onRefresh') + 1)) as any
+    const usageDefinition = definitionProvider.provideDefinition(pageDocument, positionAt(pageContent, pageContent.indexOf('onRefresh') + 1)) as any
+
+    expect(hoverText(hover)).toContain('Used by 1 ref method')
+    expect(hoverText(hover)).toContain('[Page.vue:')
+    expect(hoverText(hover)).not.toContain('[ProductList.vue:')
+    expect(hoverText(usageHover)).toContain('onRefresh(params?: T)')
+    expect(hoverText(usageHover)).toContain('Definition:')
+    expect(usageDefinition.uri.fsPath).toBe(commonListUri)
+  })
+
   it('Vue3 template slot、useTemplateRef 泛型和 TSX 命令式 ref 的 provider 关系可用', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-real-ref-provider-'))
     const buttonUri = path.join(root, 'src/components/common-button/index.vue')
@@ -1575,10 +1721,12 @@ defineExpose({
 <script setup lang="ts">
 type CoinOutOptions = { coinNum: number }
 
+async function open(props: CoinOutOptions) {
+  return props.coinNum
+}
+
 defineExpose({
-  open(props: CoinOutOptions) {
-    return props.coinNum
-  },
+  open,
 })
 </script>
 `
@@ -1642,12 +1790,15 @@ class CoinOutDialogManager {
     const referenceProvider = new VueReferenceProvider(localIndex)
     const hoverProvider = new VueHoverProvider(localIndex)
     const buttonDocument = new TestDocument(buttonUri, buttonContent) as any
+    const dialogDocument = new TestDocument(dialogUri, dialogContent) as any
     const parentDocument = new TestDocument(parentUri, parentContent) as any
     const commandDocument = new TestDocument(commandUri, commandContent, 'typescriptreact') as any
 
     const slotReferences = referenceProvider.provideReferences(buttonDocument, positionAt(buttonContent, buttonContent.indexOf('left-icon') + 1)) as any[]
     const exposeReferences = referenceProvider.provideReferences(buttonDocument, positionAt(buttonContent, buttonContent.indexOf('reset,') + 1)) as any[]
     const exposeHover = hoverProvider.provideHover(buttonDocument, positionAt(buttonContent, buttonContent.indexOf('reset,') + 1)) as any
+    const dialogExposeHover = hoverProvider.provideHover(dialogDocument, positionAt(dialogContent, dialogContent.indexOf('open(') + 1)) as any
+    const dialogPublicExposeHover = hoverProvider.provideHover(dialogDocument, positionAt(dialogContent, dialogContent.indexOf('open,') + 1)) as any
     const resetDefinition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('reset()') + 1)) as any
     const resetInputDefinition = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, parentContent.indexOf('resetInput()') + 1)) as any
     const commandDefinition = definitionProvider.provideDefinition(commandDocument, positionAt(commandContent, commandContent.indexOf('open({') + 1)) as any
@@ -1655,6 +1806,12 @@ class CoinOutDialogManager {
     expect(slotReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
     expect(exposeReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
     expect(hoverText(exposeHover)).toContain('Used by 1 ref method')
+    expect(hoverText(dialogExposeHover)).toContain('Used by 1 ref method')
+    expect(hoverText(dialogExposeHover)).toContain('[command.tsx:')
+    expect(hoverText(dialogExposeHover)).not.toContain('  \n  open')
+    expect(hoverText(dialogPublicExposeHover)).toContain('Used by 1 ref method')
+    expect(hoverText(dialogPublicExposeHover)).toContain('[command.tsx:')
+    expect(hoverText(dialogPublicExposeHover)).not.toContain('  \n  open')
     expect(resetDefinition.uri.fsPath).toBe(buttonUri)
     expect(resetInputDefinition.uri.fsPath).toBe(numberPadUri)
     expect(commandDefinition.uri.fsPath).toBe(dialogUri)
@@ -1995,6 +2152,105 @@ const onFetchStart = () => {}
     expect(hoverText(hover)).not.toContain('No template listeners found')
     expect(listenerDefinitions.map((location) => location.uri.fsPath)).toEqual([childUri])
     expect(hoverText(listenerHover)).toContain('Definition')
+  })
+
+  it('Vue3 v-bind $attrs 透传 prop 的 provider 关系可用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-provider-forwarded-props-'))
+    const childUri = path.join(root, 'src/PositiveScan.vue')
+    const middleUri = path.join(root, 'src/MemberLogin.vue')
+    const parentUri = path.join(root, 'src/Dialog.vue')
+    const childContent = `
+<template><section>{{ props.classifyId }}</section></template>
+<script setup lang="ts">
+const props = defineProps<{
+  classifyId: string
+}>()
+</script>
+`
+    const middleContent = `
+<template>
+  <PositiveScan v-bind="$attrs" />
+</template>
+<script setup lang="ts">
+import PositiveScan from './PositiveScan.vue'
+</script>
+`
+    const parentContent = `
+<template>
+  <MemberLogin :classify-id="classifyId" />
+</template>
+<script setup lang="ts">
+import MemberLogin from './MemberLogin.vue'
+
+const classifyId = '1'
+</script>
+`
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, childContent)
+    writeText(middleUri, middleContent)
+    writeText(parentUri, parentContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const parentDocument = new TestDocument(parentUri, parentContent) as any
+    const childDocument = new TestDocument(childUri, childContent) as any
+
+    const parentPropPosition = positionAt(parentContent, parentContent.indexOf(':classify-id') + 2)
+    const childPropPosition = positionAt(childContent, childContent.lastIndexOf('classifyId') + 1)
+    const definitions = asArray(definitionProvider.provideDefinition(parentDocument, parentPropPosition) as any)
+    const references = referenceProvider.provideReferences(childDocument, childPropPosition) as any[]
+    const hover = hoverProvider.provideHover(childDocument, childPropPosition) as any
+    const templatePropHover = hoverProvider.provideHover(parentDocument, parentPropPosition) as any
+
+    expect(definitions.map((location) => location.uri.fsPath)).toEqual([childUri])
+    expect(references.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(hoverText(hover)).toContain('Used by 1 template prop')
+    expect(hoverText(templatePropHover)).toContain('Definition')
+    expect(hoverText(templatePropHover)).toContain('classifyId')
+  })
+
+  it('Vue3 v-bind 对象 prop 的 provider 反向引用可用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-provider-object-bind-props-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const childContent = `
+<script setup lang="ts">
+defineProps<{
+  title: string
+}>()
+</script>
+`
+    const parentContent = `
+<template>
+  <Child v-bind="childProps" />
+</template>
+<script setup lang="ts">
+import Child from './Child.vue'
+
+const childProps = {
+  title: 'hello',
+}
+</script>
+`
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, childContent)
+    writeText(parentUri, parentContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const childDocument = new TestDocument(childUri, childContent) as any
+    const titlePosition = positionAt(childContent, childContent.indexOf('title') + 1)
+
+    const references = referenceProvider.provideReferences(childDocument, titlePosition) as any[]
+    const hover = hoverProvider.provideHover(childDocument, titlePosition) as any
+
+    expect(references.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(hoverText(hover)).toContain('Used by 1 template prop')
   })
 
   it('Vue3 hook 返回方法可在源码处 hover 和查找反向引用', async () => {

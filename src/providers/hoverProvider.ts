@@ -2,7 +2,7 @@ import * as path from 'node:path'
 import * as vscode from 'vscode'
 import type { EmitInfo, EventBusCall, MethodInfo, PropInfo, SlotInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findInject, findMethod, findProp, findProvideAtOffset, findResolvedRefComponents } from '../indexer/relationResolver'
+import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findInject, findProp, findProvideAtOffset, findResolvedRefComponents } from '../indexer/relationResolver'
 import { containsOffsetStrict, createLineStarts, offsetToPosition, positionToOffset } from '../utils/position'
 import { escapeMarkdownText, formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 import { commonDirectory, relativePath, shortestUniquePathLabels } from '../utils/pathDisplay'
@@ -359,6 +359,7 @@ function methodDefinitionHover(index: WorkspaceIndex, child: VueFileIndex, metho
     singular: 'ref method',
     plural: 'ref methods',
     commandArgs: { kind: 'ref-method-usages', childUri: child.uri, methodName: method.name },
+    includeContext: false,
   })
   return markdownHover(summary.text, summary.trusted)
 }
@@ -428,9 +429,8 @@ export class VueHoverProvider implements vscode.HoverProvider {
     const refAccess = findRefMethodAccessInFile(file, offset)
     if (refAccess) {
       const definitions = findResolvedRefComponents(this.index, file, refAccess.refName).flatMap((childUri) => {
-        const child = this.index.getFile(childUri)
-        const method = child ? findMethod(child, refAccess.methodName) : undefined
-        return child && method ? [{ child, method }] : []
+        return this.index.findRefMethodDefinitions(childUri, refAccess.methodName)
+          .map(({ file, method }) => ({ child: file, method }))
       })
       return methodDefinitionsHover(definitions, definitionLabels())
     }
@@ -524,9 +524,8 @@ export class VueHoverProvider implements vscode.HoverProvider {
   private sourceHover(sourceUri: string, offset: number): vscode.Hover | undefined {
     const refDefinitions = this.index.findSourceRefMethodCalls(sourceUri, offset).flatMap(({ file, call }) => {
       return findResolvedRefComponents(this.index, file, call.refName).flatMap((childUri) => {
-        const child = this.index.getFile(childUri)
-        const method = child ? findMethod(child, call.methodName) : undefined
-        return child && method ? [{ child, method }] : []
+        return this.index.findRefMethodDefinitions(childUri, call.methodName)
+          .map(({ file, method }) => ({ child: file, method }))
       })
     })
     if (refDefinitions.length > 0) {
@@ -583,6 +582,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
         singular: 'ref method',
         plural: 'ref methods',
         commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'method' },
+        includeContext: false,
       })
       return markdownHover(summary.text, summary.trusted)
     }
