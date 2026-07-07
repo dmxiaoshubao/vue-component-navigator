@@ -361,7 +361,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     if (args.kind === 'prop-usages') {
       return {
-        usages: index.findTemplatePropUsages(args.childUri, args.propName),
+        usages: index.findPropUsages(args.childUri, args.propName),
         placeHolder: `Select ${args.propName} prop usage`,
       }
     }

@@ -1,7 +1,7 @@
 import * as vscode from 'vscode'
 import type { SourceLocation, TextSpan, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findIndexedTemplatePropUsages, findInject, findProp, findProvideAtOffset, findResolvedRefComponents, hasRegisteredComponent } from '../indexer/relationResolver'
+import { findEmit, findIndexedInjectUsages, findIndexedPropUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findIndexedTemplatePropUsages, findInject, findProp, findProvideAtOffset, findResolvedRefComponents, hasRegisteredComponent } from '../indexer/relationResolver'
 import { containsOffsetStrict, createLineStarts, positionToOffset, spanToRange } from '../utils/position'
 
 function toRange(file: VueFileIndex, span: TextSpan): vscode.Range {
@@ -161,7 +161,7 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
 
     for (const prop of file.scriptIndex.props) {
       if (containsOffsetStrict(prop.span, offset)) {
-        const usages = findIndexedTemplatePropUsages(this.index, file.uri, prop.name)
+        const usages = findIndexedPropUsages(this.index, file.uri, prop.name)
         return usages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
       }
     }

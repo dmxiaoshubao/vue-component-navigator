@@ -2,7 +2,7 @@ import * as path from 'node:path'
 import * as vscode from 'vscode'
 import type { EmitInfo, EventBusCall, MethodInfo, PropInfo, SlotInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedInjectUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findInject, findProp, findProvideAtOffset, findResolvedRefComponents } from '../indexer/relationResolver'
+import { findEmit, findIndexedInjectUsages, findIndexedPropUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findInject, findProp, findProvideAtOffset, findResolvedRefComponents } from '../indexer/relationResolver'
 import { containsOffsetStrict, createLineStarts, offsetToPosition, positionToOffset } from '../utils/position'
 import { escapeMarkdownText, formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 import { commonDirectory, relativePath, shortestUniquePathLabels } from '../utils/pathDisplay'
@@ -340,12 +340,12 @@ function offsetInDocument(document: vscode.TextDocument, position: vscode.Positi
 }
 
 function propDefinitionHover(index: WorkspaceIndex, child: VueFileIndex, prop: PropInfo, baseDirectory: string): vscode.Hover {
-  const usages = index.findTemplatePropUsages(child.uri, prop.name)
+  const usages = findIndexedPropUsages(index, child.uri, prop.name)
   const summary = usageSummary(usages, baseDirectory, {
-    noneText: 'No template prop usages found.',
+    noneText: 'No prop usages found.',
     title: 'Used by',
-    singular: 'template prop',
-    plural: 'template props',
+    singular: 'prop usage',
+    plural: 'prop usages',
     commandArgs: { kind: 'prop-usages', childUri: child.uri, propName: prop.name },
   })
   return markdownHover(summary.text, summary.trusted)
@@ -550,25 +550,13 @@ export class VueHoverProvider implements vscode.HoverProvider {
       return markdownHover(summary.text, summary.trusted)
     }
 
-    const vue3PropUsages = this.index.findVue3PropInternalUsagesFromSource(sourceUri, offset)
-    if (vue3PropUsages.length > 0) {
-      const summary = usageSummary(vue3PropUsages, this.workspaceBaseDirectory(), {
+    const propUsages = this.index.findPropUsagesFromSource(sourceUri, offset)
+    if (propUsages.length > 0) {
+      const summary = usageSummary(propUsages, this.workspaceBaseDirectory(), {
         noneText: 'No prop usages found.',
         title: 'Used by',
         singular: 'prop usage',
         plural: 'prop usages',
-        commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'prop' },
-      })
-      return markdownHover(summary.text, summary.trusted)
-    }
-
-    const propUsages = this.index.findTemplatePropUsagesFromSource(sourceUri, offset)
-    if (propUsages.length > 0) {
-      const summary = usageSummary(propUsages, this.workspaceBaseDirectory(), {
-        noneText: 'No template prop usages found.',
-        title: 'Used by',
-        singular: 'template prop',
-        plural: 'template props',
         commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'prop' },
       })
       return markdownHover(summary.text, summary.trusted)

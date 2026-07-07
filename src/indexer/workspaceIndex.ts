@@ -655,6 +655,13 @@ export class WorkspaceIndex {
     return results
   }
 
+  findPropUsages(childUri: string, propName: string): UsageInfo[] {
+    return dedupeUsages([
+      ...this.findTemplatePropUsages(childUri, propName),
+      ...this.findVue3PropInternalUsages(childUri, propName),
+    ])
+  }
+
   findTemplateEventUsages(childUri: string, eventName: string): UsageInfo[] {
     const results: UsageInfo[] = []
     for (const key of this.eventKeys(childUri, eventName)) {
@@ -847,10 +854,10 @@ export class WorkspaceIndex {
   }
 
   findPropUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {
-    return dedupeUsages([
-      ...this.findTemplatePropUsagesFromSource(sourceUri, offset),
-      ...this.findVue3PropInternalUsagesFromSource(sourceUri, offset),
-    ])
+    return dedupeUsages(this.findSourceProps(sourceUri, offset).flatMap(({ file, prop }) => [
+      ...this.findTemplatePropUsages(file.uri, prop.name),
+      ...(file.vueVersion === 3 ? this.findVue3PropInternalUsages(file.uri, prop.name) : []),
+    ]))
   }
 
   findVue3PropTypeUsagesFromSource(sourceUri: string, offset: number): UsageInfo[] {

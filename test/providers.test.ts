@@ -306,7 +306,7 @@ export default {
 
     expect(eventDefinitions[0].uri.fsPath).toBe(path.join(fixtureRoot, 'MixinParent.vue'))
     expect(refDefinition[0].uri.fsPath).toBe(path.join(fixtureRoot, 'MixinInner.vue'))
-    expect(hoverText(propHover)).toContain('Used by 1 template prop')
+    expect(hoverText(propHover)).toContain('Used by 1 prop usage')
     expect(methodReferences[0].uri.fsPath).toBe(path.join(fixtureRoot, 'MixinParent.vue'))
     expect(completions.map((item) => item.label)).toEqual(['focus'])
   })
@@ -334,7 +334,7 @@ export default {
 
     expect(propReferences[0].uri.fsPath).toBe(path.join(fixtureRoot, 'MixinVueParent.vue'))
     expect(methodReferences[0].uri.fsPath).toBe(path.join(fixtureRoot, 'MixinVueParent.vue'))
-    expect(hoverText(propHover)).toContain('Used by 1 template prop')
+    expect(hoverText(propHover)).toContain('Used by 1 prop usage')
   })
 
   it('$emit 与 template 事件双向定义跳转可用', () => {
@@ -884,7 +884,7 @@ export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
 
     const hover = hoverProvider.provideHover(document, positionAt(content, propOffset)) as any
 
-    expect(hoverText(hover)).toContain('Used by 1 template prop')
+    expect(hoverText(hover)).toContain('Used by 1 prop usage')
     expect(hoverText(hover)).toContain('- [Parent.vue:5]')
     expect(hoverText(hover)).not.toContain('title: String')
     expect(hover.contents.isTrusted).toBe(false)
@@ -1525,7 +1525,8 @@ const onConfirm = () => {}
     expect(propDefinition.uri.fsPath).toBe(typeUri)
     expect(propDefinition.range.start.line).toBeGreaterThan(0)
     expect(propReferences.map((location) => location.uri.fsPath)).toEqual([parentUri, childUri, childUri, childUri])
-    expect(hoverText(propHover)).toContain('Used by 3 prop usages')
+    expect(hoverText(propHover)).toContain('Used by 4 prop usages')
+    expect(hoverText(propHover)).toContain('Parent.vue:3')
     expect(typeDefinition.uri.fsPath).toBe(typeUri)
     expect(templatePropDefinition.map((location) => location.uri.fsPath)).toEqual([typeUri])
     expect(hoverText(templatePropHover)).toContain('Definition')
@@ -2087,7 +2088,7 @@ export default {
     expect(eventReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
     expect(hoverText(eventHover)).toContain('Used by 1 listener')
     expect(propReferences.map((location) => location.uri.fsPath)).toEqual([parentUri])
-    expect(hoverText(propDefinitionHover)).toContain('Used by 1 template prop')
+    expect(hoverText(propDefinitionHover)).toContain('Used by 1 prop usage')
   })
 
   it('Vue3 v-bind $attrs 透传事件的 provider 关系可用', async () => {
@@ -2206,8 +2207,8 @@ const classifyId = '1'
     const templatePropHover = hoverProvider.provideHover(parentDocument, parentPropPosition) as any
 
     expect(definitions.map((location) => location.uri.fsPath)).toEqual([childUri])
-    expect(references.map((location) => location.uri.fsPath)).toEqual([parentUri])
-    expect(hoverText(hover)).toContain('Used by 1 template prop')
+    expect(references.map((location) => location.uri.fsPath)).toEqual([parentUri, childUri])
+    expect(hoverText(hover)).toContain('Used by 2 prop usages')
     expect(hoverText(templatePropHover)).toContain('Definition')
     expect(hoverText(templatePropHover)).toContain('classifyId')
   })
@@ -2250,7 +2251,7 @@ const childProps = {
     const hover = hoverProvider.provideHover(childDocument, titlePosition) as any
 
     expect(references.map((location) => location.uri.fsPath)).toEqual([parentUri])
-    expect(hoverText(hover)).toContain('Used by 1 template prop')
+    expect(hoverText(hover)).toContain('Used by 1 prop usage')
   })
 
   it('Vue3 hook 返回方法可在源码处 hover 和查找反向引用', async () => {

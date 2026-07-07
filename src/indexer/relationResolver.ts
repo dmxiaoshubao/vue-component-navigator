@@ -323,6 +323,10 @@ export function findIndexedTemplatePropUsages(index: WorkspaceIndex, childUri: s
   return index.findTemplatePropUsages(childUri, propName)
 }
 
+export function findIndexedPropUsages(index: WorkspaceIndex, childUri: string, propName: string): UsageInfo[] {
+  return index.findPropUsages(childUri, propName)
+}
+
 export function findTemplateEventUsages(files: VueFileIndex[], childUri: string, eventName: string) {
   const results: Array<{ file: VueFileIndex, span: { start: number, end: number } }> = []
 
