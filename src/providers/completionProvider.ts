@@ -35,6 +35,57 @@ function isVueDocument(document: vscode.TextDocument): boolean {
   return document.languageId === 'vue' || document.uri.fsPath.endsWith('.vue')
 }
 
+function shouldInspectNonVueCompletion(document: vscode.TextDocument, position: vscode.Position, index: WorkspaceIndex): boolean {
+  const linePrefix = getLinePrefix(document, position)
+  if (linePrefix === undefined) {
+    return true
+  }
+
+  if (linePrefix.includes('this.$refs')) {
+    return true
+  }
+
+  const eventBusNames = index.getEventBusNames()
+  if (eventBusNames.length > 0 && eventBusNames.some((name) => linePrefix.includes(name))) {
+    return true
+  }
+
+  const inString = hasOpenStringBeforeCursor(linePrefix)
+  if (inString && eventBusNames.length > 0) {
+    return true
+  }
+
+  return inString && index.hasIndexedDocumentContext(document.uri.fsPath)
+}
+
+function getLinePrefix(document: vscode.TextDocument, position: vscode.Position): string | undefined {
+  if (typeof document.lineAt !== 'function') {
+    return undefined
+  }
+  return document.lineAt(position.line).text.slice(0, position.character)
+}
+
+function hasOpenStringBeforeCursor(linePrefix: string): boolean {
+  let quote: '\'' | '"' | undefined
+  for (let index = 0; index < linePrefix.length; index += 1) {
+    const char = linePrefix[index]
+    if (char === '\\') {
+      index += 1
+      continue
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = undefined
+      }
+      continue
+    }
+    if (char === '\'' || char === '"') {
+      quote = char
+    }
+  }
+  return quote !== undefined
+}
+
 function offsetInContent(content: string, position: vscode.Position): number | undefined {
   return positionToOffset(createLineStarts(content), { line: position.line, character: position.character })
 }
@@ -55,11 +106,19 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
   constructor(private readonly index: WorkspaceIndex) {}
 
   provideCompletionItems(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.CompletionItem[]> {
+    const vueDocument = isVueDocument(document)
+    if (!vueDocument && !this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
+      return undefined
+    }
+    if (!vueDocument && !shouldInspectNonVueCompletion(document, position, this.index)) {
+      return undefined
+    }
+
     const content = document.getText()
-    const file = isVueDocument(document)
+    const file = vueDocument
       ? this.index.syncContent(document.uri.fsPath, content)
       : this.index.getFile(document.uri.fsPath)
-    const offset = isVueDocument(document)
+    const offset = vueDocument
       ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
       : offsetInContent(content, position)
     if (offset === undefined) {

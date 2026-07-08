@@ -1,8 +1,8 @@
 import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { ComponentRegistration, ComposableReturnUsage, EmitInfo, EventBusCall, EventBusRegistration, EventBusUsageInfo, GlobalComponentContext, GlobalComponentRegistration, ImportInfo, InjectInfo, MethodInfo, MixinReference, ParsedSfc, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SlotInfo, SourceLocation, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex, Vue3PropTypeInfo, Vue3PropUsage, VueMajorVersion } from './types'
-import { createComposableReturnParseCache, isComposableImport, parseComposableReturnUsages, resolveComposableImport, type ComposableReturnParseCache } from './composableParser'
+import type { ComposableReturnUsage, EmitInfo, EventBusCall, EventBusRegistration, EventBusUsageInfo, GlobalComponentContext, GlobalComponentRegistration, IndexCancellationToken, InjectInfo, MethodInfo, MixinReference, ParsedSfc, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SlotInfo, SourceLocation, TemplateComponentUsage, TemplateIndex, TextSpan, UsageInfo, VueFileIndex, Vue3PropTypeInfo, Vue3PropUsage, VueMajorVersion } from './types'
+import { isComposableImport, resolveComposableImport } from './composableParser'
 import { parseEventBusRegistrations, parseStaticImportSources } from './eventBusParser'
 import { resolveExternalRefComponent } from './externalComponentResolver'
 import { guessGlobalComponentsFromRequireContext, parseGlobalComponents } from './globalComponentParser'
@@ -10,14 +10,13 @@ import { resolveImportPathWithExtensions, resolveProjectPathWithExtensions } fro
 import { parseSfc } from './sfcParser'
 import { parseScript } from './scriptParser'
 import { parseTemplate } from './templateParser'
-import { createVue3ScriptParseCache, parseVue3Script } from './vue3ScriptParser'
+import { Vue3LanguageCoreRuntime } from './vue3LanguageCoreRuntime'
+import type { VueRuntimeEngine } from './vueRuntime'
 import { createLineStarts, positionToOffset } from '../utils/position'
 import { matchesName, toCamelCase, toKebabCase } from '../utils/casing'
 import { maskStringsAndComments, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
-export interface IndexCancellationToken {
-  readonly isCancellationRequested: boolean
-}
+export type { IndexCancellationToken } from './types'
 
 type EventBusEntryConfig = string | readonly string[]
 type TrackedUsageMap = Map<string, UsageInfo[]>
@@ -34,17 +33,77 @@ interface ScriptComponentUsageImport {
   childUri: string
   importStart: number
   importEnd: number
-  fallbackSpan: TextSpan
+  importSourceSpan: TextSpan
   spans: TextSpan[]
 }
 
-interface ForwardedRefMethodNameCacheEntry {
-  mtimeMs: number
-  size: number
-  methodsByExportName: Map<string, string[]>
+function replaceMap<K, V>(target: Map<K, V>, source: Map<K, V>, cloneValue: (value: V) => V = (value) => value): void {
+  target.clear()
+  for (const [key, value] of source) {
+    target.set(key, cloneValue(value))
+  }
 }
 
-type ForwardedRefMethodNameCache = Map<string, ForwardedRefMethodNameCacheEntry>
+function replaceSet<T>(target: Set<T>, source: Set<T>): void {
+  target.clear()
+  for (const value of source) {
+    target.add(value)
+  }
+}
+
+function cloneArray<T>(items: T[]): T[] {
+  return [...items]
+}
+
+function cloneStringSet(items: Set<string>): Set<string> {
+  return new Set(items)
+}
+
+function cloneScriptComponentUsageFile(usageFile: ScriptComponentUsageFile): ScriptComponentUsageFile {
+  return {
+    file: usageFile.file,
+    usages: [...usageFile.usages],
+  }
+}
+
+function cloneWeakSetTracking(files: VueFileIndex[], source: WeakMap<VueFileIndex, Set<string>>): WeakMap<VueFileIndex, Set<string>> {
+  const cloned = new WeakMap<VueFileIndex, Set<string>>()
+  for (const file of files) {
+    const keys = source.get(file)
+    if (keys?.size) {
+      cloned.set(file, new Set(keys))
+    }
+  }
+  return cloned
+}
+
+function cloneUsageTracking(
+  files: VueFileIndex[],
+  source: WeakMap<VueFileIndex, Map<TrackedUsageMap, Set<string>>>,
+  mapRemap: Map<TrackedUsageMap, TrackedUsageMap>,
+): WeakMap<VueFileIndex, Map<TrackedUsageMap, Set<string>>> {
+  const cloned = new WeakMap<VueFileIndex, Map<TrackedUsageMap, Set<string>>>()
+  for (const file of files) {
+    const usageMaps = source.get(file)
+    if (!usageMaps) {
+      continue
+    }
+
+    const clonedUsageMaps = new Map<TrackedUsageMap, Set<string>>()
+    for (const [sourceMap, keys] of usageMaps) {
+      const targetMap = mapRemap.get(sourceMap)
+      if (!targetMap || keys.size === 0) {
+        continue
+      }
+      clonedUsageMaps.set(targetMap, new Set(keys))
+    }
+
+    if (clonedUsageMaps.size > 0) {
+      cloned.set(file, clonedUsageMaps)
+    }
+  }
+  return cloned
+}
 
 function emptyScriptIndex(): ScriptIndex {
   return {
@@ -61,6 +120,24 @@ function emptyScriptIndex(): ScriptIndex {
     vue3PropUsages: [],
     composableReturnUsages: [],
     slots: [],
+  }
+}
+
+function emptyTemplateIndex(components: TemplateComponentUsage[] = []): TemplateIndex {
+  return {
+    components,
+    emits: [],
+    eventBusCalls: [],
+    slots: [],
+  }
+}
+
+function mergeTemplateRelations(scriptIndex: ScriptIndex, templateIndex: TemplateIndex): ScriptIndex {
+  return {
+    ...scriptIndex,
+    emits: [...scriptIndex.emits, ...templateIndex.emits],
+    eventBusCalls: [...scriptIndex.eventBusCalls, ...templateIndex.eventBusCalls],
+    slots: [...scriptIndex.slots, ...templateIndex.slots],
   }
 }
 
@@ -103,9 +180,26 @@ export class WorkspaceIndex {
   private readonly scriptComponentUsageFiles = new Map<string, ScriptComponentUsageFile>()
   private readonly mixinIndexCache = new Map<string, { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } | undefined>()
   private readonly mixinSourceUris = new Set<string>()
-  private readonly vue3ScriptParseCache = createVue3ScriptParseCache()
-  private readonly composableReturnParseCache: ComposableReturnParseCache = createComposableReturnParseCache()
-  private readonly forwardedRefMethodNameCache: ForwardedRefMethodNameCache = new Map()
+  private readonly vue2Runtime: VueRuntimeEngine = {
+    version: 2,
+    indexContent: (uri, sfc) => this.indexVue2Content(uri, sfc),
+    indexWorkspace: (root, vueFiles, scriptFiles, token) => this.indexVue2Workspace(root, vueFiles, scriptFiles, token),
+  }
+  private readonly vue3Runtime = new Vue3LanguageCoreRuntime({
+    workspaceRoots: () => this.workspaceRoots,
+    indexFile: (uri) => this.indexFile(uri),
+    indexContent: (uri, content) => this.indexContent(uri, content),
+    indexScriptComponentUsageContent: (uri, content, rebuild) => this.indexScriptComponentUsageContent(uri, content, rebuild),
+    withBulkIndexing: async (task) => {
+      this.isBulkIndexing = true
+      try {
+        await task()
+      } finally {
+        this.isBulkIndexing = false
+        this.rebuildReverseIndexes()
+      }
+    },
+  })
   private usageKeysByFile = new WeakMap<VueFileIndex, Map<TrackedUsageMap, Set<string>>>()
   private refMethodForwardKeysByFile = new WeakMap<VueFileIndex, Set<string>>()
   private sourceKeysByFile = new WeakMap<VueFileIndex, Set<string>>()
@@ -128,74 +222,49 @@ export class WorkspaceIndex {
     this.scriptComponentUsageFiles.clear()
     this.mixinIndexCache.clear()
     this.mixinSourceUris.clear()
-    this.vue3ScriptParseCache.clear()
-    this.composableReturnParseCache.clear()
-    this.forwardedRefMethodNameCache.clear()
+    this.vue3Runtime.clear()
     this.clearReverseIndexes()
   }
 
   replaceWith(other: WorkspaceIndex): void {
-    this.files.clear()
-    for (const [uri, file] of other.files) {
-      this.files.set(uri, file)
+    if (other === this) {
+      return
     }
+
+    replaceMap(this.files, other.files)
     this.workspaceRoots.length = 0
     this.workspaceRoots.push(...other.workspaceRoots)
-    this.workspaceVueVersions.clear()
-    for (const [root, version] of other.workspaceVueVersions) {
-      this.workspaceVueVersions.set(root, version)
-    }
-    this.eventBusEntriesByRoot.clear()
-    for (const [root, entries] of other.eventBusEntriesByRoot) {
-      this.eventBusEntriesByRoot.set(root, [...entries])
-    }
-    this.externalRefComponents.clear()
-    this.externalRefComponentUris.clear()
-    this.globalComponents.clear()
-    for (const [name, components] of other.globalComponents) {
-      this.globalComponents.set(name, [...components])
-    }
-    this.globalComponentRegistrations.clear()
-    for (const [fileUri, registrations] of other.globalComponentRegistrations) {
-      this.globalComponentRegistrations.set(fileUri, [...registrations])
-    }
-    this.globalComponentContexts.clear()
-    for (const [fileUri, contexts] of other.globalComponentContexts) {
-      this.globalComponentContexts.set(fileUri, [...contexts])
-    }
-    this.eventBusRegistrations.clear()
-    for (const [fileUri, registrations] of other.eventBusRegistrations) {
-      this.eventBusRegistrations.set(fileUri, [...registrations])
-    }
-    this.mixinIndexCache.clear()
-    this.mixinSourceUris.clear()
-    for (const uri of other.mixinSourceUris) {
-      this.mixinSourceUris.add(uri)
-    }
-    this.scriptComponentUsageFiles.clear()
-    for (const [uri, usageFile] of other.scriptComponentUsageFiles) {
-      this.scriptComponentUsageFiles.set(uri, {
-        file: usageFile.file,
-        usages: [...usageFile.usages],
-      })
-    }
-    this.composableReturnParseCache.clear()
-    for (const [uri, entry] of other.composableReturnParseCache) {
-      this.composableReturnParseCache.set(uri, entry)
-    }
-    this.forwardedRefMethodNameCache.clear()
-    for (const [uri, entry] of other.forwardedRefMethodNameCache) {
-      this.forwardedRefMethodNameCache.set(uri, {
-        mtimeMs: entry.mtimeMs,
-        size: entry.size,
-        methodsByExportName: new Map([...entry.methodsByExportName].map(([name, methods]) => [name, [...methods]])),
-      })
-    }
-    this.rebuildReverseIndexes()
+    replaceMap(this.workspaceVueVersions, other.workspaceVueVersions)
+    replaceMap(this.eventBusEntriesByRoot, other.eventBusEntriesByRoot, cloneArray)
+    replaceMap(this.externalRefComponents, other.externalRefComponents)
+    replaceMap(this.externalRefComponentUris, other.externalRefComponentUris)
+    replaceMap(this.globalComponents, other.globalComponents, cloneArray)
+    replaceMap(this.globalComponentRegistrations, other.globalComponentRegistrations, cloneArray)
+    replaceMap(this.globalComponentContexts, other.globalComponentContexts, cloneArray)
+    replaceMap(this.eventBusRegistrations, other.eventBusRegistrations, cloneArray)
+    replaceMap(this.mixinIndexCache, other.mixinIndexCache)
+    replaceSet(this.mixinSourceUris, other.mixinSourceUris)
+    replaceMap(this.scriptComponentUsageFiles, other.scriptComponentUsageFiles, cloneScriptComponentUsageFile)
+    this.vue3Runtime.replaceWith(other.vue3Runtime)
+    this.replaceReverseIndexesWith(other)
+    this.isBulkIndexing = false
   }
 
   getWorkspaceRoots(): string[] {
     return [...this.workspaceRoots]
+  }
+
+  getWorkspaceVueVersionForUri(uri: string): VueMajorVersion | undefined {
+    const root = this.workspaceRootFor(uri)
+    return root ? this.workspaceVueVersions.get(root) : undefined
+  }
+
+  isInsideIndexedWorkspace(uri: string): boolean {
+    return this.workspaceRootFor(uri) !== undefined
+  }
+
+  hasIndexedDocumentContext(uri: string): boolean {
+    return Boolean(this.getFile(uri)) || this.hasSourceRelations(uri)
   }
 
   setEventBusEntries(root: string, entries: EventBusEntryConfig): void {
@@ -209,6 +278,10 @@ export class WorkspaceIndex {
   }
 
   setWorkspaceVueVersion(root: string, version: VueMajorVersion): void {
+    const previous = this.workspaceVueVersions.get(root)
+    if (previous !== undefined && previous !== version) {
+      this.clearWorkspaceRoot(root)
+    }
     if (!this.workspaceRoots.includes(root)) {
       this.workspaceRoots.push(root)
     }
@@ -299,72 +372,11 @@ export class WorkspaceIndex {
 
     const sfc = this.parseIndexableContent(uri, content)
     const vueVersion = this.vueVersionForUri(uri, sfc)
-    const eventBusNames = vueVersion === 2 ? this.getEventBusNames() : []
-    const ownScriptIndex = vueVersion === 3
-      ? parseVue3Script(sfc, this.workspaceRoots, this.vue3ScriptParseCache)
-      : sfc.script
-        ? parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots, 'default', eventBusNames)
-        : emptyScriptIndex()
-    const mixed = vueVersion === 2
-      ? this.mergeStaticMixins(uri, ownScriptIndex)
-      : { scriptIndex: ownScriptIndex, refMethodCalls: [] }
-    let scriptIndex = mixed.scriptIndex
-    if (vueVersion === 3) {
-      scriptIndex = {
-        ...scriptIndex,
-        components: isScriptFile(uri) && !uri.endsWith('.vue')
-          ? [...scriptIndex.components, ...parseScriptImportedVueComponents(uri, content, scriptIndex.imports, this.workspaceRoots)]
-          : scriptIndex.components,
-        composableReturnUsages: [
-          ...scriptIndex.composableReturnUsages,
-          ...parseComposableReturnUsages(uri, sfc, scriptIndex.imports, this.workspaceRoots, this.composableReturnParseCache),
-        ],
-      }
+    const refreshVue3SourceConsumers = this.shouldRefreshVue3SourceConsumers(uri, vueVersion, previous)
+    if (refreshVue3SourceConsumers) {
+      this.vue3Runtime.invalidate(uri)
     }
-    const registeredTags = [
-      ...scriptIndex.components.flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
-      ...(vueVersion === 2 ? this.getGlobalComponents().flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]) : []),
-    ]
-    const templateIndex = sfc.template
-      ? parseTemplate(sfc.template.content, sfc.template.start, registeredTags, scriptIndex.staticComponentNames, eventBusNames, vueVersion === 3)
-      : {
-          components: vueVersion === 3 && isScriptFile(uri) && !uri.endsWith('.vue')
-            ? parseVue3ScriptRefComponentUsages(content)
-            : [],
-          emits: [],
-          eventBusCalls: [],
-          slots: [],
-        }
-    scriptIndex = {
-      ...scriptIndex,
-      emits: [...scriptIndex.emits, ...templateIndex.emits],
-      eventBusCalls: [...scriptIndex.eventBusCalls, ...templateIndex.eventBusCalls],
-      slots: [...scriptIndex.slots, ...templateIndex.slots],
-    }
-    const searchableContent = maskStringsAndComments(sfc.content)
-
-    const file: VueFileIndex = {
-      uri,
-      fileName: sfc.fileName,
-      vueVersion,
-      content: sfc.content,
-      searchableContent,
-      lineStarts: sfc.lineStarts,
-      script: sfc.script,
-      scriptSetup: sfc.scriptSetup,
-      template: sfc.template,
-      scriptIndex,
-      templateIndex,
-      refMethodCalls: vueVersion === 2
-        ? [
-            ...findRefMethodCalls(searchableContent),
-            ...mixed.refMethodCalls,
-          ]
-        : [
-            ...findVue3TemplateRefMethodCalls(sfc.content),
-            ...findVue3DefineExposeForwardedRefMethodCalls(uri, sfc, scriptIndex.imports, this.workspaceRoots, this.forwardedRefMethodNameCache),
-          ],
-    }
+    const file = this.runtimeFor(vueVersion).indexContent(uri, sfc)
     this.files.set(uri, file)
     if (this.isBulkIndexing) {
       return file
@@ -390,9 +402,56 @@ export class WorkspaceIndex {
       this.rebuildReverseIndexes()
     }
     if (wasMixinSource) {
-      this.rebuildIndexedFiles()
+      this.rebuildIndexedFilesByVersion(2)
+    }
+    if (refreshVue3SourceConsumers) {
+      this.rebuildVue3SourceConsumers(uri)
     }
     return file
+  }
+
+  private indexVue2Content(uri: string, sfc: ParsedSfc): VueFileIndex {
+    const eventBusNames = this.getEventBusNames()
+    const ownScriptIndex = sfc.script
+      ? parseScript(uri, sfc.script.content, sfc.script.start, this.workspaceRoots, 'default', eventBusNames)
+      : emptyScriptIndex()
+    const mixed = this.mergeStaticMixins(uri, ownScriptIndex)
+    const scriptIndex = mixed.scriptIndex
+    const registeredTags = [
+      ...this.scriptComponentTagAliases(scriptIndex),
+      ...this.getGlobalComponents().flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)]),
+    ]
+    const templateIndex = sfc.template
+      ? parseTemplate(sfc.template.content, sfc.template.start, registeredTags, scriptIndex.staticComponentNames, eventBusNames, false)
+      : emptyTemplateIndex()
+    const mergedScriptIndex = mergeTemplateRelations(scriptIndex, templateIndex)
+    const searchableContent = maskStringsAndComments(sfc.content)
+
+    return this.createIndexedFile(uri, sfc, 2, mergedScriptIndex, templateIndex, [
+      ...findRefMethodCalls(searchableContent),
+      ...mixed.refMethodCalls,
+    ], searchableContent)
+  }
+
+  private scriptComponentTagAliases(scriptIndex: ScriptIndex): string[] {
+    return scriptIndex.components.flatMap((component) => [component.tag, component.localName, toKebabCase(component.tag), toKebabCase(component.localName)])
+  }
+
+  private createIndexedFile(uri: string, sfc: ParsedSfc, vueVersion: VueMajorVersion, scriptIndex: ScriptIndex, templateIndex: TemplateIndex, refMethodCalls: RefMethodAccess[], searchableContent = maskStringsAndComments(sfc.content)): VueFileIndex {
+    return {
+      uri,
+      fileName: sfc.fileName,
+      vueVersion,
+      content: sfc.content,
+      searchableContent,
+      lineStarts: sfc.lineStarts,
+      script: sfc.script,
+      scriptSetup: sfc.scriptSetup,
+      template: sfc.template,
+      scriptIndex,
+      templateIndex,
+      refMethodCalls,
+    }
   }
 
   private parseIndexableContent(uri: string, content: string): ParsedSfc {
@@ -420,6 +479,10 @@ export class WorkspaceIndex {
 
   remove(uri: string): void {
     const wasMixinSource = this.isMixinSourceFile(uri) || this.hasMixinCacheForFile(uri)
+    const refreshVue3SourceConsumers = this.shouldRefreshVue3SourceConsumers(uri, undefined, this.files.get(uri))
+    if (refreshVue3SourceConsumers) {
+      this.vue3Runtime.invalidate(uri)
+    }
     this.clearMixinCacheForFile(uri)
     const file = this.files.get(uri)
     const hadRelationships = (file?.templateIndex.components.length ?? 0) > 0
@@ -432,7 +495,10 @@ export class WorkspaceIndex {
       this.rebuildReverseIndexes()
     }
     if (wasMixinSource) {
-      this.rebuildIndexedFiles()
+      this.rebuildIndexedFilesByVersion(2)
+    }
+    if (refreshVue3SourceConsumers) {
+      this.rebuildVue3SourceConsumers(uri)
     }
   }
 
@@ -458,57 +524,28 @@ export class WorkspaceIndex {
       return
     }
 
-    if (vueVersion === 2) {
-      for (const file of scriptFiles) {
-        await this.indexGlobalComponentFile(file, false)
-        if (token?.isCancellationRequested) {
-          return
-        }
-      }
+    await this.runtimeFor(vueVersion).indexWorkspace(root, vueFiles, scriptFiles, token)
+  }
 
-      await this.expandRequireContextGlobals(vueFiles)
-      if (token?.isCancellationRequested) {
-        return
-      }
+  private runtimeFor(version: VueMajorVersion): VueRuntimeEngine {
+    return version === 2 ? this.vue2Runtime : this.vue3Runtime
+  }
 
-      await this.refreshEventBusRegistrations(root, token)
+  private async indexVue2Workspace(root: string, vueFiles: string[], scriptFiles: string[], token?: IndexCancellationToken): Promise<void> {
+    for (const file of scriptFiles) {
+      await this.indexGlobalComponentFile(file, false)
       if (token?.isCancellationRequested) {
         return
       }
     }
-    if (vueVersion === 3) {
-      const indexableScriptContents = new Map<string, string>()
-      for (const file of scriptFiles) {
-        if (token?.isCancellationRequested) {
-          return
-        }
-        const content = await readTextIfExists(file)
-        if (content !== undefined) {
-          this.indexScriptComponentUsageContent(file, content, false)
-          if (hasVue3StandaloneScriptRelations(content)) {
-            indexableScriptContents.set(file, content)
-          }
-        }
-      }
 
-      this.isBulkIndexing = true
-      try {
-        for (const file of vueFiles) {
-          await this.indexFile(file)
-          if (token?.isCancellationRequested) {
-            return
-          }
-        }
-        for (const [file, content] of indexableScriptContents) {
-          this.indexContent(file, content)
-          if (token?.isCancellationRequested) {
-            return
-          }
-        }
-      } finally {
-        this.isBulkIndexing = false
-        this.rebuildReverseIndexes()
-      }
+    await this.expandRequireContextGlobals(vueFiles)
+    if (token?.isCancellationRequested) {
+      return
+    }
+
+    await this.refreshEventBusRegistrations(root, token)
+    if (token?.isCancellationRequested) {
       return
     }
 
@@ -549,13 +586,12 @@ export class WorkspaceIndex {
     const vueVersion = this.vueVersionForUri(uri)
     const hasVue3ImportConsumers = vueVersion === 3 && this.vue3ScriptImportConsumers.has(uri)
     if (vueVersion === 3) {
-      this.composableReturnParseCache.delete(uri)
-      this.forwardedRefMethodNameCache.delete(uri)
+      this.vue3Runtime.invalidate(uri)
     }
     const content = await readTextIfExists(uri)
     if (content !== undefined) {
       this.indexScriptComponentUsageContent(uri, content, vueVersion === 3 ? !hasVue3ImportConsumers : true)
-      if (vueVersion === 3 && hasVue3StandaloneScriptRelations(content)) {
+      if (vueVersion === 3 && this.vue3Runtime.shouldIndexScriptContent(content)) {
         this.indexContent(uri, content)
       } else if (vueVersion === 3) {
         this.remove(uri)
@@ -565,7 +601,6 @@ export class WorkspaceIndex {
       this.remove(uri)
     }
     if (vueVersion === 3) {
-      this.rebuildVue3ScriptImportConsumers(uri)
       return
     }
     const wasMixinSource = this.isMixinSourceFile(uri) || this.hasMixinCacheForFile(uri)
@@ -589,17 +624,15 @@ export class WorkspaceIndex {
       || eventBusChanged
       || beforeGlobals !== this.globalComponentsSignature()
     ) {
-      this.rebuildIndexedFiles()
+      this.rebuildIndexedFilesByVersion(2)
     }
   }
 
   async removeGlobalComponentFile(uri: string): Promise<void> {
     this.removeScriptComponentUsageFile(uri)
     if (this.vueVersionForUri(uri) === 3) {
-      this.composableReturnParseCache.delete(uri)
-      this.forwardedRefMethodNameCache.delete(uri)
+      this.vue3Runtime.invalidate(uri)
       this.remove(uri)
-      this.rebuildVue3ScriptImportConsumers(uri)
       return
     }
     const wasMixinSource = this.isMixinSourceFile(uri) || this.hasMixinCacheForFile(uri)
@@ -617,7 +650,7 @@ export class WorkspaceIndex {
       || eventBusChanged
       || beforeGlobals !== this.globalComponentsSignature()
     ) {
-      this.rebuildIndexedFiles()
+      this.rebuildIndexedFilesByVersion(2)
     }
   }
 
@@ -628,7 +661,7 @@ export class WorkspaceIndex {
 
     await this.refreshImportedNameGlobalComponents()
     await this.refreshRequireContextGlobals(this.getIndexedUris())
-    this.rebuildIndexedFiles()
+    this.rebuildIndexedFilesByVersion(2)
   }
 
   async refreshGlobalComponentsForVueFile(uri: string): Promise<void> {
@@ -798,11 +831,20 @@ export class WorkspaceIndex {
   }
 
   hasVue3Source(uri: string): boolean {
-    return this.hasVue3PropSource(uri) || this.hasVue3StaticKeySource(uri) || this.hasVue3ComposableSource(uri)
+    return [...(this.sourceRelationFiles.get(uri) ?? [])]
+      .some((consumerUri) => this.files.get(consumerUri)?.vueVersion === 3)
+      || this.vue3ScriptImportConsumers.has(uri)
   }
 
   hasSourceRelations(uri: string): boolean {
     return this.hasMixinSource(uri) || this.sourceRelationFiles.has(uri)
+  }
+
+  private shouldRefreshVue3SourceConsumers(uri: string, vueVersion: VueMajorVersion | undefined, previous: VueFileIndex | undefined): boolean {
+    return vueVersion === 3
+      || previous?.vueVersion === 3
+      || this.hasVue3Source(uri)
+      || this.vue3ScriptImportConsumers.has(uri)
   }
 
   async refreshEventBusRegistrations(root?: string, token?: IndexCancellationToken): Promise<boolean> {
@@ -1251,6 +1293,61 @@ export class WorkspaceIndex {
     this.scriptImportKeysByFile = new WeakMap()
     this.injectUsageKeysByProvider = new WeakMap()
     this.parentLinksByFile = new WeakMap()
+  }
+
+  private replaceReverseIndexesWith(other: WorkspaceIndex): void {
+    replaceMap(this.propUsages, other.propUsages, cloneArray)
+    replaceMap(this.componentUsages, other.componentUsages, cloneArray)
+    replaceMap(this.eventUsages, other.eventUsages, cloneArray)
+    replaceMap(this.slotUsages, other.slotUsages, cloneArray)
+    replaceMap(this.eventBusEmits, other.eventBusEmits, cloneArray)
+    replaceMap(this.eventBusListeners, other.eventBusListeners, cloneArray)
+    replaceMap(this.eventBusEventNames, other.eventBusEventNames, cloneStringSet)
+    replaceMap(this.refMethodUsages, other.refMethodUsages, cloneArray)
+    replaceMap(this.refMethodForwards, other.refMethodForwards, cloneArray)
+    replaceMap(this.vue3PropInternalUsages, other.vue3PropInternalUsages, cloneArray)
+    replaceMap(this.provideDefinitions, other.provideDefinitions, cloneArray)
+    replaceMap(this.injectUsages, other.injectUsages, cloneArray)
+    replaceMap(this.sourceProps, other.sourceProps, cloneArray)
+    replaceMap(this.sourcePropTypes, other.sourcePropTypes, cloneArray)
+    replaceMap(this.sourceMethods, other.sourceMethods, cloneArray)
+    replaceMap(this.sourceEmits, other.sourceEmits, cloneArray)
+    replaceMap(this.sourceSlots, other.sourceSlots, cloneArray)
+    replaceMap(this.sourceEventBusCalls, other.sourceEventBusCalls, cloneArray)
+    replaceMap(this.sourceProvides, other.sourceProvides, cloneArray)
+    replaceMap(this.sourceInjects, other.sourceInjects, cloneArray)
+    replaceMap(this.sourceRefMethodCalls, other.sourceRefMethodCalls, cloneArray)
+    replaceMap(this.sourceComposableReturnUsages, other.sourceComposableReturnUsages, cloneArray)
+    replaceMap(this.sourceRelationFiles, other.sourceRelationFiles, cloneStringSet)
+    replaceMap(this.vue3ScriptImportConsumers, other.vue3ScriptImportConsumers, cloneStringSet)
+    replaceMap(this.parentComponents, other.parentComponents, cloneStringSet)
+
+    const trackedUsageMapRemap = new Map<TrackedUsageMap, TrackedUsageMap>([
+      [other.propUsages as TrackedUsageMap, this.propUsages as TrackedUsageMap],
+      [other.componentUsages as TrackedUsageMap, this.componentUsages as TrackedUsageMap],
+      [other.eventUsages as TrackedUsageMap, this.eventUsages as TrackedUsageMap],
+      [other.slotUsages as TrackedUsageMap, this.slotUsages as TrackedUsageMap],
+      [other.eventBusEmits as TrackedUsageMap, this.eventBusEmits as TrackedUsageMap],
+      [other.eventBusListeners as TrackedUsageMap, this.eventBusListeners as TrackedUsageMap],
+      [other.refMethodUsages as TrackedUsageMap, this.refMethodUsages as TrackedUsageMap],
+      [other.vue3PropInternalUsages as TrackedUsageMap, this.vue3PropInternalUsages as TrackedUsageMap],
+      [other.provideDefinitions as TrackedUsageMap, this.provideDefinitions as TrackedUsageMap],
+      [other.injectUsages as TrackedUsageMap, this.injectUsages as TrackedUsageMap],
+    ])
+    const trackedFiles = this.reverseIndexTrackingFiles()
+    this.usageKeysByFile = cloneUsageTracking(trackedFiles, other.usageKeysByFile, trackedUsageMapRemap)
+    this.refMethodForwardKeysByFile = cloneWeakSetTracking(trackedFiles, other.refMethodForwardKeysByFile)
+    this.sourceKeysByFile = cloneWeakSetTracking(trackedFiles, other.sourceKeysByFile)
+    this.scriptImportKeysByFile = cloneWeakSetTracking(trackedFiles, other.scriptImportKeysByFile)
+    this.injectUsageKeysByProvider = cloneWeakSetTracking(trackedFiles, other.injectUsageKeysByProvider)
+    this.parentLinksByFile = cloneWeakSetTracking(trackedFiles, other.parentLinksByFile)
+  }
+
+  private reverseIndexTrackingFiles(): VueFileIndex[] {
+    return [
+      ...this.files.values(),
+      ...[...this.scriptComponentUsageFiles.values()].map((usageFile) => usageFile.file),
+    ]
   }
 
   private indexScriptComponentUsageContent(uri: string, content: string, rebuild = true): void {
@@ -1841,6 +1938,55 @@ export class WorkspaceIndex {
     this.eventBusRegistrations.delete(fileUri)
   }
 
+  private clearWorkspaceRoot(root: string): void {
+    const inRoot = (uri: string): boolean => {
+      const owner = this.workspaceRootFor(uri)
+      return owner ? owner === root : uri === root || isInsideDirectory(uri, root)
+    }
+
+    for (const [uri, file] of [...this.files]) {
+      if (!inRoot(uri)) {
+        continue
+      }
+      this.removeReverseIndex(file)
+      this.files.delete(uri)
+      this.parentComponents.delete(uri)
+    }
+
+    for (const uri of [...this.scriptComponentUsageFiles.keys()]) {
+      if (inRoot(uri)) {
+        this.removeScriptComponentUsageFile(uri)
+      }
+    }
+
+    const globalStateFiles = new Set([
+      ...this.globalComponentRegistrations.keys(),
+      ...this.globalComponentContexts.keys(),
+      ...this.eventBusRegistrations.keys(),
+    ])
+    for (const uri of globalStateFiles) {
+      if (inRoot(uri)) {
+        this.removeGlobalRegistrationsFromFile(uri)
+      }
+    }
+
+    for (const uri of [...this.mixinSourceUris]) {
+      if (inRoot(uri)) {
+        this.mixinSourceUris.delete(uri)
+      }
+    }
+    for (const key of [...this.mixinIndexCache.keys()]) {
+      const sourceUri = key.split('\0')[0]
+      if (inRoot(sourceUri)) {
+        this.mixinIndexCache.delete(key)
+      }
+    }
+
+    this.externalRefComponents.clear()
+    this.externalRefComponentUris.clear()
+    this.vue3Runtime.clear()
+  }
+
   private removeGlobalComponentsFromContexts(): void {
     const contextFiles = new Set(this.globalComponentContexts.keys())
     for (const [name, components] of this.globalComponents) {
@@ -1886,9 +2032,18 @@ export class WorkspaceIndex {
     }
   }
 
-  private rebuildIndexedFiles(): void {
-    const indexedFiles = this.getAllFiles().map((file) => ({ uri: file.uri, content: file.content }))
-    this.files.clear()
+  private rebuildIndexedFilesByVersion(version: VueMajorVersion): void {
+    this.rebuildIndexedFiles((file) => file.vueVersion === version)
+  }
+
+  private rebuildIndexedFiles(filter: (file: VueFileIndex) => boolean = () => true): void {
+    const indexedFiles = this.getAllFiles()
+      .filter(filter)
+      .map((file) => ({ uri: file.uri, content: file.content }))
+    if (indexedFiles.length === 0) {
+      return
+    }
+
     this.clearReverseIndexes()
     this.isBulkIndexing = true
     try {
@@ -1901,7 +2056,7 @@ export class WorkspaceIndex {
     }
   }
 
-  private rebuildVue3ScriptImportConsumers(sourceUri: string): void {
+  private rebuildVue3SourceConsumers(sourceUri: string): void {
     const consumerUris = new Set([
       ...(this.sourceRelationFiles.get(sourceUri) ?? []),
       ...(this.vue3ScriptImportConsumers.get(sourceUri) ?? []),
@@ -2353,6 +2508,10 @@ function parseScriptComponentUsages(uri: string, content: string, workspaceRoots
     }
 
     const clause = content.slice(cursor, index + sourceMatch.index).trim()
+    if (isTypeOnlyImportClause(clause)) {
+      index = statementEnd - 1
+      continue
+    }
     const localName = parseDefaultImportName(clause)
     if (localName) {
       imports.push({
@@ -2360,7 +2519,7 @@ function parseScriptComponentUsages(uri: string, content: string, workspaceRoots
         childUri,
         importStart: index,
         importEnd: statementEnd,
-        fallbackSpan: { start: literal.start, end: literal.end },
+        importSourceSpan: { start: literal.start, end: literal.end },
         spans: [],
       })
     } else {
@@ -2372,7 +2531,7 @@ function parseScriptComponentUsages(uri: string, content: string, workspaceRoots
   collectImportedIdentifierUsages(content, imports)
   for (const item of imports) {
     if (item.spans.length === 0) {
-      usages.push({ childUri: item.childUri, span: item.fallbackSpan })
+      usages.push({ childUri: item.childUri, span: item.importSourceSpan })
       continue
     }
     usages.push(...item.spans.map((span) => ({ childUri: item.childUri, span })))
@@ -2387,6 +2546,21 @@ function resolveVueImport(fromUri: string, source: string, workspaceRoots: strin
     return undefined
   }
   return resolveImportPathWithExtensions(fromUri, cleanSource, workspaceRoots, ['.vue'])
+}
+
+function isTypeOnlyImportClause(clause: string): boolean {
+  const normalized = clause.trim()
+  if (/^type\b/.test(normalized)) {
+    return true
+  }
+
+  const named = /^\{\s*([\s\S]*?)\s*\}$/.exec(normalized)
+  if (!named) {
+    return false
+  }
+
+  const parts = named[1].split(',').map((part) => part.trim()).filter(Boolean)
+  return parts.length > 0 && parts.every((part) => /^type\b/.test(part))
 }
 
 function parseDefaultImportName(clause: string): string | undefined {
@@ -2586,337 +2760,9 @@ function findRefMethodCalls(searchableContent: string): RefMethodAccess[] {
   return results
 }
 
-function findVue3TemplateRefMethodCalls(content: string): RefMethodAccess[] {
-  const searchableContent = maskStringsAndComments(content)
-  const templateRefNames = collectUseTemplateRefNames(content)
-  const refAliases = collectVue3RefAliases(searchableContent)
-  const results: RefMethodAccess[] = []
-  const pattern = /\b([A-Za-z_$][\w$]*)\s*\.\s*value\s*!?\s*(?:\.|\?\.)\s*([A-Za-z_$][\w$]*)/g
-  let match: RegExpExecArray | null
-
-  while ((match = pattern.exec(searchableContent))) {
-    const [, localName, methodName] = match
-    const methodStart = match.index + match[0].lastIndexOf(methodName)
-    const methodSpan: TextSpan = { start: methodStart, end: methodStart + methodName.length }
-    results.push({
-      refName: templateRefNames.get(localName) ?? localName,
-      methodName,
-      methodSpan,
-    })
-  }
-
-  const assertionPattern = /\(\s*([A-Za-z_$][\w$]*)\s*\.\s*value\s*!?\s+as\s+[^)]*\)\s*(?:\.|\?\.)\s*([A-Za-z_$][\w$]*)/g
-  while ((match = assertionPattern.exec(searchableContent))) {
-    const [, localName, methodName] = match
-    const methodStart = match.index + match[0].lastIndexOf(methodName)
-    results.push({
-      refName: templateRefNames.get(localName) ?? localName,
-      methodName,
-      methodSpan: { start: methodStart, end: methodStart + methodName.length },
-    })
-  }
-
-  const aliasPattern = /\b(?:(this)\s*\.\s*)?([A-Za-z_$][\w$]*)\s*(?:\.|\?\.)\s*([A-Za-z_$][\w$]*)\s*(?=\()/g
-  while ((match = aliasPattern.exec(searchableContent))) {
-    const [, thisToken, localName, methodName] = match
-    const aliasKey = thisToken ? `this.${localName}` : localName
-    const refName = refAliases.get(aliasKey) ?? refAliases.get(localName)
-    if (!refName) {
-      continue
-    }
-    const methodStart = match.index + match[0].lastIndexOf(methodName)
-    results.push({
-      refName,
-      methodName,
-      methodSpan: { start: methodStart, end: methodStart + methodName.length },
-    })
-  }
-
-  return results
-}
-
 function hasVue3RefMethod(file: VueFileIndex | undefined, methodName: string): boolean {
   return Boolean(file?.scriptIndex.methods.some((method) => method.name === methodName)
     || file?.refMethodCalls.some((call) => call.forwarded && call.methodName === methodName))
-}
-
-interface DefineExposeForwardCall {
-  calleeName: string
-  refName: string
-  callSpan: TextSpan
-}
-
-function findVue3DefineExposeForwardedRefMethodCalls(uri: string, sfc: ParsedSfc, imports: ImportInfo[], workspaceRoots: string[], cache: ForwardedRefMethodNameCache): RefMethodAccess[] {
-  const segment = sfc.scriptSetup
-  if (!segment) {
-    return []
-  }
-
-  const results: RefMethodAccess[] = []
-  const calls = findDefineExposeForwardCalls(segment.content, segment.start)
-  const methodsByComposable = new Map<string, string[]>()
-
-  for (const call of calls) {
-    const imported = imports.find((item) => item.localName === call.calleeName && isComposableImport(item))
-    if (!imported) {
-      continue
-    }
-
-    const sourceUri = resolveComposableImport(uri, imported.source, workspaceRoots)
-    if (!sourceUri) {
-      continue
-    }
-
-    const cacheKey = `${sourceUri}\0${imported.importedName ?? imported.localName}`
-    let methodNames = methodsByComposable.get(cacheKey)
-    if (!methodNames) {
-      methodNames = readForwardedRefMethodNames(sourceUri, imported.importedName ?? imported.localName, cache)
-      methodsByComposable.set(cacheKey, methodNames)
-    }
-
-    for (const methodName of methodNames) {
-      results.push({
-        refName: call.refName,
-        methodName,
-        methodSpan: call.callSpan,
-        forwarded: true,
-      })
-    }
-  }
-
-  return results
-}
-
-function findDefineExposeForwardCalls(content: string, offset: number): DefineExposeForwardCall[] {
-  const searchableContent = maskStringsAndComments(content)
-  const results: DefineExposeForwardCall[] = []
-
-  for (let index = 0; index < searchableContent.length; index += 1) {
-    if (!isCodeTokenAt(searchableContent, 'defineExpose', index)) {
-      continue
-    }
-
-    let cursor = skipWhitespace(searchableContent, index + 'defineExpose'.length)
-    cursor = skipTypeArguments(searchableContent, cursor)
-    cursor = skipWhitespace(searchableContent, cursor)
-    if (searchableContent[cursor] !== '(') {
-      continue
-    }
-
-    cursor = skipWhitespace(searchableContent, cursor + 1)
-    const callee = readIdentifierAt(searchableContent, cursor)
-    if (!callee) {
-      continue
-    }
-
-    cursor = skipWhitespace(searchableContent, callee.end)
-    cursor = skipTypeArguments(searchableContent, cursor)
-    cursor = skipWhitespace(searchableContent, cursor)
-    if (searchableContent[cursor] !== '(') {
-      continue
-    }
-
-    const ref = readIdentifierAt(searchableContent, skipWhitespace(searchableContent, cursor + 1))
-    if (!ref) {
-      continue
-    }
-
-    results.push({
-      calleeName: callee.value,
-      refName: ref.value,
-      callSpan: { start: offset + callee.start, end: offset + callee.end },
-    })
-  }
-
-  return results
-}
-
-function readForwardedRefMethodNames(uri: string, exportName: string, cache: ForwardedRefMethodNameCache): string[] {
-  try {
-    const stats = fsSync.statSync(uri)
-    const cached = cache.get(uri)
-    if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
-      const cachedMethods = cached.methodsByExportName.get(exportName)
-      if (cachedMethods) {
-        return cachedMethods
-      }
-    }
-
-    const content = fsSync.readFileSync(uri, 'utf8')
-    const methodNames = readForwardedRefMethodNamesFromContent(content, exportName)
-    const methodsByExportName = cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size
-      ? cached.methodsByExportName
-      : new Map<string, string[]>()
-    methodsByExportName.set(exportName, methodNames)
-    cache.set(uri, {
-      mtimeMs: stats.mtimeMs,
-      size: stats.size,
-      methodsByExportName,
-    })
-    return methodNames
-  } catch {
-    return []
-  }
-}
-
-function readForwardedRefMethodNamesFromContent(content: string, exportName: string): string[] {
-  const range = findComposableFunctionRange(content, exportName)
-  if (!range) {
-    return []
-  }
-
-  const methods = new Set<string>()
-  const searchableContent = maskStringsAndComments(content)
-  const escapedParam = escapeRegExp(range.paramName)
-  const pattern = new RegExp(`\\b${escapedParam}\\s*\\.\\s*value\\s*!?\\s*(?:\\.|\\?\\.)\\s*([A-Za-z_$][\\w$]*)`, 'g')
-  pattern.lastIndex = range.bodyStart
-  let match: RegExpExecArray | null
-
-  while ((match = pattern.exec(searchableContent)) && match.index < range.bodyEnd) {
-    methods.add(match[1])
-  }
-
-  const assertionPattern = new RegExp(`\\(\\s*${escapedParam}\\s*\\.\\s*value\\s*!?\\s+as\\s+[^)]*\\)\\s*(?:\\.|\\?\\.)\\s*([A-Za-z_$][\\w$]*)`, 'g')
-  assertionPattern.lastIndex = range.bodyStart
-  while ((match = assertionPattern.exec(searchableContent)) && match.index < range.bodyEnd) {
-    methods.add(match[1])
-  }
-
-  return [...methods]
-}
-
-function findComposableFunctionRange(content: string, exportName: string): { paramName: string, bodyStart: number, bodyEnd: number } | undefined {
-  const searchableContent = maskStringsAndComments(content)
-  return findVariableComposableFunctionRange(searchableContent, exportName)
-    ?? findDeclaredComposableFunctionRange(searchableContent, exportName)
-}
-
-function findVariableComposableFunctionRange(content: string, exportName: string): { paramName: string, bodyStart: number, bodyEnd: number } | undefined {
-  const pattern = new RegExp(`\\b(?:export\\s+)?(?:const|let|var)\\s+${escapeRegExp(exportName)}\\s*=`, 'g')
-  let match: RegExpExecArray | null
-
-  while ((match = pattern.exec(content))) {
-    const valueStart = skipWhitespace(content, pattern.lastIndex)
-    const header = readArrowFunctionHeader(content, valueStart)
-    if (!header) {
-      continue
-    }
-
-    const arrow = findArrowAfterFunctionHeader(content, header.end)
-    if (arrow === -1) {
-      continue
-    }
-
-    const body = readArrowFunctionBodyRange(content, arrow + 2)
-    if (body) {
-      return { paramName: header.paramName, ...body }
-    }
-  }
-
-  return undefined
-}
-
-function findDeclaredComposableFunctionRange(content: string, exportName: string): { paramName: string, bodyStart: number, bodyEnd: number } | undefined {
-  const pattern = new RegExp(`\\b(?:export\\s+)?(?:async\\s+)?function\\s+${escapeRegExp(exportName)}\\s*`, 'g')
-  let match: RegExpExecArray | null
-
-  while ((match = pattern.exec(content))) {
-    let paramsStart = skipWhitespace(content, pattern.lastIndex)
-    paramsStart = skipTypeArguments(content, paramsStart)
-    paramsStart = skipWhitespace(content, paramsStart)
-    if (content[paramsStart] !== '(') {
-      continue
-    }
-
-    const param = readIdentifierAt(content, skipWhitespace(content, paramsStart + 1))
-    const paramsEnd = findMatchingBracket(content, paramsStart)
-    const bodyStart = skipWhitespace(content, paramsEnd + 1)
-    if (!param || content[bodyStart] !== '{') {
-      continue
-    }
-
-    return {
-      paramName: param.value,
-      bodyStart,
-      bodyEnd: findMatchingBracket(content, bodyStart),
-    }
-  }
-
-  return undefined
-}
-
-function readArrowFunctionHeader(content: string, start: number): { paramName: string, end: number } | undefined {
-  let cursor = skipWhitespace(content, start)
-  if (isCodeTokenAt(content, 'async', cursor)) {
-    cursor = skipWhitespace(content, cursor + 'async'.length)
-  }
-  cursor = skipTypeArguments(content, cursor)
-  cursor = skipWhitespace(content, cursor)
-
-  if (content[cursor] === '(') {
-    const param = readIdentifierAt(content, skipWhitespace(content, cursor + 1))
-    const paramsEnd = findMatchingBracket(content, cursor)
-    if (!param) {
-      return undefined
-    }
-    return { paramName: param.value, end: paramsEnd + 1 }
-  }
-
-  const param = readIdentifierAt(content, cursor)
-  if (!param) {
-    return undefined
-  }
-  return { paramName: param.value, end: param.end }
-}
-
-function findArrowAfterFunctionHeader(content: string, start: number): number {
-  let parenDepth = 0
-  let bracketDepth = 0
-  let braceDepth = 0
-  let angleDepth = 0
-
-  for (let index = skipWhitespace(content, start); index < content.length; index += 1) {
-    if (content.startsWith('=>', index) && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
-      return index
-    }
-
-    const char = content[index]
-    if (char === ';' && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
-      return -1
-    }
-    if (char === '(') {
-      parenDepth += 1
-    } else if (char === ')') {
-      parenDepth = Math.max(0, parenDepth - 1)
-    } else if (char === '[') {
-      bracketDepth += 1
-    } else if (char === ']') {
-      bracketDepth = Math.max(0, bracketDepth - 1)
-    } else if (char === '{') {
-      braceDepth += 1
-    } else if (char === '}') {
-      braceDepth = Math.max(0, braceDepth - 1)
-    } else if (char === '<') {
-      angleDepth += 1
-    } else if (char === '>') {
-      angleDepth = Math.max(0, angleDepth - 1)
-    }
-  }
-
-  return -1
-}
-
-function readArrowFunctionBodyRange(content: string, start: number): { bodyStart: number, bodyEnd: number } | undefined {
-  const bodyStart = skipWhitespace(content, start)
-  if (content[bodyStart] === '{') {
-    return { bodyStart, bodyEnd: findMatchingBracket(content, bodyStart) }
-  }
-
-  if (content[bodyStart] === '(') {
-    return { bodyStart, bodyEnd: findMatchingBracket(content, bodyStart) }
-  }
-
-  return { bodyStart, bodyEnd: findExpressionEnd(content, bodyStart) }
 }
 
 function findExpressionEnd(content: string, start: number): number {
@@ -2951,66 +2797,6 @@ function findExpressionEnd(content: string, start: number): number {
   return content.length
 }
 
-function collectUseTemplateRefNames(content: string): Map<string, string> {
-  const searchableContent = maskStringsAndComments(content)
-  const names = new Map<string, string>()
-
-  for (let index = 0; index < searchableContent.length; index += 1) {
-    const declaration = (['const', 'let', 'var'] as const).find((token) => isCodeTokenAt(searchableContent, token, index))
-    if (!declaration) {
-      continue
-    }
-
-    let cursor = skipWhitespace(searchableContent, index + declaration.length)
-    if (!isIdentifierStart(searchableContent[cursor])) {
-      continue
-    }
-    const nameEnd = readIdentifierEnd(searchableContent, cursor + 1)
-    const localName = searchableContent.slice(cursor, nameEnd)
-    const equals = findDeclaratorEquals(searchableContent, nameEnd)
-    if (equals === undefined) {
-      index = nameEnd - 1
-      continue
-    }
-
-    cursor = skipWhitespace(searchableContent, equals + 1)
-    if (!isCodeTokenAt(searchableContent, 'useTemplateRef', cursor)) {
-      index = cursor - 1
-      continue
-    }
-
-    cursor = skipWhitespace(searchableContent, cursor + 'useTemplateRef'.length)
-    cursor = skipTypeArguments(searchableContent, cursor)
-    cursor = skipWhitespace(searchableContent, cursor)
-    if (searchableContent[cursor] !== '(') {
-      index = cursor
-      continue
-    }
-
-    const literalStart = skipWhitespace(content, cursor + 1)
-    const literal = readStringLiteral(content, literalStart)
-    if (literal) {
-      names.set(localName, literal.value)
-    }
-    index = cursor
-  }
-
-  return names
-}
-
-function findDeclaratorEquals(content: string, start: number): number | undefined {
-  for (let index = start; index < content.length; index += 1) {
-    const char = content[index]
-    if (char === '=') {
-      return index
-    }
-    if (char === ';') {
-      return undefined
-    }
-  }
-  return undefined
-}
-
 function skipTypeArguments(content: string, index: number): number {
   if (content[index] !== '<') {
     return index
@@ -3030,131 +2816,6 @@ function skipTypeArguments(content: string, index: number): number {
     }
   }
   return index
-}
-
-function collectVue3RefAliases(searchableContent: string): Map<string, string> {
-  const aliases = new Map<string, string>()
-  const pattern = /\b(?:(this)\s*\.\s*)?([A-Za-z_$][\w$]*)\s*=\s*[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\.\s*\$refs\s*(?:\.|\?\.)\s*([A-Za-z_$][\w$]*)/g
-  let match: RegExpExecArray | null
-
-  while ((match = pattern.exec(searchableContent))) {
-    const [, thisToken, localName, refName] = match
-    aliases.set(thisToken ? `this.${localName}` : localName, refName)
-  }
-
-  return aliases
-}
-
-function parseScriptImportedVueComponents(uri: string, content: string, imports: ImportInfo[], workspaceRoots: string[]): ComponentRegistration[] {
-  return imports
-    .map((item): ComponentRegistration | undefined => {
-      const targetUri = resolveImportPathWithExtensions(uri, item.source, workspaceRoots, ['.vue'])
-      if (!targetUri || !targetUri.endsWith('.vue') || !fsSync.existsSync(targetUri)) {
-        return undefined
-      }
-      const start = content.indexOf(item.localName)
-      const nameSpan = start === -1
-        ? { start: 0, end: 0 }
-        : { start, end: start + item.localName.length }
-      return {
-        tag: item.localName,
-        localName: item.localName,
-        source: item.source,
-        targetUri,
-        nameSpan,
-      }
-    })
-    .filter((item): item is ComponentRegistration => Boolean(item))
-}
-
-function parseVue3ScriptRefComponentUsages(content: string): TemplateComponentUsage[] {
-  const usages: TemplateComponentUsage[] = []
-
-  for (let index = 0; index < content.length; index += 1) {
-    const skipped = skipStringCommentOrRegex(content, index)
-    if (skipped !== undefined) {
-      index = skipped - 1
-      continue
-    }
-    if (!isCodeTokenAt(content, 'h', index)) {
-      continue
-    }
-
-    const open = skipWhitespace(content, index + 1)
-    if (content[open] !== '(') {
-      continue
-    }
-    const componentStart = skipWhitespace(content, open + 1)
-    if (!isIdentifierStart(content[componentStart])) {
-      continue
-    }
-    const componentEnd = readIdentifierEnd(content, componentStart + 1)
-    const tag = content.slice(componentStart, componentEnd)
-    const comma = skipWhitespace(content, componentEnd)
-    if (content[comma] !== ',') {
-      continue
-    }
-    const objectStart = skipWhitespace(content, comma + 1)
-    if (content[objectStart] !== '{') {
-      continue
-    }
-    const objectEnd = findMatchingBracket(content, objectStart)
-    const ref = readObjectRefString(content, objectStart, objectEnd)
-    if (!ref) {
-      continue
-    }
-
-    usages.push({
-      tag,
-      span: { start: componentStart, end: componentEnd },
-      attrs: [{
-        kind: 'ref',
-        name: ref.name,
-        normalizedName: ref.name,
-        span: ref.span,
-        fullSpan: ref.fullSpan,
-      }],
-      binds: [],
-      slots: [],
-    })
-    index = objectEnd
-  }
-
-  return usages
-}
-
-function readObjectRefString(content: string, objectStart: number, objectEnd: number): { name: string, span: TextSpan, fullSpan: TextSpan } | undefined {
-  let index = objectStart + 1
-  while (index < objectEnd) {
-    const skipped = skipStringCommentOrRegex(content, index)
-    if (skipped !== undefined) {
-      index = skipped
-      continue
-    }
-    if (!isCodeTokenAt(content, 'ref', index)) {
-      index += 1
-      continue
-    }
-
-    const afterName = skipWhitespace(content, index + 'ref'.length)
-    if (content[afterName] !== ':') {
-      index = afterName
-      continue
-    }
-    const valueStart = skipWhitespace(content, afterName + 1)
-    const literal = readStringLiteral(content, valueStart)
-    if (!literal) {
-      index = valueStart + 1
-      continue
-    }
-    return {
-      name: literal.value,
-      span: { start: literal.start, end: literal.end },
-      fullSpan: { start: index, end: index + 'ref'.length },
-    }
-  }
-
-  return undefined
 }
 
 function findMatchingBracket(content: string, openIndex: number): number {

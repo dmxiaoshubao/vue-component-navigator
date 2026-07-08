@@ -13,6 +13,10 @@ export interface TextSpan {
   end: number
 }
 
+export interface IndexCancellationToken {
+  readonly isCancellationRequested: boolean
+}
+
 export interface SourceLocation {
   uri: string
   lineStarts: number[]
@@ -41,6 +45,8 @@ export interface ImportInfo {
   localName: string
   source: string
   importedName?: string
+  isTypeOnly?: boolean
+  nameSpan?: TextSpan
 }
 
 export interface MixinReference {

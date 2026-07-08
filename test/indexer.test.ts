@@ -4,6 +4,7 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { WorkspaceIndex, findRefMethodAccess } from '../src/indexer/workspaceIndex'
 import { clearTsConfigCache, findEmit, findMethod, findProp, findRefComponent, findRefMethodUsages, findRegisteredComponent, findTemplateEventUsages, findTemplatePropUsages, resolveProjectPathWithExtensions } from '../src/indexer/relationResolver'
+import { parseSfc } from '../src/indexer/sfcParser'
 
 const fixtureRoot = path.resolve(__dirname, './fixtures/vue2-basic')
 const demoFixtureRoot = path.resolve(__dirname, '../test-fixtures/vue2-demo')
@@ -104,6 +105,39 @@ async function buildDemoIndex(): Promise<WorkspaceIndex> {
 }
 
 describe('Vue2 indexer', () => {
+  it('使用 compiler-sfc 解析 SFC block 并保留源码 offset', () => {
+    const content = `
+<!-- <script>ignored()</script> -->
+<template lang="pug">
+  Child(:title="title")
+</template>
+<script lang="ts">
+export default { name: 'OffsetProbe' }
+</script>
+`
+    const parsed = parseSfc('/tmp/OffsetProbe.vue', content)
+
+    expect(parsed.template?.content).toContain('Child(:title="title")')
+    expect(parsed.script?.content).toContain('OffsetProbe')
+    expect(parsed.scriptSetup).toBeUndefined()
+    expect(content.slice(parsed.template!.start, parsed.template!.end)).toBe(parsed.template!.content)
+    expect(content.slice(parsed.script!.start, parsed.script!.end)).toBe(parsed.script!.content)
+  })
+
+  it('SFC 外部 script src 不会被当作内联脚本索引', () => {
+    const content = `
+<template><div /></template>
+<script src="./logic.ts"></script>
+`
+    const parsed = parseSfc('/tmp/ExternalScript.vue', content)
+    const file = new WorkspaceIndex().indexContent('/tmp/ExternalScript.vue', content)
+
+    expect(parsed.script?.content).toBe('')
+    expect(parsed.script?.start).toBe(parsed.script?.end)
+    expect(file.scriptIndex.props).toEqual([])
+    expect(file.scriptIndex.methods).toEqual([])
+  })
+
   it('demo fixture 覆盖录屏用的核心导航关系', async () => {
     const index = await buildDemoIndex()
     const workspace = index.getFile(path.join(demoFixtureRoot, 'src/DemoWorkspace.vue'))!
@@ -1633,7 +1667,10 @@ childRef.value?.close()
     const child = index.getFile(childUri)!
     const parent = index.getFile(parentUri)!
 
+    expect(child.scriptIndex.props.map((prop) => prop.name).sort()).toEqual(['modelValue', 'visible'])
     expect(child.scriptIndex.emits.map((emit) => emit.eventName).sort()).toEqual(['update:modelValue', 'update:visible'])
+    expect(index.findTemplatePropUsages(childUri, 'visible')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(childUri, 'modelValue')).toHaveLength(1)
     expect(index.findTemplateEventUsages(childUri, 'update:visible')).toHaveLength(1)
     expect(index.findTemplateEventUsages(childUri, 'update:modelValue')).toHaveLength(1)
     expect(child.scriptIndex.slots.map((slot) => slot.name)).toEqual(['footer', 'default'])
@@ -1644,6 +1681,47 @@ childRef.value?.close()
     expect(parent.templateIndex.components.find((component) => component.tag === 'component')?.dynamicTags?.sort()).toEqual(['OrderPanel', 'UserPanel'])
     expect(index.findComponentUsages(userUri)).toHaveLength(2)
     expect(index.findComponentUsages(orderUri)).toHaveLength(1)
+  })
+
+  it('Vue3 withDefaults 在外部 utility type 解析不到时仍用默认值键建立 prop 关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-with-defaults-external-type-'))
+    const childUri = path.join(root, 'src/NumberStepper.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<template>
+  <van-stepper v-bind="props" />
+</template>
+<script setup lang="ts">
+import type { StepperProps } from 'vant'
+
+type NumberStepperProps = Partial<StepperProps>
+
+const props = withDefaults(defineProps<NumberStepperProps>(), {
+  autoFixed: true,
+  defaultValue: 1,
+  disableInput: true,
+  step: 1,
+})
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <NumberStepper :step="2" disable-input />
+</template>
+<script setup lang="ts">
+import NumberStepper from './NumberStepper.vue'
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const child = index.getFile(childUri)!
+
+    expect(child.scriptIndex.props.map((prop) => prop.name).sort()).toEqual(['autoFixed', 'defaultValue', 'disableInput', 'step'])
+    expect(index.findTemplatePropUsages(childUri, 'step').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplatePropUsages(childUri, 'disableInput').map((usage) => usage.file.uri)).toEqual([parentUri])
   })
 
   it('支持 Vue3 defineExpose 内联函数和 ref 转发反向索引', async () => {
@@ -1743,6 +1821,7 @@ checkoutOrderRef.value?.getReceiptChecked()
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-expose-composable-forward-'))
     const commonListUri = path.join(root, 'src/components/common-list/index.vue')
     const forwardUri = path.join(root, 'src/components/common-list/hooks/use-forward-list-ref.ts')
+    const listTypeUri = path.join(root, 'src/components/common-list/type.ts')
     const productListUri = path.join(root, 'src/ProductList.vue')
     const secondProductListUri = path.join(root, 'src/SecondProductList.vue')
     const pageUri = path.join(root, 'src/Page.vue')
@@ -1767,13 +1846,15 @@ defineExpose<ListRef<T>>({
 })
 </script>
 `)
-    writeText(forwardUri, `
-import type { Ref } from 'vue'
-
-type ListRef<T extends Record<string, any>> = {
+    writeText(listTypeUri, `
+export type ListRef<T extends Record<string, any>> = {
   onRefresh: (params?: T, refreshing?: boolean) => void
   onLoad: (params?: T) => void
 }
+`)
+    writeText(forwardUri, `
+import type { Ref } from 'vue'
+import type { ListRef } from '../type'
 
 export const useForwardListRef = <T extends Record<string, any>>(
   targetRef: Ref<ListRef<T> | undefined>,
@@ -2003,6 +2084,43 @@ defineExpose({
 
     expect(index.getFile(commandUri)).toBeUndefined()
     expect(index.findRefMethodUsages(dialogUri, 'open')).toEqual([])
+  })
+
+  it('Vue3 type-only 的 .vue import 不会产生组件注册或组件用法', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-type-only-vue-import-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const consumerUri = path.join(root, 'src/consumer.ts')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<template><div /></template>
+<script setup lang="ts">
+defineProps<{ title?: string }>()
+</script>
+`)
+    writeText(parentUri, `
+<template>
+  <Child title="ignored" />
+</template>
+<script setup lang="ts">
+import type Child from './Child.vue'
+</script>
+`)
+    writeText(consumerUri, `
+import type Child from './Child.vue'
+
+export type ChildInstance = InstanceType<typeof Child>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const parent = index.getFile(parentUri)!
+
+    expect(parent.scriptIndex.components).toEqual([])
+    expect(index.getFile(consumerUri)).toBeTruthy()
+    expect(index.findComponentUsages(childUri)).toEqual([])
+    expect(index.findTemplatePropUsages(childUri, 'title')).toEqual([])
   })
 
   it('Vue3 新增普通脚本消费文件会参与 hook 返回成员反向引用', async () => {
@@ -2586,6 +2704,159 @@ export const serviceKey = {}
     expect(index.hasVue3Source(keyUri)).toBe(false)
   })
 
+  it('Vue3 .vue key 源文件更新时会重建依赖文件', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-vue-key-source-rebuild-'))
+    const keyUri = path.join(root, 'src/KeySource.vue')
+    const providerUri = path.join(root, 'src/Provider.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    const keyContent = `
+<script setup lang="ts">
+export const serviceKey = Symbol('service')
+</script>
+`
+    const nextKeyContent = `
+<script setup lang="ts">
+export const serviceKey = {}
+</script>
+`
+    writeText(keyUri, keyContent)
+    writeText(providerUri, `
+<template><Consumer /></template>
+<script setup lang="ts">
+import Consumer from './Consumer.vue'
+import { serviceKey } from './KeySource.vue'
+
+provide(serviceKey, { ready: true })
+</script>
+`)
+    writeText(consumerUri, `
+<template><div /></template>
+<script setup lang="ts">
+import { serviceKey } from './KeySource.vue'
+
+const service = inject(serviceKey)
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const beforeProvider = index.getFile(providerUri)!
+    const beforeConsumer = index.getFile(consumerUri)!
+    const symbolKey = beforeProvider.scriptIndex.provides[0].key
+
+    expect(index.findInjectUsages(providerUri, symbolKey).map((usage) => usage.file.uri)).toEqual([consumerUri])
+
+    writeText(keyUri, nextKeyContent)
+    index.syncContent(keyUri, nextKeyContent)
+
+    expect(index.getFile(providerUri)).not.toBe(beforeProvider)
+    expect(index.getFile(consumerUri)).not.toBe(beforeConsumer)
+    expect(index.getFile(providerUri)?.scriptIndex.provides).toEqual([])
+    expect(index.getFile(consumerUri)?.scriptIndex.injects).toEqual([])
+    expect(index.findInjectUsages(providerUri, symbolKey)).toEqual([])
+    expect(index.hasVue3Source(keyUri)).toBe(false)
+  })
+
+  it('Vue3 .vue 类型源文件更新时会重建依赖组件 props', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-vue-type-source-rebuild-'))
+    const typeUri = path.join(root, 'src/Types.vue')
+    const childUri = path.join(root, 'src/Child.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    const typeContent = `
+<script setup lang="ts">
+export interface ChildProps {
+  title: string
+}
+</script>
+`
+    const nextTypeContent = `
+<script setup lang="ts">
+export interface ChildProps {
+  label: string
+}
+</script>
+`
+    writeText(typeUri, typeContent)
+    writeText(childUri, `
+<script setup lang="ts">
+import type { ChildProps } from './Types.vue'
+
+defineProps<ChildProps>()
+</script>
+`)
+    writeText(parentUri, `
+<template><Child title="old" /></template>
+<script setup lang="ts">
+import Child from './Child.vue'
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const beforeChild = index.getFile(childUri)!
+
+    expect(beforeChild.scriptIndex.props.map((prop) => prop.name)).toEqual(['title'])
+    expect(index.findTemplatePropUsages(childUri, 'title').map((usage) => usage.file.uri)).toEqual([parentUri])
+
+    writeText(typeUri, nextTypeContent)
+    index.syncContent(typeUri, nextTypeContent)
+
+    const afterChild = index.getFile(childUri)!
+    expect(afterChild).not.toBe(beforeChild)
+    expect(afterChild.scriptIndex.props.map((prop) => prop.name)).toEqual(['label'])
+    expect(index.findPropDefinitions(childUri, 'title')).toEqual([])
+    expect(index.findPropDefinitions(childUri, 'label').map(({ file }) => file.uri)).toEqual([childUri])
+  })
+
+  it('Vue3 .vue 源文件删除时会清理依赖文件的旧关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-vue-source-delete-'))
+    const keyUri = path.join(root, 'src/KeySource.vue')
+    const providerUri = path.join(root, 'src/Provider.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(keyUri, `
+<script setup lang="ts">
+export const serviceKey = Symbol('service')
+</script>
+`)
+    writeText(providerUri, `
+<template><Consumer /></template>
+<script setup lang="ts">
+import Consumer from './Consumer.vue'
+import { serviceKey } from './KeySource.vue'
+
+provide(serviceKey, { ready: true })
+</script>
+`)
+    writeText(consumerUri, `
+<template><div /></template>
+<script setup lang="ts">
+import { serviceKey } from './KeySource.vue'
+
+const service = inject(serviceKey)
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const symbolKey = index.getFile(providerUri)!.scriptIndex.provides[0].key
+
+    expect(index.findInjectUsages(providerUri, symbolKey).map((usage) => usage.file.uri)).toEqual([consumerUri])
+
+    fs.unlinkSync(keyUri)
+    index.remove(keyUri)
+
+    expect(index.getFile(keyUri)).toBeUndefined()
+    expect(index.getFile(providerUri)?.scriptIndex.provides).toEqual([])
+    expect(index.getFile(consumerUri)?.scriptIndex.injects).toEqual([])
+    expect(index.findInjectUsages(providerUri, symbolKey)).toEqual([])
+  })
+
   it('Vue2 全局组件与 require.context 结果不变时不会重建已索引 Vue 文件', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-stable-global-refresh-'))
     const registerUri = path.join(root, 'src/register.js')
@@ -2728,10 +2999,48 @@ export default {
     const index = new WorkspaceIndex()
     await index.indexWorkspace(vue3Root, undefined, undefined, 3)
     await index.indexWorkspace(vue2Root, undefined, undefined, 2)
+    const vue3File = index.getFile(path.join(vue3Root, 'src/App.vue'))!
 
     expect(index.getEventBusNames()).toEqual(['$bus'])
+    writeText(path.join(vue2Root, 'src/main.js'), 'Vue.prototype.$nextBus = new Vue()\n')
+    await index.syncGlobalComponentFile(path.join(vue2Root, 'src/main.js'))
+    expect(index.getEventBusNames()).toEqual(['$nextBus'])
+    expect(index.getFile(path.join(vue3Root, 'src/App.vue'))).toBe(vue3File)
+
     await index.refreshEventBusRegistrations()
+    expect(index.getEventBusNames()).toEqual(['$nextBus'])
+  })
+
+  it('同一 workspace 从 Vue2 切到 Vue3 时会清理 Vue2 专属状态', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-version-switch-v2-v3-'))
+    const mainUri = path.join(root, 'src/main.js')
+    const appUri = path.join(root, 'src/App.vue')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^2.7.16' } }))
+    writeText(mainUri, 'Vue.prototype.$bus = new Vue()\n')
+    writeText(appUri, `
+<template><div /></template>
+<script>
+export default {
+  mounted() {
+    this.$bus.$emit('ready')
+  },
+}
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 2)
     expect(index.getEventBusNames()).toEqual(['$bus'])
+    expect(index.findEventBusEmits('$bus', 'ready')).toHaveLength(1)
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(appUri, '<template><div /></template><script setup lang="ts"></script>')
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.getEventBusNames()).toEqual([])
+    expect(index.findEventBusEmits('$bus', 'ready')).toEqual([])
+    expect(index.getFile(appUri)?.vueVersion).toBe(3)
   })
 })
 
@@ -3070,6 +3379,115 @@ export default { components: { IndexedChild } }
     index.remove(parentUri)
     expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(0)
     expect(index.findComponentUsages(childUri)).toHaveLength(0)
+  })
+
+  it('replaceWith 后普通 SFC 增量更新仍会清理当前反向索引', () => {
+    const active = new WorkspaceIndex()
+    const next = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-replace-sfc-cleanup-'))
+    const childUri = path.join(root, 'src/MigratedChild.vue')
+    const parentUri = path.join(root, 'src/MigratedParent.vue')
+
+    next.indexContent(childUri, `
+<template><div /></template>
+<script>
+export default {
+  props: { title: String },
+  methods: { open() {} },
+}
+</script>
+`)
+    next.indexContent(parentUri, `
+<template>
+  <MigratedChild ref="child" :title="title" @save="onSave" />
+</template>
+<script>
+import MigratedChild from './MigratedChild.vue'
+export default {
+  components: { MigratedChild },
+  methods: {
+    callChild() {
+      this.$refs.child.open()
+    },
+  },
+}
+</script>
+`)
+
+    active.replaceWith(next)
+
+    expect(active.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(active.findTemplateEventUsages(childUri, 'save')).toHaveLength(1)
+    expect(active.findRefMethodUsages(childUri, 'open')).toHaveLength(1)
+    expect(active.findComponentUsages(childUri)).toHaveLength(1)
+
+    active.syncContent(parentUri, `
+<template>
+  <MigratedChild ref="child" />
+</template>
+<script>
+import MigratedChild from './MigratedChild.vue'
+export default { components: { MigratedChild } }
+</script>
+`)
+
+    expect(active.findTemplatePropUsages(childUri, 'title')).toHaveLength(0)
+    expect(active.findTemplateEventUsages(childUri, 'save')).toHaveLength(0)
+    expect(active.findRefMethodUsages(childUri, 'open')).toHaveLength(0)
+    expect(active.findComponentUsages(childUri)).toHaveLength(1)
+
+    active.remove(parentUri)
+
+    expect(active.findComponentUsages(childUri)).toHaveLength(0)
+  })
+
+  it('replaceWith 传入自身时保持索引不变', () => {
+    const index = new WorkspaceIndex()
+    const childUri = path.join(fixtureRoot, 'SelfReplaceChild.vue')
+
+    index.indexContent(childUri, `
+<template><div /></template>
+<script>
+export default { props: { title: String } }
+</script>
+`)
+    index.replaceWith(index)
+
+    expect(index.getFile(childUri)?.scriptIndex.props.map((prop) => prop.name)).toEqual(['title'])
+  })
+
+  it('replaceWith 后普通脚本组件用法保存时会清理反向索引', async () => {
+    const active = new WorkspaceIndex()
+    const next = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-replace-script-cleanup-'))
+    const childUri = path.join(root, 'src/ScriptChild.vue')
+    const commandUri = path.join(root, 'src/command.ts')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, `
+<template><div /></template>
+<script setup lang="ts">
+defineOptions({ name: 'script-child' })
+</script>
+`)
+    writeText(commandUri, `
+import { h } from 'vue'
+import ScriptChild from './ScriptChild.vue'
+
+export function renderChild() {
+  return h(ScriptChild)
+}
+`)
+
+    await next.indexWorkspace(root, undefined, undefined, 3)
+    active.replaceWith(next)
+
+    expect(active.findComponentUsages(childUri).map((usage) => usage.file.uri)).toEqual([commandUri])
+
+    writeText(commandUri, 'export const stable = true\n')
+    await active.syncGlobalComponentFile(commandUri)
+
+    expect(active.findComponentUsages(childUri)).toHaveLength(0)
   })
 
   it('脚本中的动态 vue import 会参与组件用法关系', async () => {

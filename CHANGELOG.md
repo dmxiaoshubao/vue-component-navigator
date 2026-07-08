@@ -1,5 +1,53 @@
 # Changelog
 
+## 2.0.0 - 2026-07-08
+
+### English
+
+#### Changed
+
+- Rebuilt the indexer around isolated Vue 2 and Vue 3 runtimes. A workspace now runs only the runtime that matches its detected Vue major version.
+- Replaced the legacy Vue 3 script-parser path with `@vue/language-core` based SFC and macro-aware indexing.
+- Moved Vue SFC block parsing to `@vue/compiler-sfc`.
+- Kept Vue 2 and Vue 3 cache state, reverse indexes, source relations, and incremental rebuild rules separated.
+
+#### Improved
+
+- Expanded Vue 3 type-aware contract indexing for `defineProps`, `defineEmits`, `defineModel`, `defineSlots`, `defineExpose`, typed refs, composable return members, and static provide/inject keys.
+- Added Vue 3 `.vue` source-file invalidation for imported type sources, static key sources, and deleted source files.
+- Added Vue 3 `defineModel()` prop-side indexing so `v-model` participates in both prop and `update:*` event relationships.
+- Improved Vue 3 composable forwarded-ref handling when a composable has an external return type but returns a statically readable object.
+- Updated README documentation for the 2.0 runtime split, Vue 3 language-core indexing, and current static-analysis boundaries.
+
+#### Fixed
+
+- Fixed stale Vue 3 relationships after `.vue` type/key source updates or deletions.
+- Fixed missed forwarded ref methods for patterns such as `defineExpose(useForwardListRef(listRef))` when the helper return type is imported from another file.
+- Fixed missing prop reverse references for default `defineModel()` / `v-model` usage.
+
+### 中文
+
+#### 变更
+
+- 围绕隔离的 Vue 2 / Vue 3 运行时重建索引器。一个 workspace 现在只运行匹配其 Vue 主版本的一套运行时。
+- 将旧的 Vue 3 script parser 路径替换为基于 `@vue/language-core` 的 SFC 与宏感知索引。
+- Vue SFC block 解析改为使用 `@vue/compiler-sfc`。
+- Vue 2 和 Vue 3 的缓存状态、反向索引、source relations 和增量重建规则保持隔离。
+
+#### 改进
+
+- 扩展 Vue 3 类型感知组件契约索引，覆盖 `defineProps`、`defineEmits`、`defineModel`、`defineSlots`、`defineExpose`、typed refs、composable 返回成员和静态 provide/inject key。
+- 新增 Vue 3 `.vue` 源文件失效处理，覆盖导入类型源、静态 key 源和源文件删除场景。
+- 新增 Vue 3 `defineModel()` 的 prop 侧索引，让 `v-model` 同时参与 prop 和 `update:*` event 关系。
+- 改进 Vue 3 composable 转发 ref 的处理：当 helper 使用外部返回类型但返回静态可读对象时，也能识别转发方法。
+- 更新 README 文档，说明 2.0 运行时隔离、Vue 3 language-core 索引和当前静态分析边界。
+
+#### 修复
+
+- 修复 `.vue` 类型/key 源文件更新或删除后 Vue 3 关系残留的问题。
+- 修复 `defineExpose(useForwardListRef(listRef))` 这类 helper 返回类型来自外部文件时，转发 ref 方法漏命中的问题。
+- 修复默认 `defineModel()` / `v-model` 缺失 prop 反向引用的问题。
+
 ## 1.3.0 - 2026-06-30
 
 ### English

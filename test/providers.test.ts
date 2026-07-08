@@ -17,6 +17,10 @@ class TestDocument {
   getText(): string {
     return this.content
   }
+
+  lineAt(line: number): { text: string } {
+    return { text: this.content.split(/\r?\n/)[line] ?? '' }
+  }
 }
 
 function readFixture(name: string): string {
@@ -167,6 +171,49 @@ describe('Vue providers', () => {
     expect(hoverText(hover)).not.toContain('Definition: [Child.vue:')
     expect(hoverText(hover)).toContain('file://')
     expect(hover.contents.isTrusted).toBe(false)
+  })
+
+  it('普通 JS/TS 没有补全语境时不读取全文', () => {
+    const localIndex = new WorkspaceIndex()
+    const completionProvider = new VueCompletionProvider(localIndex)
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-completion-fast-path-'))
+    const uri = path.join(root, 'src/util.ts')
+    const content = 'const value = 1\n'
+    const document = new TestDocument(uri, content, 'typescript') as any
+    const getText = vi.spyOn(document, 'getText')
+
+    localIndex.setWorkspaceVueVersion(root, 2)
+
+    expect(completionProvider.provideCompletionItems(document, positionAt(content, content.length))).toBeUndefined()
+    expect(getText).not.toHaveBeenCalled()
+  })
+
+  it('普通 JS/TS 换行 EventBus 字符串仍提供事件名补全', async () => {
+    const localIndex = new WorkspaceIndex()
+    const completionProvider = new VueCompletionProvider(localIndex)
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-eventbus-multiline-js-'))
+
+    writeText(path.join(root, 'src/main.js'), 'Vue.prototype.$eventBus = new Vue()\n')
+    await localIndex.refreshEventBusRegistrations(root)
+    localIndex.indexContent(path.join(root, 'src/EventSource.vue'), `
+<script>
+export default {
+  mounted() {
+    this.$eventBus.$emit('ready')
+  },
+}
+</script>
+`)
+
+    const content = `
+this.$eventBus.$emit(
+  ''
+)
+`
+    const document = new TestDocument(path.join(root, 'src/plain.ts'), content, 'typescript') as any
+    const completions = completionProvider.provideCompletionItems(document, positionAt(content, content.indexOf("''") + 1)) as any[]
+
+    expect(completions.map((item) => item.label)).toContain('ready')
   })
 
   it('$refs 根对象补全模板 ref 名称', () => {

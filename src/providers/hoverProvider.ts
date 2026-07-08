@@ -335,10 +335,6 @@ function isVueDocument(document: vscode.TextDocument): boolean {
   return document.languageId === 'vue' || document.uri.fsPath.endsWith('.vue')
 }
 
-function offsetInDocument(document: vscode.TextDocument, position: vscode.Position): number | undefined {
-  return positionToOffset(createLineStarts(document.getText()), { line: position.line, character: position.character })
-}
-
 function propDefinitionHover(index: WorkspaceIndex, child: VueFileIndex, prop: PropInfo, baseDirectory: string): vscode.Hover {
   const usages = findIndexedPropUsages(index, child.uri, prop.name)
   const summary = usageSummary(usages, baseDirectory, {
@@ -380,12 +376,18 @@ export class VueHoverProvider implements vscode.HoverProvider {
   constructor(private readonly index: WorkspaceIndex) {}
 
   provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.Hover> {
-    const file = isVueDocument(document)
-      ? this.index.syncContent(document.uri.fsPath, document.getText())
+    const vueDocument = isVueDocument(document)
+    if (!vueDocument && !this.index.hasIndexedDocumentContext(document.uri.fsPath)) {
+      return undefined
+    }
+
+    const content = document.getText()
+    const file = vueDocument
+      ? this.index.syncContent(document.uri.fsPath, content)
       : this.index.getFile(document.uri.fsPath)
-    const offset = isVueDocument(document)
+    const offset = vueDocument
       ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
-      : offsetInDocument(document, position)
+      : positionToOffset(createLineStarts(content), { line: position.line, character: position.character })
     if (offset === undefined) {
       return undefined
     }

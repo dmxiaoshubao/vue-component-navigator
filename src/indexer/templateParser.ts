@@ -73,6 +73,26 @@ function normalizeAttr(attrName: string, vue3ModelEvents: boolean): TemplateAttr
   return { kind: 'prop', name: attrName, normalizedName: toCamelCase(attrName), span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } }
 }
 
+function normalizeAttrs(attrName: string, vue3ModelEvents: boolean): TemplateAttrUsage[] {
+  if (vue3ModelEvents && attrName === 'v-model') {
+    return [
+      { kind: 'prop', name: 'v-model', normalizedName: 'modelValue', span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } },
+      { kind: 'event', name: 'v-model', normalizedName: 'update:modelValue', span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } },
+    ]
+  }
+
+  if (vue3ModelEvents && attrName.startsWith('v-model:')) {
+    const name = stripModifier(attrName.slice('v-model:'.length))
+    return [
+      { kind: 'prop', name, normalizedName: toCamelCase(name), span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } },
+      { kind: 'event', name, normalizedName: `update:${name}`, span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } },
+    ]
+  }
+
+  const normalized = normalizeAttr(attrName, vue3ModelEvents)
+  return normalized ? [normalized] : []
+}
+
 function extractRef(openTag: string, openStart: number): TemplateAttrUsage[] {
   const refs: TemplateAttrUsage[] = []
   const pattern = /\sref\s*=\s*["']([^"']+)["']/g
@@ -101,8 +121,8 @@ function extractAttrs(openTag: string, openStart: number, vue3ModelEvents: boole
     if (rawName === 'ref') {
       continue
     }
-    const normalized = normalizeAttr(rawName, vue3ModelEvents)
-    if (!normalized) {
+    const normalizedAttrs = normalizeAttrs(rawName, vue3ModelEvents)
+    if (normalizedAttrs.length === 0) {
       continue
     }
 
@@ -119,11 +139,13 @@ function extractAttrs(openTag: string, openStart: number, vue3ModelEvents: boole
               ? fullStart + 'v-model:'.length
               : fullStart
 
-    attrs.push({
-      ...normalized,
-      span: { start: semanticNameStart, end: semanticNameStart + normalized.name.length },
-      fullSpan: { start: fullStart, end: fullStart + rawName.length },
-    })
+    for (const normalized of normalizedAttrs) {
+      attrs.push({
+        ...normalized,
+        span: { start: semanticNameStart, end: semanticNameStart + normalized.name.length },
+        fullSpan: { start: fullStart, end: fullStart + rawName.length },
+      })
+    }
   }
 
   return attrs
