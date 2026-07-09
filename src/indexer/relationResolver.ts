@@ -292,9 +292,9 @@ export function findRefComponent(parent: VueFileIndex, refName: string): string 
     return undefined
   }
   if (usage.dynamicTags?.length) {
-    return usage.dynamicTags.map((tag) => resolveTemplateComponentUriInFile(parent, tag, true)).find(Boolean)
+    return usage.dynamicTags.map((tag) => resolveTemplateComponentUriInFile(parent, tag)).find(Boolean)
   }
-  return resolveTemplateComponentUriInFile(parent, usage.tag, false)
+  return resolveTemplateComponentUriInFile(parent, usage.tag)
 }
 
 export function findResolvedRefComponent(index: WorkspaceIndex, parent: VueFileIndex, refName: string): string | undefined {
@@ -368,22 +368,13 @@ export function findIndexedEventBusListeners(index: WorkspaceIndex, busName: str
 
 function templateComponentMatches(file: VueFileIndex, component: VueFileIndex['templateIndex']['components'][number], childUri: string): boolean {
   if (component.dynamicTags?.length) {
-    return component.dynamicTags.some((tag) => resolveTemplateComponentUriInFile(file, tag, true) === childUri)
+    return component.dynamicTags.some((tag) => resolveTemplateComponentUriInFile(file, tag) === childUri)
   }
-  return resolveTemplateComponentUriInFile(file, component.tag, false) === childUri
+  return resolveTemplateComponentUriInFile(file, component.tag) === childUri
 }
 
-function resolveTemplateComponentUriInFile(file: VueFileIndex, tag: string, allowImportFallback: boolean): string | undefined {
-  return findRegisteredComponent(file, tag) ?? (allowImportFallback ? resolveImportedVueComponentInFile(file, tag) : undefined)
-}
-
-function resolveImportedVueComponentInFile(file: VueFileIndex, tag: string): string | undefined {
-  const normalizedTag = toKebabCase(tag)
-  const imported = file.scriptIndex.imports.find((item) => {
-    return !item.isTypeOnly && (item.localName === tag || toKebabCase(item.localName) === normalizedTag)
-  })
-  const resolved = imported ? resolveImportPath(file.uri, imported.source) : undefined
-  return resolved?.endsWith('.vue') && fs.existsSync(resolved) ? resolved : undefined
+function resolveTemplateComponentUriInFile(file: VueFileIndex, tag: string): string | undefined {
+  return findRegisteredComponent(file, tag)
 }
 
 export function findProvide(file: VueFileIndex, provideKey: string) {

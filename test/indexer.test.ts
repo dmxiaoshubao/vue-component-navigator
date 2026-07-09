@@ -715,7 +715,7 @@ export default {
     expect(index.findTemplateEventUsages(objectChild.uri, 'save')).toHaveLength(2)
   })
 
-  it('Vue2 动态组件对象映射支持 import 组件变量候选', () => {
+  it('Vue2 未注册 import 动态组件对象映射不会建立组件关系', () => {
     const index = new WorkspaceIndex()
     const singleUri = path.join(fixtureRoot, 'SingleBtn.vue')
     const horizontalUri = path.join(fixtureRoot, 'HorizontalBtn.vue')
@@ -764,18 +764,15 @@ export default {
 </script>
 `)
 
-    const dynamicUsage = parent.templateIndex.components.find((component) => component.tag === 'component')!
-
     expect(parent.scriptIndex.components).toEqual([])
-    expect(dynamicUsage.dynamicTags).toEqual(['SingleBtn', 'HorizontalBtn'])
-    expect(index.resolveTemplateComponentUris(parent, dynamicUsage).sort()).toEqual([horizontalUri, singleUri].sort())
-    expect(index.findTemplatePropUsages(singleUri, 'visible')).toHaveLength(1)
-    expect(index.findTemplatePropUsages(horizontalUri, 'visible')).toHaveLength(1)
-    expect(index.findTemplateEventUsages(singleUri, 'cancel')).toHaveLength(1)
-    expect(index.findTemplateEventUsages(horizontalUri, 'cancel')).toHaveLength(1)
+    expect(parent.templateIndex.components.find((component) => component.tag === 'component')).toBeUndefined()
+    expect(index.findTemplatePropUsages(singleUri, 'visible')).toHaveLength(0)
+    expect(index.findTemplatePropUsages(horizontalUri, 'visible')).toHaveLength(0)
+    expect(index.findTemplateEventUsages(singleUri, 'cancel')).toHaveLength(0)
+    expect(index.findTemplateEventUsages(horizontalUri, 'cancel')).toHaveLength(0)
   })
 
-  it('Vue2 动态组件 import 候选不会解析到不存在的 Vue 文件', () => {
+  it('Vue2 动态组件不会仅凭 import 解析候选组件', () => {
     const index = new WorkspaceIndex()
     const existingUri = path.join(fixtureRoot, 'ExistingDynamicChild.vue')
     const missingUri = path.join(fixtureRoot, 'MissingDynamicChild.vue')
@@ -814,12 +811,11 @@ export default {
 </script>
 `)
 
-    const dynamicUsage = parent.templateIndex.components.find((component) => component.tag === 'component')!
-
-    expect(dynamicUsage.dynamicTags).toEqual(['ExistingDynamicChild', 'MissingDynamicChild'])
-    expect(index.resolveTemplateComponentUris(parent, dynamicUsage)).toEqual([existingUri])
-    expect(index.findTemplateEventUsages(existingUri, 'save')).toHaveLength(1)
+    expect(parent.scriptIndex.components).toEqual([])
+    expect(parent.templateIndex.components.find((component) => component.tag === 'component')).toBeUndefined()
+    expect(index.findTemplateEventUsages(existingUri, 'save')).toHaveLength(0)
     expect(index.findTemplateEventUsages(missingUri, 'save')).toHaveLength(0)
+    expect(findTemplateEventUsages([parent], existingUri, 'save')).toHaveLength(0)
     expect(findTemplateEventUsages([parent], missingUri, 'save')).toHaveLength(0)
   })
 
@@ -3425,7 +3421,7 @@ describe('Vue2 relation resolver', () => {
     expect(findRefMethodAccess(parent.content, closeOffset + 1)?.methodName).toBe('close')
   })
 
-  it('未注册的普通静态 ref 不会通过 import fallback 解析', () => {
+  it('未注册的普通静态 ref 不会仅凭 import 解析', () => {
     const index = new WorkspaceIndex()
     const childUri = path.join(fixtureRoot, 'UnregisteredRefChild.vue')
     const parentUri = path.join(fixtureRoot, 'UnregisteredRefParent.vue')
