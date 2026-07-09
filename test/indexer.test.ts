@@ -715,6 +715,86 @@ export default {
     expect(index.findTemplateEventUsages(objectChild.uri, 'save')).toHaveLength(2)
   })
 
+  it('静态可证明的动态组件支持对象简写、wrapper 和 computed 返回', () => {
+    const index = new WorkspaceIndex()
+    const shorthandUri = path.join(fixtureRoot, 'DynamicShorthandChild.vue')
+    const wrappedUri = path.join(fixtureRoot, 'DynamicWrappedChild.vue')
+    const computedAUri = path.join(fixtureRoot, 'DynamicComputedA.vue')
+    const computedBUri = path.join(fixtureRoot, 'DynamicComputedB.vue')
+    const parentUri = path.join(fixtureRoot, 'StaticDynamicWrapperHost.vue')
+    const childContent = `
+<template><button /></template>
+<script>
+export default {
+  methods: {
+    save() {
+      this.$emit('save')
+    },
+  },
+}
+</script>
+`
+    const shorthand = index.indexContent(shorthandUri, childContent)
+    const wrapped = index.indexContent(wrappedUri, childContent)
+    const computedA = index.indexContent(computedAUri, childContent)
+    const computedB = index.indexContent(computedBUri, childContent)
+    const parent = index.indexContent(parentUri, `
+<template>
+  <component :is="componentMap[type]" @save="onSave" />
+  <component :is="wrappedComponent" @save="onSave" />
+  <component :is="computedComponent" @save="onSave" />
+</template>
+<script>
+import { computed, markRaw } from 'vue'
+import DynamicShorthandChild from './DynamicShorthandChild.vue'
+import DynamicWrappedChild from './DynamicWrappedChild.vue'
+import DynamicComputedA from './DynamicComputedA.vue'
+import DynamicComputedB from './DynamicComputedB.vue'
+
+const componentMap = {
+  DynamicShorthandChild,
+  wrapped: markRaw(DynamicWrappedChild),
+  conditional: type === 'a' ? DynamicComputedA : DynamicComputedB,
+}
+const wrappedComponent = computed(() => DynamicWrappedChild)
+
+export default {
+  components: {
+    DynamicShorthandChild,
+    DynamicWrappedChild,
+    DynamicComputedA,
+    DynamicComputedB,
+  },
+  data() {
+    return {
+      componentMap,
+      wrappedComponent,
+      type: 'short',
+    }
+  },
+  computed: {
+    computedComponent() {
+      return this.type === 'a' ? 'DynamicComputedA' : DynamicComputedB
+    },
+  },
+  methods: {
+    onSave() {},
+  },
+}
+</script>
+`)
+
+    const dynamicUsages = parent.templateIndex.components.filter((component) => component.tag === 'component')
+
+    expect(dynamicUsages[0].dynamicTags?.sort()).toEqual(['DynamicComputedA', 'DynamicComputedB', 'DynamicShorthandChild', 'DynamicWrappedChild'])
+    expect(dynamicUsages[1].dynamicTags).toEqual(['DynamicWrappedChild'])
+    expect(dynamicUsages[2].dynamicTags?.sort()).toEqual(['DynamicComputedA', 'DynamicComputedB'])
+    expect(index.findTemplateEventUsages(shorthand.uri, 'save')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(wrapped.uri, 'save')).toHaveLength(2)
+    expect(index.findTemplateEventUsages(computedA.uri, 'save')).toHaveLength(2)
+    expect(index.findTemplateEventUsages(computedB.uri, 'save')).toHaveLength(2)
+  })
+
   it('Vue2 未注册 import 动态组件对象映射不会建立组件关系', () => {
     const index = new WorkspaceIndex()
     const singleUri = path.join(fixtureRoot, 'SingleBtn.vue')

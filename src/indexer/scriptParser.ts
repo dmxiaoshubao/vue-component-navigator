@@ -17,6 +17,16 @@ interface StaticComponentAlias {
   source?: string
 }
 
+const staticComponentWrappers = new Set([
+  'computed',
+  'markRaw',
+  'reactive',
+  'readonly',
+  'ref',
+  'shallowReactive',
+  'shallowRef',
+])
+
 interface ExportObject {
   open: number
   close: number
@@ -699,6 +709,114 @@ function readStaticCandidateValue(content: string, start: number, end: number): 
   return undefined
 }
 
+function readStaticCandidateValues(content: string, start: number, end: number): string[] {
+  const single = readStaticCandidateValue(content, start, end)
+  if (single) {
+    return [single]
+  }
+
+  const value = content.slice(start, end).trim()
+  const wrapped = unwrapStaticComponentWrapper(value)
+  if (wrapped) {
+    return readStaticCandidateValues(wrapped, 0, wrapped.length)
+  }
+  if (value.startsWith('{') && value.endsWith('}')) {
+    return readObjectStaticCandidateValues(value, 0, value.length - 1)
+  }
+  if (value.startsWith('[') && value.endsWith(']')) {
+    return readArrayStaticCandidateValues(value, 0, value.length - 1)
+  }
+  return []
+}
+
+function unwrapStaticComponentWrapper(expression: string): string | undefined {
+  const callee = readIdentifier(expression, 0)
+  if (!callee || !staticComponentWrappers.has(callee.value)) {
+    return undefined
+  }
+
+  const open = skipTrivia(expression, callee.end)
+  if (expression[open] !== '(' || findMatchingBracket(expression, open) !== expression.length - 1) {
+    return undefined
+  }
+
+  const argStart = skipTrivia(expression, open + 1)
+  const argEnd = findArrayEntryEnd(expression, argStart, expression.length - 1)
+  const argument = expression.slice(argStart, argEnd).trim()
+  if (!argument) {
+    return undefined
+  }
+
+  return callee.value === 'computed'
+    ? readSimpleFunctionReturn(argument) ?? argument
+    : argument
+}
+
+function readSimpleFunctionReturn(expression: string): string | undefined {
+  return readSimpleArrowBody(expression) ?? readSimpleFunctionBodyReturn(expression)
+}
+
+function readSimpleArrowBody(expression: string): string | undefined {
+  const arrowIndex = findTopLevelArrow(expression)
+  if (arrowIndex === -1) {
+    return undefined
+  }
+
+  const body = stripOuterParens(expression.slice(arrowIndex + 2).trim())
+  if (!body) {
+    return undefined
+  }
+  if (body.startsWith('{') && body.endsWith('}')) {
+    return readReturnedExpression(body, 1, body.length - 1)
+  }
+  return body
+}
+
+function readSimpleFunctionBodyReturn(expression: string): string | undefined {
+  const functionIndex = expression.indexOf('function')
+  if (functionIndex === -1) {
+    return undefined
+  }
+  const bodyOpen = expression.indexOf('{', functionIndex + 'function'.length)
+  if (bodyOpen === -1 || findMatchingBracket(expression, bodyOpen) !== expression.length - 1) {
+    return undefined
+  }
+  return readReturnedExpression(expression, bodyOpen + 1, expression.length - 1)
+}
+
+function findTopLevelArrow(expression: string): number {
+  let depth = 0
+  for (let index = 0; index < expression.length - 1; index += 1) {
+    const skipped = skipStringCommentOrRegex(expression, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = expression[index]
+    if (char === '{' || char === '[' || char === '(') {
+      depth += 1
+      continue
+    }
+    if (char === '}' || char === ']' || char === ')') {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth === 0 && expression.startsWith('=>', index)) {
+      return index
+    }
+  }
+  return -1
+}
+
+function stripOuterParens(expression: string): string {
+  let current = expression
+  while (current.startsWith('(') && findMatchingBracket(current, 0) === current.length - 1) {
+    current = current.slice(1, -1).trim()
+  }
+  return current
+}
+
 function readObjectStaticCandidateValues(content: string, objectStart: number, objectEnd: number): string[] {
   const values: string[] = []
   let index = objectStart + 1
@@ -722,21 +840,32 @@ function readObjectStaticCandidateValues(content: string, objectStart: number, o
       index += 1
       continue
     }
-    if (depth !== 0 || char !== ':') {
+    if (depth !== 0) {
       index += 1
       continue
     }
-
-    const valueStart = skipTrivia(content, index + 1)
-    const valueEnd = findMemberValueEnd(content, valueStart, objectEnd)
-    const value = readStaticCandidateValue(content, valueStart, valueEnd)
-    if (value) {
-      values.push(value)
+    if (char === ':') {
+      const valueStart = skipTrivia(content, index + 1)
+      const valueEnd = findMemberValueEnd(content, valueStart, objectEnd)
+      values.push(...readStaticCandidateValues(content, valueStart, valueEnd))
       index = valueEnd
       continue
     }
 
-    index = valueEnd
+    const shorthand = readIdentifier(content, index)
+    if (shorthand) {
+      const afterName = skipTrivia(content, shorthand.end)
+      if (content[afterName] === ',' || afterName >= objectEnd) {
+        // 对象简写 `{ UserPanel }` 是静态可证明的组件候选。
+        values.push(shorthand.value)
+        index = afterName + 1
+        continue
+      }
+      index = shorthand.end
+      continue
+    }
+
+    index += 1
   }
 
   return [...new Set(values)]
@@ -819,24 +948,20 @@ function collectStaticVariableComponentNameBindings(content: string, start = 0, 
         })
       } else if (content[valueStart] === '{') {
         const values = readObjectStaticCandidateValues(content, valueStart, findMatchingBracket(content, valueStart))
-        if (values.length > 0) {
-          bindings.push({
-            variableName: name.value,
-            tags: values,
-            kind: 'map',
-            expression,
-          })
-        }
+        bindings.push({
+          variableName: name.value,
+          tags: values,
+          kind: 'map',
+          expression,
+        })
       } else if (content[valueStart] === '[') {
         const values = readArrayStaticCandidateValues(content, valueStart, findMatchingBracket(content, valueStart))
-        if (values.length > 0) {
-          bindings.push({
-            variableName: name.value,
-            tags: values,
-            kind: 'array',
-            expression,
-          })
-        }
+        bindings.push({
+          variableName: name.value,
+          tags: values,
+          kind: 'array',
+          expression,
+        })
       } else if (expression) {
         bindings.push({
           variableName: name.value,
@@ -954,9 +1079,69 @@ function collectDataStaticComponentNameBindings(content: string): StaticComponen
   ]
 }
 
+function readReturnedExpression(content: string, bodyStart: number, bodyEnd: number): string | undefined {
+  let depth = 0
+  for (let index = bodyStart; index < bodyEnd; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = content[index]
+    if (char === '{' || char === '[' || char === '(') {
+      depth += 1
+      continue
+    }
+    if (char === '}' || char === ']' || char === ')') {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth !== 0 || !isCodeTokenAt(content, 'return', index)) {
+      continue
+    }
+
+    const valueStart = skipTrivia(content, index + 'return'.length)
+    const valueEnd = findExpressionEnd(content, valueStart, bodyEnd)
+    return content.slice(valueStart, valueEnd).trim()
+  }
+  return undefined
+}
+
+function collectComputedStaticComponentNameBindings(content: string): StaticComponentNameBinding[] {
+  const object = findDefaultExportObject(content)
+  if (!object) {
+    return []
+  }
+  const computed = findTopLevelProperty(content, object.open, object.close, 'computed')
+  if (!computed || content[computed.valueStart] !== '{') {
+    return []
+  }
+
+  const bindings: StaticComponentNameBinding[] = []
+  eachObjectMember(content, computed.valueStart, computed.valueEnd - 1, (member) => {
+    const body = functionBodyRange(content, member.valueStart, member.valueEnd)
+    const expression = body ? readReturnedExpression(content, body.start, body.end) : undefined
+    if (!expression) {
+      return
+    }
+    const valueStart = content.indexOf(expression, member.valueStart)
+    const valueEnd = valueStart === -1 ? member.valueEnd : valueStart + expression.length
+    const tags = valueStart === -1 ? [] : readStaticCandidateValues(content, valueStart, valueEnd)
+    bindings.push({
+      variableName: member.name,
+      tags,
+      kind: tags.length > 0 ? 'literal' : 'expression',
+      expression,
+    })
+  })
+  return bindings
+}
+
 export function collectStaticComponentNameBindings(content: string): StaticComponentNameBinding[] {
   return [
     ...collectDataStaticComponentNameBindings(content),
+    ...collectComputedStaticComponentNameBindings(content),
     ...collectStaticVariableComponentNameBindings(content),
   ]
 }

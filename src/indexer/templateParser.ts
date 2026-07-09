@@ -43,6 +43,16 @@ const expressionKeywords = new Set([
   '$event',
 ])
 
+const staticComponentWrappers = new Set([
+  'computed',
+  'markRaw',
+  'reactive',
+  'readonly',
+  'ref',
+  'shallowReactive',
+  'shallowRef',
+])
+
 interface TemplateExpressionAttrValue {
   value: string
   start: number
@@ -1147,6 +1157,16 @@ function resolveStaticComponentNameExpression(expression: string, staticComponen
     return [literal.value]
   }
 
+  const wrapped = unwrapStaticComponentWrapper(trimmed)
+  if (wrapped) {
+    return resolveStaticComponentNameExpression(wrapped, staticComponentNames, registeredTags, visited)
+  }
+
+  const arrowBody = readSimpleArrowBody(trimmed)
+  if (arrowBody) {
+    return resolveStaticComponentNameExpression(arrowBody, staticComponentNames, registeredTags, visited)
+  }
+
   const conditional = splitConditionalExpression(trimmed)
   if (conditional) {
     return uniqueStrings([
@@ -1200,13 +1220,19 @@ function resolveBindingCandidates(binding: StaticComponentNameBinding, staticCom
   visited.add(binding.variableName)
   try {
     if (binding.tags.length > 0 && (binding.kind === 'literal' || binding.kind === 'map' || binding.kind === 'array')) {
-      return uniqueStrings([
+      const candidates = [
         ...binding.tags,
         ...binding.tags.flatMap((tag) => {
           const nested = staticComponentNames.find((item) => item.variableName === tag)
           return nested ? resolveBindingCandidates(nested, staticComponentNames, registeredTags, visited) : []
         }),
-      ])
+      ]
+      return uniqueStrings(binding.kind === 'map' || binding.kind === 'array'
+        ? [
+            ...candidates,
+            ...(binding.expression ? resolveStaticComponentNameExpression(binding.expression, staticComponentNames, registeredTags, visited) : []),
+          ]
+        : candidates)
     }
     if (!binding.expression) {
       return binding.tags
@@ -1233,6 +1259,155 @@ function resolveObjectLiteralCandidates(expression: string, staticComponentNames
   }
   return uniqueStrings(readObjectCandidates(expression, 0, expression.length - 1)
     .flatMap((value) => resolveStaticComponentNameExpression(value, staticComponentNames, registeredTags, visited)))
+}
+
+function unwrapStaticComponentWrapper(expression: string): string | undefined {
+  const callee = readIdentifier(expression, 0)
+  if (!callee || !staticComponentWrappers.has(callee.value)) {
+    return undefined
+  }
+
+  const open = skipTrivia(expression, callee.end)
+  if (expression[open] !== '(' || findMatchingBracket(expression, open) !== expression.length - 1) {
+    return undefined
+  }
+
+  const argStart = skipTrivia(expression, open + 1)
+  const argEnd = findArrayEntryEnd(expression, argStart, expression.length - 1)
+  const argument = expression.slice(argStart, argEnd).trim()
+  if (!argument) {
+    return undefined
+  }
+
+  return callee.value === 'computed'
+    ? readSimpleFunctionReturn(argument) ?? argument
+    : argument
+}
+
+function readSimpleFunctionReturn(expression: string): string | undefined {
+  return readSimpleArrowBody(expression) ?? readSimpleFunctionBodyReturn(expression)
+}
+
+function readSimpleArrowBody(expression: string): string | undefined {
+  const arrowIndex = findTopLevelArrow(expression)
+  if (arrowIndex === -1) {
+    return undefined
+  }
+
+  const body = stripOuterParens(expression.slice(arrowIndex + 2).trim())
+  if (!body) {
+    return undefined
+  }
+  if (body.startsWith('{') && body.endsWith('}')) {
+    return readReturnedExpression(body, 1, body.length - 1)
+  }
+  return body
+}
+
+function readSimpleFunctionBodyReturn(expression: string): string | undefined {
+  const functionIndex = expression.indexOf('function')
+  if (functionIndex === -1) {
+    return undefined
+  }
+  const bodyOpen = expression.indexOf('{', functionIndex + 'function'.length)
+  if (bodyOpen === -1 || findMatchingBracket(expression, bodyOpen) !== expression.length - 1) {
+    return undefined
+  }
+  return readReturnedExpression(expression, bodyOpen + 1, expression.length - 1)
+}
+
+function readReturnedExpression(content: string, start: number, end: number): string | undefined {
+  let depth = 0
+  for (let index = start; index < end; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = content[index]
+    if ('([{'.includes(char)) {
+      depth += 1
+      continue
+    }
+    if (')]}'.includes(char)) {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth !== 0 || !isTokenAt(content, 'return', index)) {
+      continue
+    }
+
+    const valueStart = skipTrivia(content, index + 'return'.length)
+    const valueEnd = findExpressionEnd(content, valueStart, end)
+    return content.slice(valueStart, valueEnd).trim()
+  }
+  return undefined
+}
+
+function findTopLevelArrow(expression: string): number {
+  let depth = 0
+  for (let index = 0; index < expression.length - 1; index += 1) {
+    const skipped = skipStringCommentOrRegex(expression, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = expression[index]
+    if ('([{'.includes(char)) {
+      depth += 1
+      continue
+    }
+    if (')]}'.includes(char)) {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth === 0 && expression.startsWith('=>', index)) {
+      return index
+    }
+  }
+  return -1
+}
+
+function isTokenAt(content: string, token: string, index: number): boolean {
+  return content.startsWith(token, index)
+    && !/[\w$]/.test(content[index - 1] ?? '')
+    && !/[\w$]/.test(content[index + token.length] ?? '')
+}
+
+function findExpressionEnd(content: string, start: number, close: number): number {
+  let index = start
+  let depth = 0
+
+  while (index < close) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped
+      continue
+    }
+
+    const char = content[index]
+    if ('([{'.includes(char)) {
+      depth += 1
+      index += 1
+      continue
+    }
+    if (')]}'.includes(char)) {
+      if (depth === 0) {
+        return index
+      }
+      depth -= 1
+      index += 1
+      continue
+    }
+    if (depth === 0 && (char === ',' || char === ';' || char === '\n')) {
+      return index
+    }
+    index += 1
+  }
+
+  return close
 }
 
 function splitConditionalExpression(expression: string): { consequent: string, alternate: string } | undefined {
@@ -1402,7 +1577,7 @@ function readArrayCandidates(content: string, arrayStart: number, arrayEnd: numb
       continue
     }
     const entryEnd = findArrayEntryEnd(content, index, arrayEnd)
-    const value = readStaticCandidate(content, index, entryEnd)
+    const value = content.slice(index, entryEnd).trim()
     if (value) {
       values.push(value)
     }
@@ -1414,45 +1589,53 @@ function readArrayCandidates(content: string, arrayStart: number, arrayEnd: numb
 function readObjectCandidates(content: string, objectStart: number, objectEnd: number): string[] {
   const values: string[] = []
   let index = objectStart + 1
+  let depth = 0
+
   while (index < objectEnd) {
-    index = skipWhitespace(content, index)
-    if (content[index] === ',') {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped
+      continue
+    }
+
+    const char = content[index]
+    if (char === '{' || char === '[' || char === '(') {
+      depth += 1
       index += 1
       continue
     }
-    const key = readIdentifier(content, index) ?? readQuotedPropertyName(content, index)
-    if (!key) {
+    if (char === '}' || char === ']' || char === ')') {
+      depth = Math.max(0, depth - 1)
       index += 1
       continue
     }
-    index = skipTrivia(content, key.end)
-    if (content[index] !== ':') {
+    if (depth !== 0) {
       index += 1
       continue
     }
-    const valueStart = skipTrivia(content, index + 1)
-    const valueEnd = findArrayEntryEnd(content, valueStart, objectEnd)
-    const value = readStaticCandidate(content, valueStart, valueEnd)
-    if (value) {
-      values.push(value)
+    if (char === ':') {
+      const valueStart = skipTrivia(content, index + 1)
+      const valueEnd = findArrayEntryEnd(content, valueStart, objectEnd)
+      values.push(content.slice(valueStart, valueEnd).trim())
+      index = valueEnd + 1
+      continue
     }
-    index = valueEnd + 1
+
+    const shorthand = readIdentifier(content, index)
+    if (shorthand) {
+      const afterName = skipTrivia(content, shorthand.end)
+      if (content[afterName] === ',' || afterName >= objectEnd) {
+        values.push(shorthand.value)
+        index = afterName + 1
+        continue
+      }
+      index = shorthand.end
+      continue
+    }
+
+    index += 1
   }
   return [...new Set(values)]
-}
-
-function readStaticCandidate(content: string, start: number, end: number): string | undefined {
-  const literal = readStringLiteral(content, start)
-  if (literal && skipTrivia(content, literal.end + 1) === end) {
-    return literal.value
-  }
-
-  const identifier = readIdentifier(content, start)
-  if (identifier && skipTrivia(content, identifier.end) === end) {
-    return identifier.value
-  }
-
-  return undefined
 }
 
 function skipTrivia(content: string, index: number): number {
