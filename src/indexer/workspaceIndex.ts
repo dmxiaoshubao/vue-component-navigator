@@ -382,7 +382,16 @@ export class WorkspaceIndex {
 
   private parseIndexableContent(uri: string, content: string): ParsedSfc {
     if (!isScriptFile(uri) || uri.endsWith('.vue')) {
-      return parseSfc(uri, content)
+      try {
+        return parseSfc(uri, content)
+      } catch {
+        return {
+          uri,
+          fileName: path.basename(uri),
+          content,
+          lineStarts: createLineStarts(content),
+        }
+      }
     }
 
     return {

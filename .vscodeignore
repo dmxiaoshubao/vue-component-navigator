@@ -7,6 +7,7 @@ scripts/**
 coverage/**
 .vscode-test/**
 docs/gifs/**
+docs/runtime-flow.md
 node_modules/**
 *.vsix
 .gitignore

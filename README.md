@@ -6,14 +6,14 @@ VS Code navigation helpers for Vue 2 Options API projects and Vue 3 `<script set
 
 This extension focuses on static relationships that are easy to miss in Vue codebases. It complements the official Vue tooling instead of replacing it, so local component tag definitions are intentionally left to the Vue language extension to avoid duplicate results.
 
-Current documented feature set: `2.0.0`.
+Current documented feature set: `2.0.1`.
 
 ## 2.0 Runtime Split
 
 Version `2.0.0` rebuilds the indexer around isolated Vue major-version runtimes. A Vue 2 workspace and a Vue 3 workspace can be supported by the same extension codebase, but only the matching runtime is used for a given project.
 
 - Vue 2 keeps the Options API feature set, including mixins, Event Bus, global components, and third-party `$refs` helpers.
-- Vue 2 SFC blocks are parsed through `@vue/compiler-sfc`.
+- Vue 2 SFC blocks are split by a lightweight lexical block scanner, so valid Vue 2 template syntax such as `v-bind.sync` cannot break indexing.
 - Vue 3 uses `@vue/language-core` for SFC structure and macro-aware script ranges instead of the old Vue 3 script parser path.
 - Vue 3 relationship indexing is focused on static component contracts: `defineProps`, `defineEmits`, `defineModel`, `defineSlots`, `defineExpose`, typed template refs, composable return members, and static provide/inject keys.
 - Vue 2 and Vue 3 caches, reverse indexes, and incremental rebuild rules are intentionally separated.

@@ -6,14 +6,14 @@
 
 这个插件主要处理 Vue 项目里容易断开的静态关系。它是 Vue 官方工具的补充，不会替代官方扩展；局部组件标签名的定义跳转会交给 Vue 语言扩展处理，避免同一个位置出现重复结果。
 
-当前文档对应功能版本：`2.0.0`。
+当前文档对应功能版本：`2.0.1`。
 
 ## 2.0 运行时隔离
 
 `2.0.0` 围绕 Vue 主版本隔离重建索引器。同一套扩展代码可以同时维护 Vue 2 和 Vue 3 能力，但在具体项目里只会运行匹配该项目主版本的一套运行时。
 
 - Vue 2 保留 Options API 能力，包括 mixins、Event Bus、全局组件和第三方 `$refs` 辅助。
-- Vue 2 SFC block 通过 `@vue/compiler-sfc` 解析。
+- Vue 2 SFC block 通过轻量的词法块扫描切分，`v-bind.sync` 等合法的 Vue 2 模板语法不会再中断索引。
 - Vue 3 使用 `@vue/language-core` 获取 SFC 结构和宏相关 script ranges，不再走旧的 Vue 3 script parser 路径。
 - Vue 3 关系索引聚焦静态组件契约：`defineProps`、`defineEmits`、`defineModel`、`defineSlots`、`defineExpose`、typed template refs、composable 返回成员，以及静态 provide/inject key。
 - Vue 2 和 Vue 3 的缓存、反向索引和增量重建规则保持隔离。

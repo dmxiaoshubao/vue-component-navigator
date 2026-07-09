@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.0.1 - 2026-07-09
+
+### English
+
+#### Fixed
+
+- Fixed workspace indexing aborting with `Cannot read properties of undefined (reading 'loc')` on Vue 2 files that use valid syntax such as `v-bind.sync`. Vue 2 SFC blocks are no longer parsed by the Vue 3 `@vue/compiler-sfc` template compiler.
+
+#### Changed
+
+- Replaced `@vue/compiler-sfc` SFC block parsing with a lightweight, single-pass lexical block scanner that only extracts the `script` / `scriptSetup` / `template` byte ranges. Template internals stay with the in-house template parser and Vue 3 keeps using `@vue/language-core`.
+- Hardened single-file parsing so any parse failure skips that file instead of aborting the whole workspace index.
+
+### 中文
+
+#### 修复
+
+- 修复 Vue 2 文件使用 `v-bind.sync` 等合法语法时，整库索引以 `Cannot read properties of undefined (reading 'loc')` 中断的问题。Vue 2 SFC block 不再交给 Vue 3 的 `@vue/compiler-sfc` 模板编译器解析。
+
+#### 变更
+
+- 将 `@vue/compiler-sfc` 的 SFC block 解析替换为轻量的单遍词法块扫描，只提取 `script` / `scriptSetup` / `template` 的字节范围。模板内部仍由自研 template parser 处理，Vue 3 继续使用 `@vue/language-core`。
+- 加固单文件解析：任何解析失败只跳过该文件，而不再中断整库索引。
+
 ## 2.0.0 - 2026-07-08
 
 ### English

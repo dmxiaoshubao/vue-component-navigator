@@ -105,7 +105,7 @@ async function buildDemoIndex(): Promise<WorkspaceIndex> {
 }
 
 describe('Vue2 indexer', () => {
-  it('使用 compiler-sfc 解析 SFC block 并保留源码 offset', () => {
+  it('手写切割解析 SFC block 并保留源码 offset', () => {
     const content = `
 <!-- <script>ignored()</script> -->
 <template lang="pug">
@@ -136,6 +136,44 @@ export default { name: 'OffsetProbe' }
     expect(parsed.script?.start).toBe(parsed.script?.end)
     expect(file.scriptIndex.props).toEqual([])
     expect(file.scriptIndex.methods).toEqual([])
+  })
+
+  it('Vue2 合法语法 v-bind.sync 不会中断解析', () => {
+    const content = `
+<template>
+  <Comp v-bind.sync="filter" />
+</template>
+<script>
+export default { name: 'SyncHost' }
+</script>
+`
+    const parsed = parseSfc('/tmp/SyncHost.vue', content)
+
+    expect(parsed.template?.content).toContain('v-bind.sync="filter"')
+    expect(parsed.script?.content).toContain('SyncHost')
+    expect(parsed.scriptSetup).toBeUndefined()
+    expect(content.slice(parsed.template!.start, parsed.template!.end)).toBe(parsed.template!.content)
+  })
+
+  it('嵌套 template 深度配对到最外层闭合', () => {
+    const content = `<template>
+<div><template v-if="a"><span/></template></div>
+</template>
+<script>export default {}</script>`
+    const parsed = parseSfc('/tmp/NestedTemplate.vue', content)
+
+    expect(parsed.template?.content).toBe('\n<div><template v-if="a"><span/></template></div>\n')
+    expect(content.slice(parsed.template!.start, parsed.template!.end)).toBe(parsed.template!.content)
+  })
+
+  it('script 与 script setup 并存时分别归类', () => {
+    const content = `<template><div /></template>
+<script>const shared = 1</script>
+<script setup>const local = 2</script>`
+    const parsed = parseSfc('/tmp/DualScript.vue', content)
+
+    expect(parsed.script?.content).toContain('const shared = 1')
+    expect(parsed.scriptSetup?.content).toContain('const local = 2')
   })
 
   it('demo fixture 覆盖录屏用的核心导航关系', async () => {
