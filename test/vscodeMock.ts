@@ -41,6 +41,7 @@ export class Location {
 export enum CompletionItemKind {
   Method = 1,
   Event = 2,
+  Property = 3,
 }
 
 export class CompletionItem {
@@ -87,6 +88,7 @@ export const providerRegistrations: string[] = []
 export const providerSelectors: any[] = []
 export const codeLensProviders: any[] = []
 export const configurationValues = new Map<string, any>()
+export const extensionValues = new Map<string, any>()
 
 function disposable(): Disposable {
   return { dispose() {} }
@@ -109,6 +111,7 @@ export function resetMockState(): void {
   providerSelectors.length = 0
   codeLensProviders.length = 0
   configurationValues.clear()
+  extensionValues.clear()
   workspace.workspaceFolders = []
   window.activeTextEditor = undefined
 }
@@ -147,6 +150,10 @@ export const commands = {
     registeredCommands.set(name, handler)
     return disposable()
   },
+}
+
+export const extensions = {
+  getExtension: (id: string) => extensionValues.get(id),
 }
 
 export const window = {

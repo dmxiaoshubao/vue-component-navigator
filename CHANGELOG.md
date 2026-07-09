@@ -17,6 +17,7 @@
 - Added Vue 3 `.vue` source-file invalidation for imported type sources, static key sources, and deleted source files.
 - Added Vue 3 `defineModel()` prop-side indexing so `v-model` participates in both prop and `update:*` event relationships.
 - Improved Vue 3 composable forwarded-ref handling when a composable has an external return type but returns a statically readable object.
+- Reduced the VSIX bundle size by loading VS Code's built-in TypeScript runtime instead of bundling a full TypeScript copy into `extension.js`.
 - Updated README documentation for the 2.0 runtime split, Vue 3 language-core indexing, and current static-analysis boundaries.
 
 #### Fixed
@@ -40,6 +41,7 @@
 - 新增 Vue 3 `.vue` 源文件失效处理，覆盖导入类型源、静态 key 源和源文件删除场景。
 - 新增 Vue 3 `defineModel()` 的 prop 侧索引，让 `v-model` 同时参与 prop 和 `update:*` event 关系。
 - 改进 Vue 3 composable 转发 ref 的处理：当 helper 使用外部返回类型但返回静态可读对象时，也能识别转发方法。
+- 通过加载 VS Code 内置 TypeScript runtime，而不是把完整 TypeScript 打进 `extension.js`，降低 VSIX 包体积。
 - 更新 README 文档，说明 2.0 运行时隔离、Vue 3 language-core 索引和当前静态分析边界。
 
 #### 修复

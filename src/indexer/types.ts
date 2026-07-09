@@ -55,6 +55,7 @@ export interface MixinReference {
   importedName?: string
   targetUri?: string
   span: TextSpan
+  sourceLocation?: SourceLocation
 }
 
 export interface ComponentRegistration {
@@ -63,6 +64,7 @@ export interface ComponentRegistration {
   source?: string
   targetUri?: string
   nameSpan: TextSpan
+  sourceLocation?: SourceLocation
 }
 
 export interface StaticComponentNameBinding {
@@ -83,14 +85,6 @@ export interface GlobalComponentRegistration {
   fileUri: string
 }
 
-export interface GlobalComponentContext {
-  source: string
-  targetUri: string
-  nameSpan: TextSpan
-  registerSpan: TextSpan
-  fileUri: string
-}
-
 export interface PropInfo {
   name: string
   span: TextSpan
@@ -104,6 +98,15 @@ export interface MethodInfo {
   span: TextSpan
   detail: string
   signature: string
+  documentation?: string
+  sourceLocation?: SourceLocation
+}
+
+export interface OptionMemberInfo {
+  name: string
+  kind: 'data' | 'computed' | 'method'
+  span: TextSpan
+  detail: string
   documentation?: string
   sourceLocation?: SourceLocation
 }
@@ -182,11 +185,13 @@ export interface SlotInfo {
 export interface ScriptIndex {
   componentName?: string
   imports: ImportInfo[]
+  extendsRef?: MixinReference
   mixins: MixinReference[]
   components: ComponentRegistration[]
   staticComponentNames: StaticComponentNameBinding[]
   props: PropInfo[]
   methods: MethodInfo[]
+  optionMembers: OptionMemberInfo[]
   emits: EmitInfo[]
   eventBusCalls: EventBusCall[]
   provides: ProvideInfo[]
@@ -214,9 +219,11 @@ export interface TemplateBindUsage {
 export interface TemplateComponentUsage {
   tag: string
   dynamicTags?: string[]
+  dynamicExpressionSpan?: TextSpan
   span: TextSpan
   attrs: TemplateAttrUsage[]
   binds: TemplateBindUsage[]
+  ons?: TemplateBindUsage[]
   slots: TemplateSlotUsage[]
   forwardsAttrs?: boolean
   forwardsListeners?: boolean
@@ -229,11 +236,17 @@ export interface TemplateSlotUsage {
   fullSpan: TextSpan
 }
 
+export interface TemplateInstanceMemberUsage {
+  name: string
+  span: TextSpan
+}
+
 export interface TemplateIndex {
   components: TemplateComponentUsage[]
   emits: EmitInfo[]
   eventBusCalls: EventBusCall[]
   slots: SlotInfo[]
+  instanceMembers: TemplateInstanceMemberUsage[]
 }
 
 export interface VueFileIndex {

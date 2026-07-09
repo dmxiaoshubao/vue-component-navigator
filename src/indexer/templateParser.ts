@@ -1,4 +1,4 @@
-import type { EmitInfo, EventBusCall, SlotInfo, StaticComponentNameBinding, TemplateAttrUsage, TemplateBindUsage, TemplateComponentUsage, TemplateIndex, TemplateSlotUsage } from './types'
+import type { EmitInfo, EventBusCall, SlotInfo, StaticComponentNameBinding, TemplateAttrUsage, TemplateBindUsage, TemplateComponentUsage, TemplateIndex, TemplateInstanceMemberUsage, TemplateSlotUsage } from './types'
 import { parseEventBusCalls } from './eventBusParser'
 import { toCamelCase, toKebabCase } from '../utils/casing'
 import { readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
@@ -13,10 +13,53 @@ const ignoredPropNames = new Set([
   'is',
 ])
 
+const expressionKeywords = new Set([
+  'true',
+  'false',
+  'null',
+  'undefined',
+  'NaN',
+  'Infinity',
+  'this',
+  'typeof',
+  'void',
+  'new',
+  'delete',
+  'in',
+  'of',
+  'instanceof',
+  'return',
+  'if',
+  'else',
+  'Math',
+  'Number',
+  'String',
+  'Boolean',
+  'Array',
+  'Object',
+  'Date',
+  'JSON',
+  'console',
+  '$event',
+])
+
 interface TemplateExpressionAttrValue {
   value: string
   start: number
 }
+
+interface TemplateInstanceExpressionAttrValue extends TemplateExpressionAttrValue {
+  rawName: string
+  localNames?: string[]
+}
+
+interface DynamicComponentExpression {
+  value: string
+  static: boolean
+  span: { start: number, end: number }
+}
+
+const voidHtmlTags = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'])
 
 function isVueDirective(name: string): boolean {
   return name.startsWith('v-') || name.startsWith('#')
@@ -24,6 +67,24 @@ function isVueDirective(name: string): boolean {
 
 function stripModifier(name: string): string {
   return name.split('.')[0]
+}
+
+function hasModifier(name: string, modifier: string): boolean {
+  return name.split('.').slice(1).includes(modifier)
+}
+
+function namedSyncProp(attrName: string): string | undefined {
+  if (!hasModifier(attrName, 'sync')) {
+    return undefined
+  }
+
+  const name = attrName.startsWith(':')
+    ? stripModifier(attrName.slice(1))
+    : attrName.startsWith('v-bind:')
+      ? stripModifier(attrName.slice('v-bind:'.length))
+      : undefined
+
+  return name && !ignoredPropNames.has(name) ? name : undefined
 }
 
 function normalizeAttr(attrName: string, vue3ModelEvents: boolean): TemplateAttrUsage | undefined {
@@ -74,6 +135,24 @@ function normalizeAttr(attrName: string, vue3ModelEvents: boolean): TemplateAttr
 }
 
 function normalizeAttrs(attrName: string, vue3ModelEvents: boolean): TemplateAttrUsage[] {
+  const syncProp = namedSyncProp(attrName)
+  if (syncProp) {
+    const normalized = normalizeAttr(attrName, vue3ModelEvents)
+    // Vue2 .sync 等价于传入 prop，并监听对应的 update:prop 事件。
+    return normalized
+      ? [
+          normalized,
+          {
+            kind: 'event',
+            name: syncProp,
+            normalizedName: `update:${syncProp}`,
+            span: { start: 0, end: 0 },
+            fullSpan: { start: 0, end: 0 },
+          },
+        ]
+      : []
+  }
+
   if (vue3ModelEvents && attrName === 'v-model') {
     return [
       { kind: 'prop', name: 'v-model', normalizedName: 'modelValue', span: { start: 0, end: 0 }, fullSpan: { start: 0, end: 0 } },
@@ -176,6 +255,33 @@ function extractBindUsages(openTag: string, openStart: number): TemplateBindUsag
   }
 
   return binds
+}
+
+function extractOnUsages(openTag: string, openStart: number): TemplateBindUsage[] {
+  const ons: TemplateBindUsage[] = []
+  const pattern = /\s(v-on)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(openTag))) {
+    const rawValue = match[2]
+    if (!rawValue) {
+      continue
+    }
+
+    const fullStart = openStart + match.index + match[0].indexOf(match[1])
+    const rawValueStart = openStart + match.index + match[0].lastIndexOf(rawValue)
+    const quoted = (rawValue.startsWith('"') && rawValue.endsWith('"')) || (rawValue.startsWith('\'') && rawValue.endsWith('\''))
+    const expression = quoted ? rawValue.slice(1, -1) : rawValue
+    const expressionStart = rawValueStart + (quoted ? 1 : 0)
+
+    ons.push({
+      expression,
+      span: { start: expressionStart, end: expressionStart + expression.length },
+      fullSpan: { start: fullStart, end: fullStart + match[1].length },
+    })
+  }
+
+  return ons
 }
 
 function normalizeSlotAttr(rawName: string): { name: string, normalizedName: string, semanticOffset: number } | undefined {
@@ -340,19 +446,368 @@ function extractExpressionAttrValues(openTag: string, openStart: number): Templa
   return values
 }
 
-function extractDynamicIsExpression(openTag: string): { value: string, static: boolean } | undefined {
-  const shorthand = extractAttrValue(openTag, ':is')
-  if (shorthand !== undefined) {
-    return { value: shorthand, static: false }
+function isInstanceExpressionAttrName(rawName: string): boolean {
+  return isExpressionAttrName(rawName)
+    || rawName === 'v-for'
+    || rawName === 'v-if'
+    || rawName === 'v-else-if'
+    || rawName === 'v-show'
+    || rawName === 'v-text'
+    || rawName === 'v-html'
+    || rawName === 'v-model'
+    || rawName.startsWith('v-model:')
+}
+
+function findTopLevelForOperator(expression: string): { index: number, length: number } | undefined {
+  let depth = 0
+
+  for (let index = 0; index < expression.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(expression, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = expression[index]
+    if (char === '(' || char === '[' || char === '{') {
+      depth += 1
+      continue
+    }
+    if (char === ')' || char === ']' || char === '}') {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth !== 0) {
+      continue
+    }
+
+    const match = /^(?:in|of)\b/.exec(expression.slice(index).trimStart())
+    if (!match) {
+      continue
+    }
+    const leading = expression.slice(index).length - expression.slice(index).trimStart().length
+    const operatorIndex = index + leading
+    const before = expression[operatorIndex - 1]
+    if (before && /[\w$]/.test(before)) {
+      continue
+    }
+    return { index: operatorIndex, length: match[0].length }
   }
 
-  const bind = extractAttrValue(openTag, 'v-bind:is')
-  if (bind !== undefined) {
-    return { value: bind, static: false }
+  return undefined
+}
+
+function unquoteAttrValue(rawValue: string): string {
+  return (rawValue.startsWith('"') && rawValue.endsWith('"')) || (rawValue.startsWith('\'') && rawValue.endsWith('\''))
+    ? rawValue.slice(1, -1)
+    : rawValue
+}
+
+function attrValueStart(rawValue: string, rawValueStart: number): number {
+  return rawValueStart + (((rawValue.startsWith('"') && rawValue.endsWith('"')) || (rawValue.startsWith('\'') && rawValue.endsWith('\''))) ? 1 : 0)
+}
+
+function collectBindingIdentifiers(expression: string): string[] {
+  const names: string[] = []
+  const content = stripOuterParens(expression.trim())
+
+  for (let index = 0; index < content.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const identifier = readExpressionIdentifier(content, index)
+    if (!identifier) {
+      continue
+    }
+
+    const previous = previousNonWhitespace(content, identifier.start)
+    if (
+      previous?.char === '.'
+      || expressionKeywords.has(identifier.value)
+      || isObjectKeyLike(content, identifier.start, identifier.end)
+    ) {
+      index = identifier.end - 1
+      continue
+    }
+
+    names.push(identifier.value)
+    index = identifier.end - 1
   }
 
-  const staticValue = extractAttrValue(openTag, 'is')
-  return staticValue !== undefined ? { value: staticValue, static: true } : undefined
+  return [...new Set(names)]
+}
+
+function readForExpression(expression: string): { localNames: string[], sourceStart: number } | undefined {
+  const operator = findTopLevelForOperator(expression)
+  if (!operator) {
+    return undefined
+  }
+
+  return {
+    localNames: collectBindingIdentifiers(expression.slice(0, operator.index)),
+    sourceStart: operator.index + operator.length,
+  }
+}
+
+function isSlotScopeAttrName(rawName: string): boolean {
+  return rawName === 'slot-scope'
+    || rawName === 'scope'
+    || rawName === 'v-slot'
+    || rawName.startsWith('v-slot:')
+    || rawName.startsWith('#')
+}
+
+function extractLocalScopeNames(openTag: string): string[] {
+  const names: string[] = []
+  const pattern = /\s([#:@A-Za-z_][\w:.-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(openTag))) {
+    const rawName = match[1]
+    const rawValue = match[2]
+    if (!rawValue) {
+      continue
+    }
+
+    const value = unquoteAttrValue(rawValue)
+    if (rawName === 'v-for') {
+      names.push(...(readForExpression(value)?.localNames ?? []))
+      continue
+    }
+
+    if (isSlotScopeAttrName(rawName)) {
+      names.push(...collectBindingIdentifiers(value))
+    }
+  }
+
+  return [...new Set(names)]
+}
+
+function extractInstanceExpressionAttrValues(openTag: string, openStart: number): TemplateInstanceExpressionAttrValue[] {
+  const values: TemplateInstanceExpressionAttrValue[] = []
+  const pattern = /\s([:@A-Za-z_][\w:.-]*)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(openTag))) {
+    const rawName = match[1]
+    const rawValue = match[2]
+    if (!rawValue || !isInstanceExpressionAttrName(rawName)) {
+      continue
+    }
+
+    const rawValueStart = openStart + match.index + match[0].lastIndexOf(rawValue)
+    const value = unquoteAttrValue(rawValue)
+    const valueStart = attrValueStart(rawValue, rawValueStart)
+
+    if (rawName === 'v-for') {
+      const forExpression = readForExpression(value)
+      if (!forExpression) {
+        continue
+      }
+      const expressionStart = forExpression.sourceStart
+      values.push({
+        rawName,
+        value: value.slice(expressionStart),
+        start: valueStart + expressionStart,
+        localNames: forExpression.localNames,
+      })
+      continue
+    }
+
+    values.push({ rawName, value, start: valueStart })
+  }
+
+  return values
+}
+
+function previousNonWhitespace(content: string, index: number): { char: string, index: number } | undefined {
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    if (!/\s/.test(content[cursor])) {
+      return { char: content[cursor], index: cursor }
+    }
+  }
+  return undefined
+}
+
+function nextNonWhitespace(content: string, index: number): { char: string, index: number } | undefined {
+  for (let cursor = index; cursor < content.length; cursor += 1) {
+    if (!/\s/.test(content[cursor])) {
+      return { char: content[cursor], index: cursor }
+    }
+  }
+  return undefined
+}
+
+function readExpressionIdentifier(content: string, index: number): { value: string, start: number, end: number } | undefined {
+  const match = /^[A-Za-z_$][\w$]*/.exec(content.slice(index))
+  if (!match) {
+    return undefined
+  }
+  return { value: match[0], start: index, end: index + match[0].length }
+}
+
+function isObjectKeyLike(expression: string, identifierStart: number, identifierEnd: number): boolean {
+  const previous = previousNonWhitespace(expression, identifierStart)
+  const next = nextNonWhitespace(expression, identifierEnd)
+  return next?.char === ':' && (!previous || previous.char === '{' || previous.char === ',')
+}
+
+function shouldCollectInstanceMember(name: string, candidateNames?: ReadonlySet<string>): boolean {
+  return !candidateNames || candidateNames.has(name)
+}
+
+function parseTemplateExpressionInstanceMembers(expression: string, expressionStart: number, ignoredNames: ReadonlySet<string>, candidateNames?: ReadonlySet<string>): TemplateInstanceMemberUsage[] {
+  const members: TemplateInstanceMemberUsage[] = []
+
+  for (let index = 0; index < expression.length; index += 1) {
+    const skipped = skipStringCommentOrRegex(expression, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const identifier = readExpressionIdentifier(expression, index)
+    if (!identifier) {
+      continue
+    }
+
+    const previous = previousNonWhitespace(expression, identifier.start)
+    if (identifier.value === 'this') {
+      const dot = nextNonWhitespace(expression, identifier.end)
+      if (dot?.char === '.') {
+        const member = readExpressionIdentifier(expression, dot.index + 1)
+        if (member && !expressionKeywords.has(member.value) && shouldCollectInstanceMember(member.value, candidateNames)) {
+          members.push({
+            name: member.value,
+            span: { start: expressionStart + member.start, end: expressionStart + member.end },
+          })
+          index = member.end - 1
+          continue
+        }
+      }
+    }
+
+    if (
+      previous?.char === '.'
+      || expressionKeywords.has(identifier.value)
+      || ignoredNames.has(identifier.value)
+      || isObjectKeyLike(expression, identifier.start, identifier.end)
+      || !shouldCollectInstanceMember(identifier.value, candidateNames)
+    ) {
+      index = identifier.end - 1
+      continue
+    }
+
+    members.push({
+      name: identifier.value,
+      span: { start: expressionStart + identifier.start, end: expressionStart + identifier.end },
+    })
+    index = identifier.end - 1
+  }
+
+  return members
+}
+
+function withAdditionalLocalNames(base: ReadonlySet<string>, names: string[]): ReadonlySet<string> {
+  if (names.length === 0) {
+    return base
+  }
+
+  return new Set([...base, ...names])
+}
+
+function parseOpenTagInstanceMembers(openTag: string, openStart: number, activeLocalNames: ReadonlySet<string>, candidateNames?: ReadonlySet<string>): TemplateInstanceMemberUsage[] {
+  const attrs = extractInstanceExpressionAttrValues(openTag, openStart)
+  const localNames = attrs.flatMap((attr) => attr.localNames ?? [])
+  const openTagLocalNames = withAdditionalLocalNames(activeLocalNames, localNames)
+
+  return attrs.flatMap((attr) => parseTemplateExpressionInstanceMembers(
+    attr.value,
+    attr.start,
+    attr.rawName === 'v-for' ? activeLocalNames : openTagLocalNames,
+    candidateNames,
+  ))
+}
+
+function parseInterpolationInstanceMembers(content: string, templateStart: number, activeLocalNames: ReadonlySet<string>, candidateNames?: ReadonlySet<string>, start = 0, end = content.length): TemplateInstanceMemberUsage[] {
+  const members: TemplateInstanceMemberUsage[] = []
+  let cursor = start
+  let commentEnd = -1
+
+  while (cursor < end) {
+    const commentStart = content.indexOf('<!--', cursor)
+    const interpolationStart = content.indexOf('{{', cursor)
+    if (interpolationStart === -1 || interpolationStart >= end) {
+      break
+    }
+    if (commentStart !== -1 && commentStart < interpolationStart) {
+      commentEnd = findHtmlCommentEnd(content, commentStart)
+      cursor = commentEnd
+      continue
+    }
+    if (interpolationStart < commentEnd) {
+      cursor = commentEnd
+      continue
+    }
+
+    const interpolationEnd = content.indexOf('}}', interpolationStart + 2)
+    if (interpolationEnd === -1 || interpolationEnd > end) {
+      break
+    }
+
+    const expressionStart = interpolationStart + 2
+    members.push(...parseTemplateExpressionInstanceMembers(
+      content.slice(expressionStart, interpolationEnd),
+      templateStart + expressionStart,
+      activeLocalNames,
+      candidateNames,
+    ))
+    cursor = interpolationEnd + 2
+  }
+
+  return members
+}
+
+function uniqueInstanceMembers(members: TemplateInstanceMemberUsage[]): TemplateInstanceMemberUsage[] {
+  const seen = new Set<string>()
+  const results: TemplateInstanceMemberUsage[] = []
+  for (const member of members) {
+    const key = `${member.name}\0${member.span.start}\0${member.span.end}`
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    results.push(member)
+  }
+  return results.sort((a, b) => a.span.start - b.span.start)
+}
+
+function extractDynamicIsExpression(openTag: string, openStart: number): DynamicComponentExpression | undefined {
+  const pattern = /\s(:is|v-bind:is|is)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/g
+  let match: RegExpExecArray | null
+
+  while ((match = pattern.exec(openTag))) {
+    const rawName = match[1]
+    const rawValue = match[2]
+    if (!rawValue) {
+      continue
+    }
+
+    const rawValueStart = openStart + match.index + match[0].lastIndexOf(rawValue)
+    const quoted = (rawValue.startsWith('"') && rawValue.endsWith('"')) || (rawValue.startsWith('\'') && rawValue.endsWith('\''))
+    const value = quoted ? rawValue.slice(1, -1) : rawValue
+    const valueStart = rawValueStart + (quoted ? 1 : 0)
+    return {
+      value,
+      static: rawName === 'is',
+      span: { start: valueStart, end: valueStart + value.length },
+    }
+  }
+
+  return undefined
 }
 
 function findOpenTagEnd(template: string, openStart: number): number {
@@ -533,17 +988,51 @@ function extractComponentSlotUsages(template: string, templateStart: number, raw
   return uniqueSlotUsages(slots)
 }
 
-export function parseTemplate(content: string, templateStart: number, registeredTags: string[], staticComponentNames: StaticComponentNameBinding[] = [], eventBusNames: readonly string[] = [], vue3ModelEvents = false): TemplateIndex {
+export function parseTemplate(content: string, templateStart: number, registeredTags: string[], staticComponentNames: StaticComponentNameBinding[] = [], eventBusNames: readonly string[] = [], vue3ModelEvents = false, instanceMemberNames?: ReadonlySet<string>): TemplateIndex {
   const uniqueTags = new Set(registeredTags.map((tag) => toKebabCase(tag)))
   const components: TemplateComponentUsage[] = []
   const emits: EmitInfo[] = []
   const eventBusCalls: EventBusCall[] = []
   const slotDefinitions: SlotInfo[] = []
+  const instanceMembers: TemplateInstanceMemberUsage[] = []
+  const shouldIndexInstanceMembers = instanceMemberNames === undefined || instanceMemberNames.size > 0
+  const tagStack: Array<{ tag: string, localNames: string[] }> = []
+  const activeLocalNames = new Set<string>()
 
-  const pattern = /<([A-Za-z][\w-]*)(?=\s|>|\/)/g
+  const pattern = /<\/?([A-Za-z][\w-]*)(?=\s|>|\/)/g
   let match: RegExpExecArray | null
   let nextCommentStart = content.indexOf('<!--')
   let commentEnd = -1
+  let textCursor = 0
+
+  function addLocalNames(names: string[]): void {
+    for (const name of names) {
+      activeLocalNames.add(name)
+    }
+  }
+
+  function rebuildActiveLocalNames(): void {
+    activeLocalNames.clear()
+    for (const scope of tagStack) {
+      addLocalNames(scope.localNames)
+    }
+  }
+
+  function popTagScope(tag: string): void {
+    let scopeIndex = -1
+    for (let index = tagStack.length - 1; index >= 0; index -= 1) {
+      if (tagStack[index].tag === tag) {
+        scopeIndex = index
+        break
+      }
+    }
+    if (scopeIndex === -1) {
+      return
+    }
+
+    tagStack.splice(scopeIndex)
+    rebuildActiveLocalNames()
+  }
 
   while ((match = pattern.exec(content))) {
     while (nextCommentStart !== -1 && nextCommentStart < match.index && match.index >= commentEnd) {
@@ -556,41 +1045,73 @@ export function parseTemplate(content: string, templateStart: number, registered
 
     const rawTag = match[1]
     const openEnd = findOpenTagEnd(content, match.index)
+    if (shouldIndexInstanceMembers && textCursor < match.index) {
+      instanceMembers.push(...parseInterpolationInstanceMembers(content, templateStart, activeLocalNames, instanceMemberNames, textCursor, match.index))
+    }
+
+    if (content[match.index + 1] === '/') {
+      if (shouldIndexInstanceMembers) {
+        popTagScope(rawTag)
+      }
+      textCursor = openEnd
+      pattern.lastIndex = openEnd
+      continue
+    }
+
     const openTag = content.slice(match.index, openEnd)
+    const localNames = shouldIndexInstanceMembers ? extractLocalScopeNames(openTag) : []
+    if (shouldIndexInstanceMembers) {
+      instanceMembers.push(...parseOpenTagInstanceMembers(openTag, templateStart + match.index, activeLocalNames, instanceMemberNames))
+    }
     if (rawTag === 'slot') {
       slotDefinitions.push(extractSlotDefinition(openTag, templateStart + match.index))
-      continue
-    }
-    emits.push(...parseTemplateEmits(openTag, templateStart + match.index))
-    eventBusCalls.push(...parseTemplateEventBusCalls(openTag, templateStart + match.index, eventBusNames))
-    const dynamicTags = isDynamicComponentTag(rawTag)
-      ? resolveDynamicComponentTags(extractDynamicIsExpression(openTag), staticComponentNames, uniqueTags)
-      : undefined
+    } else {
+      emits.push(...parseTemplateEmits(openTag, templateStart + match.index))
+      eventBusCalls.push(...parseTemplateEventBusCalls(openTag, templateStart + match.index, eventBusNames))
+      const dynamicExpression = isDynamicComponentTag(rawTag)
+        ? extractDynamicIsExpression(openTag, templateStart + match.index)
+        : undefined
+      const dynamicTags = dynamicExpression
+        ? resolveDynamicComponentTags(dynamicExpression, staticComponentNames, uniqueTags)
+        : undefined
 
-    if (!dynamicTags && !uniqueTags.has(toKebabCase(rawTag)) && !isLikelyComponentTag(rawTag)) {
-      continue
+      if (dynamicTags || uniqueTags.has(toKebabCase(rawTag)) || isLikelyComponentTag(rawTag)) {
+        const attrs = extractAttrs(openTag, templateStart + match.index, vue3ModelEvents)
+        const binds = extractBindUsages(openTag, templateStart + match.index)
+        const ons = extractOnUsages(openTag, templateStart + match.index)
+        const slots = extractComponentSlotUsages(content, templateStart, rawTag, openTag, match.index, openEnd, uniqueTags)
+        components.push({
+          tag: rawTag,
+          dynamicTags,
+          dynamicExpressionSpan: dynamicExpression?.span,
+          span: {
+            start: templateStart + match.index + 1,
+            end: templateStart + match.index + 1 + rawTag.length,
+          },
+          attrs,
+          binds,
+          ons,
+          slots,
+          forwardsAttrs: forwardsAttrs(openTag),
+          forwardsListeners: forwardsListeners(openTag),
+        })
+      }
     }
 
-    const attrs = extractAttrs(openTag, templateStart + match.index, vue3ModelEvents)
-    const binds = extractBindUsages(openTag, templateStart + match.index)
-    const slots = extractComponentSlotUsages(content, templateStart, rawTag, openTag, match.index, openEnd, uniqueTags)
-    components.push({
-      tag: rawTag,
-      dynamicTags,
-      span: {
-        start: templateStart + match.index + 1,
-        end: templateStart + match.index + 1 + rawTag.length,
-      },
-      attrs,
-      binds,
-      slots,
-      forwardsAttrs: forwardsAttrs(openTag),
-      forwardsListeners: forwardsListeners(openTag),
-    })
+    textCursor = openEnd
+    pattern.lastIndex = openEnd
+    if (shouldIndexInstanceMembers && !isSelfClosingOpenTag(openTag) && !voidHtmlTags.has(rawTag.toLowerCase())) {
+      tagStack.push({ tag: rawTag, localNames })
+      addLocalNames(localNames)
+    }
+  }
+
+  if (shouldIndexInstanceMembers && textCursor < content.length) {
+    instanceMembers.push(...parseInterpolationInstanceMembers(content, templateStart, activeLocalNames, instanceMemberNames, textCursor))
   }
 
   components.sort((a, b) => a.span.start - b.span.start)
-  return { components, emits, eventBusCalls, slots: slotDefinitions }
+  return { components, emits, eventBusCalls, slots: slotDefinitions, instanceMembers: uniqueInstanceMembers(instanceMembers) }
 }
 
 function isDynamicComponentTag(tag: string): boolean {
@@ -679,7 +1200,13 @@ function resolveBindingCandidates(binding: StaticComponentNameBinding, staticCom
   visited.add(binding.variableName)
   try {
     if (binding.tags.length > 0 && (binding.kind === 'literal' || binding.kind === 'map' || binding.kind === 'array')) {
-      return binding.tags
+      return uniqueStrings([
+        ...binding.tags,
+        ...binding.tags.flatMap((tag) => {
+          const nested = staticComponentNames.find((item) => item.variableName === tag)
+          return nested ? resolveBindingCandidates(nested, staticComponentNames, registeredTags, visited) : []
+        }),
+      ])
     }
     if (!binding.expression) {
       return binding.tags

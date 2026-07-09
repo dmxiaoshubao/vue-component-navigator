@@ -1,7 +1,7 @@
 import * as vscode from 'vscode'
 import type { SourceLocation, TextSpan, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedInjectUsages, findIndexedPropUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findIndexedTemplatePropUsages, findInject, findProp, findProvideAtOffset, findResolvedRefComponents, hasRegisteredComponent } from '../indexer/relationResolver'
+import { findEmit, findIndexedInjectUsages, findIndexedPropUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findIndexedTemplatePropUsages, findInject, findProp, findProvideAtOffset, findRegisteredComponentRegistration, findResolvedRefComponents, hasRegisteredComponent } from '../indexer/relationResolver'
 import { containsOffsetStrict, createLineStarts, positionToOffset, spanToRange } from '../utils/position'
 
 function toRange(file: VueFileIndex, span: TextSpan): vscode.Range {
@@ -50,6 +50,12 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
 
   provideDefinition(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.Definition> {
     const vueDocument = isVueDocument(document)
+    if (document.uri.scheme !== 'file') {
+      return undefined
+    }
+    if (vueDocument && !this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
+      return undefined
+    }
     if (!vueDocument && !this.index.hasIndexedDocumentContext(document.uri.fsPath)) {
       return undefined
     }
@@ -57,7 +63,7 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
     const content = document.getText()
     const file = vueDocument
       ? this.index.syncContent(document.uri.fsPath, content)
-      : this.index.getFile(document.uri.fsPath)
+      : this.index.syncDocumentContent(document.uri.fsPath, content, document.version) ?? this.index.getFile(document.uri.fsPath)
     const offset = vueDocument
       ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
       : positionToOffset(createLineStarts(content), { line: position.line, character: position.character })
@@ -112,7 +118,12 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
         continue
       }
 
-      if (containsOffsetStrict(component.span, offset) && !hasRegisteredComponent(file, component.tag)) {
+      const isDynamicComponentExpression = component.dynamicExpressionSpan
+        ? containsOffsetStrict(component.dynamicExpressionSpan, offset)
+        : false
+      const registeredComponent = findRegisteredComponentRegistration(file, component.tag)
+      const shouldProvideComponentDefinition = !hasRegisteredComponent(file, component.tag) || Boolean(registeredComponent?.sourceLocation)
+      if ((containsOffsetStrict(component.span, offset) || isDynamicComponentExpression) && shouldProvideComponentDefinition) {
         return locationResult(uniqueLocations(children.map((child) => toLocation(child, { start: 0, end: 0 }))))
       }
 
@@ -145,6 +156,11 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
         })
         return locationResult(uniqueLocations(definitions))
       }
+    }
+
+    const templateMember = this.index.findTemplateInstanceMemberAtOffset(file, offset)
+    if (templateMember) {
+      return toLocation(file, templateMember.member.span, templateMember.member.sourceLocation)
     }
 
     for (const emit of file.scriptIndex.emits) {
@@ -230,6 +246,11 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
     const injectUsages = this.index.findInjectUsagesFromProvideSource(sourceUri, offset)
     if (injectUsages.length > 0) {
       return injectUsages.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
+    }
+
+    const mixinConsumers = this.index.findMixinConsumersFromSource(sourceUri, offset)
+    if (mixinConsumers.length > 0) {
+      return mixinConsumers.map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
     }
 
     return undefined

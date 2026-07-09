@@ -167,10 +167,128 @@ describe('Vue providers', () => {
     expect(hoverText(hover)).toContain('open(source)')
     expect(hoverText(hover)).not.toContain('open(source) {')
     expect(hoverText(hover)).not.toContain('Child.methods.open')
-    expect(hoverText(hover)).toContain('Definition: [Child.vue]')
-    expect(hoverText(hover)).not.toContain('Definition: [Child.vue:')
+    expect(hoverText(hover)).toContain('Definition: [Child.vue:21]')
     expect(hoverText(hover)).toContain('file://')
     expect(hover.contents.isTrusted).toBe(false)
+  })
+
+  it('provider 不会把 workspace 外 Vue 文件同步进索引', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-outside-workspace-'))
+    const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-outside-file-'))
+    const outsideUri = path.join(outsideRoot, 'Outside.vue')
+    const content = `
+<template><div /></template>
+<script>
+export default { props: { title: String } }
+</script>
+`
+    localIndex.setWorkspaceVueVersion(root, 2)
+
+    const document = new TestDocument(outsideUri, content) as any
+    const provider = new VueDefinitionProvider(localIndex)
+
+    expect(provider.provideDefinition(document, positionAt(content, content.indexOf('title') + 1))).toBeUndefined()
+    expect(localIndex.getFile(outsideUri)).toBeUndefined()
+  })
+
+  it('provider 在没有 workspace root 时不会同步 Vue 文件', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-empty-roots-'))
+    const uri = path.join(root, 'Loose.vue')
+    const content = `
+<template><div /></template>
+<script>
+export default { props: { title: String } }
+</script>
+`
+    const document = new TestDocument(uri, content) as any
+    const provider = new VueDefinitionProvider(localIndex)
+
+    expect(provider.provideDefinition(document, positionAt(content, content.indexOf('title') + 1))).toBeUndefined()
+    expect(localIndex.getFile(uri)).toBeUndefined()
+  })
+
+  it('Vue2 普通静态 ref 不会仅凭 import 解析未注册组件', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-unregistered-static-ref-'))
+    const childUri = path.join(root, 'src/UnregisteredChild.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const childContent = `
+<template><div /></template>
+<script>
+export default {
+  methods: {
+    open() {},
+  },
+}
+</script>
+`
+    const parentContent = `
+<template>
+  <UnregisteredChild ref="child" />
+</template>
+<script>
+import UnregisteredChild from './UnregisteredChild.vue'
+
+export default {
+  methods: {
+    callChild() {
+      this.$refs.child.open()
+    },
+  },
+}
+</script>
+`
+    localIndex.setWorkspaceVueVersion(root, 2)
+    localIndex.indexContent(childUri, childContent)
+    localIndex.indexContent(parentUri, parentContent)
+    const document = new TestDocument(parentUri, parentContent) as any
+    const provider = new VueDefinitionProvider(localIndex)
+
+    expect(provider.provideDefinition(document, positionAt(parentContent, parentContent.indexOf('open()') + 1))).toBeUndefined()
+  })
+
+  it('非 Vue 源文件未保存内容会同步刷新 Vue3 反向关系', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-unsaved-ts-source-'))
+    const hookUri = path.join(root, 'src/hooks/use-verify.ts')
+    const pageUri = path.join(root, 'src/Page.vue')
+    const initialHookContent = `
+export function useVerify() {
+  return {}
+}
+`
+    const nextHookContent = `
+export function useVerify() {
+  const runVerifyWithCode = () => true
+  return { runVerifyWithCode }
+}
+`
+    const pageContent = `
+<template><div /></template>
+<script setup lang="ts">
+import { useVerify } from './hooks/use-verify'
+const { runVerifyWithCode } = useVerify()
+runVerifyWithCode()
+</script>
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(hookUri, initialHookContent)
+    writeText(pageUri, pageContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hookDocument = new TestDocument(hookUri, nextHookContent, 'typescript') as any
+
+    const references = referenceProvider.provideReferences(
+      hookDocument,
+      positionAt(nextHookContent, nextHookContent.indexOf('runVerifyWithCode =') + 1),
+    ) as any[]
+
+    expect(references).toHaveLength(2)
+    expect(references.every((reference) => reference.uri.fsPath === pageUri)).toBe(true)
   })
 
   it('普通 JS/TS 没有补全语境时不读取全文', () => {
@@ -239,6 +357,148 @@ this.$eventBus.$emit(
     const completions = completionProvider.provideCompletionItems(document, positionAt(content, content.indexOf('this.$refs') + 'this.$refs'.length)) as any[]
 
     expect(completions.map((item) => item.label)).toEqual(['child'])
+  })
+
+  it('Vue2 wrapper 通过 v-bind $attrs 透传深层 props 时提供模板 prop 补全', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-forwarded-prop-completion-'))
+    localIndex.setWorkspaceVueVersion(root, 2)
+    const childUri = path.join(root, 'src/Child.vue')
+    const middleUri = path.join(root, 'src/Middle.vue')
+    const outerUri = path.join(root, 'src/Outer.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const childContent = `
+<template><div /></template>
+<script>
+export default {
+  name: 'Child',
+  props: {
+    inheritedTitle: String,
+    operateType: Number,
+    statusText: String,
+    sizeType: String,
+    displayName: String,
+  },
+}
+</script>
+`
+    const middleContent = `
+<template>
+  <Child v-bind="$attrs" />
+</template>
+<script>
+import Child from './Child.vue'
+export default { name: 'Middle', components: { Child } }
+</script>
+`
+    const outerContent = `
+<template>
+  <Middle v-bind="$attrs" />
+</template>
+<script>
+import Middle from './Middle.vue'
+export default {
+  name: 'Outer',
+  components: { Middle },
+  props: {
+    inheritedTitle: String,
+  },
+}
+</script>
+`
+    const parentContent = `
+<template>
+  <Outer : />
+</template>
+<script>
+import Outer from './Outer.vue'
+export default { components: { Outer } }
+</script>
+`
+    const parentBindContent = `
+<template>
+  <Outer v-bind:o />
+</template>
+<script>
+import Outer from './Outer.vue'
+export default { components: { Outer } }
+</script>
+`
+    const parentOpenTagContent = `
+<template>
+  <Outer :
+</template>
+<script>
+import Outer from './Outer.vue'
+export default { components: { Outer } }
+</script>
+`
+    const parentValueContent = `
+<template>
+  <Outer title=":" />
+</template>
+<script>
+import Outer from './Outer.vue'
+export default { components: { Outer } }
+</script>
+`
+    const parentExistingContent = `
+<template>
+  <Outer operateType="1" v-bind:status-text="status" :size-type.sync="size" : />
+</template>
+<script>
+import Outer from './Outer.vue'
+export default { components: { Outer } }
+</script>
+`
+    writeText(childUri, childContent)
+    writeText(middleUri, middleContent)
+    writeText(outerUri, outerContent)
+    localIndex.indexContent(childUri, childContent)
+    localIndex.indexContent(middleUri, middleContent)
+    localIndex.indexContent(outerUri, outerContent)
+    const completionProvider = new VueCompletionProvider(localIndex)
+    const document = new TestDocument(parentUri, parentContent) as any
+
+    const completions = completionProvider.provideCompletionItems(
+      document,
+      positionAt(parentContent, parentContent.indexOf('<Outer :') + '<Outer :'.length),
+    ) as any[]
+    const bindDocument = new TestDocument(parentUri, parentBindContent) as any
+    const bindCompletions = completionProvider.provideCompletionItems(
+      bindDocument,
+      positionAt(parentBindContent, parentBindContent.indexOf('v-bind:o') + 'v-bind:o'.length),
+    ) as any[]
+    const openTagDocument = new TestDocument(parentUri, parentOpenTagContent) as any
+    const openTagCompletions = completionProvider.provideCompletionItems(
+      openTagDocument,
+      positionAt(parentOpenTagContent, parentOpenTagContent.indexOf('<Outer :') + '<Outer :'.length),
+    ) as any[]
+    const valueDocument = new TestDocument(parentUri, parentValueContent) as any
+    const valueCompletions = completionProvider.provideCompletionItems(
+      valueDocument,
+      positionAt(parentValueContent, parentValueContent.indexOf('title=":"') + 'title=":'.length),
+    )
+    const existingDocument = new TestDocument(parentUri, parentExistingContent) as any
+    const existingCompletions = completionProvider.provideCompletionItems(
+      existingDocument,
+      positionAt(parentExistingContent, parentExistingContent.indexOf(': />') + 1),
+    ) as any[]
+
+    expect(completions.map((item) => item.label)).toContain('inherited-title')
+    expect(completions.map((item) => item.label)).toContain('operate-type')
+    expect(completions.filter((item) => item.label === 'inherited-title')).toHaveLength(1)
+    expect(completions.find((item) => item.label === 'inherited-title')?.detail).toBe('Outer.props.inheritedTitle')
+    expect(completions.find((item) => item.label === 'inherited-title')?.insertText).toBe(':inherited-title')
+    expect(completions.find((item) => item.label === 'operate-type')?.detail).toBe('Child.props.operateType')
+    expect(completions.find((item) => item.label === 'operate-type')?.insertText).toBe(':operate-type')
+    expect(bindCompletions.find((item) => item.label === 'operate-type')?.insertText).toBe('v-bind:operate-type')
+    expect(openTagCompletions.find((item) => item.label === 'operate-type')?.insertText).toBe(':operate-type')
+    expect(valueCompletions).toBeUndefined()
+    expect(existingCompletions.map((item) => item.label)).not.toContain('operate-type')
+    expect(existingCompletions.map((item) => item.label)).not.toContain('status-text')
+    expect(existingCompletions.map((item) => item.label)).not.toContain('size-type')
+    expect(existingCompletions.map((item) => item.label)).toContain('display-name')
   })
 
   it('$refs 根对象可选链补全模板 ref 名称', () => {
@@ -310,7 +570,7 @@ export default {
     expect(completions.map((item) => item.label)).toEqual(['open', 'close', 'load', 'notify'])
     expect(completions.every((item) => item.sortText?.startsWith('\u0000\u0000\u0000'))).toBe(true)
     expect(hoverText(hover)).toContain('async load()')
-    expect(hoverText(hover)).toContain('Definition: [Child.vue]')
+    expect(hoverText(hover)).toContain('Definition: [Child.vue:27]')
   })
 
   it('静态 mixin 中的定义和 $refs 引用 provider 可用', () => {
@@ -640,7 +900,7 @@ export default {
     expect(completions.map((item) => item.label)).toEqual(['validate', 'resetFields', 'clearValidate'])
     expect(completions.find((item) => item.label === 'validate')?.detail).toBe('ElForm.methods.validate')
     expect(hoverText(hover)).toContain('Focus the Input component')
-    expect(hoverText(hover)).toContain('Definition: [input.d.ts]')
+    expect(hoverText(hover)).toContain('Definition: [input.d.ts:9]')
   })
 
   it('Vant ref 方法定义和补全可用', async () => {
@@ -683,6 +943,7 @@ export default {
 
   it('全局组件晚于父组件索引时仍能从 prop 跳转', async () => {
     const localIndex = new WorkspaceIndex()
+    localIndex.setWorkspaceVueVersion(fixtureRoot, 2)
     const parentUri = path.join(fixtureRoot, 'LateGlobalParent.vue')
     const childUri = path.join(fixtureRoot, 'LateGlobalChild.vue')
     const globalUri = path.join(fixtureRoot, 'late-global.js')
@@ -737,6 +998,162 @@ Vue.component('LateGlobalChild', LateGlobalChild)
     const definition = definitionProvider.provideDefinition(document, positionAt(parentContent, parentContent.indexOf('Child') + 1))
 
     expect(definition).toBeUndefined()
+  })
+
+  it('mixin 注册的局部组件标签名可跳转到组件文件', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-mixin-component-tag-definition-'))
+    localIndex.setWorkspaceVueVersion(root, 2)
+    const childUri = path.join(root, 'src/components/business-channel-dialog/index.vue')
+    const mixinUri = path.join(root, 'src/pages/home/mixin.js')
+    const parentUri = path.join(root, 'src/pages/home/big-screen/index.vue')
+    const childContent = `
+<template><div /></template>
+<script>
+export default { name: 'business-channel-dialog' }
+</script>
+`
+    const mixinContent = `
+import BusinessChannelDialog from '../../components/business-channel-dialog/index.vue'
+
+export default {
+  components: {
+    BusinessChannelDialog,
+  },
+}
+`
+    const parentContent = `
+<template>
+  <business-channel-dialog v-if="channelVisible" />
+</template>
+<script>
+import homeMixin from '../mixin'
+
+export default {
+  mixins: [homeMixin],
+  data() {
+    return {
+      channelVisible: true,
+    }
+  },
+}
+</script>
+`
+    writeText(childUri, childContent)
+    writeText(mixinUri, mixinContent)
+    writeText(parentUri, parentContent)
+    localIndex.indexContent(childUri, childContent)
+    localIndex.indexContent(parentUri, parentContent)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const document = new TestDocument(parentUri, parentContent) as any
+    const tagPosition = positionAt(parentContent, parentContent.indexOf('business-channel-dialog') + 1)
+
+    const definition = definitionProvider.provideDefinition(document, tagPosition) as any
+    const hover = hoverProvider.provideHover(document, tagPosition) as any
+
+    expect(definition.uri.fsPath).toBe(childUri)
+    expect(hoverText(hover)).toContain('Definition: [business-channel-dialog/index.vue:')
+  })
+
+  it('template 实例成员可跳转到当前组件或 mixin 定义并展示 JSDoc', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-template-instance-member-'))
+    localIndex.setWorkspaceVueVersion(root, 2)
+    const mixinUri = path.join(root, 'src/pages/home/mixin.js')
+    const parentUri = path.join(root, 'src/pages/home/big-screen/index.vue')
+    const screenSaverUri = path.join(root, 'src/pages/home/components/screen-saver-dialog.vue')
+    const mixinContent = `
+import ScreenSaverDialog from './components/screen-saver-dialog.vue'
+
+export default {
+  components: {
+    ScreenSaverDialog,
+  },
+  computed: {
+    // 不支持普通行注释 hover
+    screenBannerList() {
+      return []
+    },
+  },
+}
+`
+    const parentContent = `
+<template>
+  <section>
+    <div :class="buttonFormatArr.length > 2 ? 'main' : 'main-min'">
+      <button v-for="item in buttonFormatArr" :key="item.id" @click="onBtnHandle(item.id)">
+        {{ localCount }} {{ item.name }}
+      </button>
+    </div>
+    <ScreenSaverDialog :bannerList="screenBannerList" v-slot="{ slotItem }">
+      {{ slotItem.title }}
+    </ScreenSaverDialog>
+  </section>
+</template>
+<script>
+import homeMixin from '../mixin'
+
+export default {
+  mixins: [homeMixin],
+  data() {
+    return {
+      /** Local count docs */
+      localCount: 1,
+      /** Instance item docs */
+      item: null,
+      /** Instance slot item docs */
+      slotItem: null,
+    }
+  },
+  computed: {
+    /** Button format docs */
+    buttonFormatArr() {
+      return []
+    },
+  },
+  methods: {
+    /** Button click docs */
+    onBtnHandle(id) {
+      return id
+    },
+  },
+}
+</script>
+`
+    writeText(mixinUri, mixinContent)
+    writeText(parentUri, parentContent)
+    writeText(screenSaverUri, '<template><div /></template><script>export default { name: "ScreenSaverDialog" }</script>')
+    localIndex.indexContent(screenSaverUri, fs.readFileSync(screenSaverUri, 'utf8'))
+    localIndex.indexContent(parentUri, parentContent)
+
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const document = new TestDocument(parentUri, parentContent) as any
+
+    const screenDefinition = definitionProvider.provideDefinition(document, positionAt(parentContent, parentContent.indexOf('screenBannerList') + 1)) as any
+    const buttonDefinition = definitionProvider.provideDefinition(document, positionAt(parentContent, parentContent.indexOf('buttonFormatArr.length') + 1)) as any
+    const buttonHover = hoverProvider.provideHover(document, positionAt(parentContent, parentContent.indexOf('buttonFormatArr.length') + 1)) as any
+    const dataHover = hoverProvider.provideHover(document, positionAt(parentContent, parentContent.indexOf('localCount') + 1)) as any
+    const methodHover = hoverProvider.provideHover(document, positionAt(parentContent, parentContent.indexOf('onBtnHandle') + 1)) as any
+    const screenHover = hoverProvider.provideHover(document, positionAt(parentContent, parentContent.indexOf('screenBannerList') + 1)) as any
+    const forItemDefinition = definitionProvider.provideDefinition(document, positionAt(parentContent, parentContent.indexOf('item.id') + 1)) as any
+    const nestedForItemHover = hoverProvider.provideHover(document, positionAt(parentContent, parentContent.indexOf('item.name') + 1)) as any
+    const slotItemHover = hoverProvider.provideHover(document, positionAt(parentContent, parentContent.indexOf('slotItem.title') + 1)) as any
+
+    expect(screenDefinition.uri.fsPath).toBe(mixinUri)
+    expect(buttonDefinition.uri.fsPath).toBe(parentUri)
+    expect(hoverText(buttonHover)).toContain('Button format docs')
+    expect(hoverText(dataHover)).toContain('Local count docs')
+    expect(hoverText(methodHover)).toContain('Button click docs')
+    expect(hoverText(buttonHover)).not.toContain('buttonFormatArr()')
+    expect(hoverText(dataHover)).not.toContain('localCount: 1')
+    expect(hoverText(methodHover)).not.toContain('onBtnHandle(id)')
+    expect(hoverText(screenHover)).not.toContain('不支持普通行注释 hover')
+    expect(hoverText(screenHover)).not.toContain('screenBannerList()')
+    expect(forItemDefinition).toBeUndefined()
+    expect(nestedForItemHover).toBeUndefined()
+    expect(slotItemHover).toBeUndefined()
   })
 
   it('默认 slot 使用不抢占嵌套局部组件标签名', () => {
@@ -807,8 +1224,7 @@ export default { components: { Child, Nested } }
 
     expect(definition.uri.fsPath.endsWith('Child.vue')).toBe(true)
     expect(hoverText(hover)).toContain('title: String')
-    expect(hoverText(hover)).toContain('Definition: [Child.vue]')
-    expect(hoverText(hover)).not.toContain('Definition: [Child.vue:')
+    expect(hoverText(hover)).toContain('Definition: [Child.vue:9]')
     expect(hoverText(hover)).toContain('file://')
     expect(hover.contents.isTrusted).toBe(false)
     expect(missing).toBeUndefined()
@@ -850,15 +1266,15 @@ export default { components: { Child, Nested } }
     expect(hoverText(propHover).startsWith('*@description* — Source image URL.')).toBe(true)
     expect(hoverText(propHover)).toContain("originUrl: {\n  type: String,")
     expect(hoverText(propHover)).toContain('default')
-    expect(hoverText(propHover)).toContain('Definition: [AliasChild.vue]')
+    expect(hoverText(propHover)).toContain('Definition: [AliasChild.vue:12]')
     expect(hoverText(propHover)).not.toContain('Definition: [src/components/AliasChild.vue]')
     expect(propHover.contents.isTrusted).toBe(false)
     expect(parentEventHover).toBeDefined()
-    expect(hoverText(parentEventHover)).toContain('Definition: [AliasChild.vue]')
+    expect(hoverText(parentEventHover)).toContain('Definition: [AliasChild.vue:19]')
     expect(hoverText(parentEventHover)).not.toContain('Definition: [src/components/AliasChild.vue]')
     expect(hoverText(parentEventHover)).not.toContain('Used by 1 listener')
     expect(parentEventHover.contents.isTrusted).toBe(false)
-    expect(hoverText(eventHover)).not.toContain('Definition: [AliasChild.vue]')
+    expect(hoverText(eventHover)).not.toContain('Definition: [AliasChild.vue:')
     expect(hoverText(eventHover)).toContain('Used by 1 listener')
     expect(hoverText(eventHover)).not.toContain('AliasChild emits onLoadSuccess')
     expect(hoverText(eventHover)).toContain('[Parent.vue')
@@ -874,7 +1290,7 @@ export default { components: { Child, Nested } }
 
     const hover = hoverProvider.provideHover(document, positionAt(parentContent, originOffset)) as any
 
-    expect(hoverText(hover)).toContain('Definition: [AliasChild.vue]')
+    expect(hoverText(hover)).toContain('Definition: [AliasChild.vue:12]')
     expect(hoverText(hover)).not.toContain('Definition: [src/components/AliasChild.vue]')
     expect(hoverText(hover)).toContain('file://')
   })
@@ -923,6 +1339,79 @@ export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
     expect(hoverText(hover)).not.toContain('- [pages/admin/marketing/red-packet/index.vue')
   })
 
+  it('Vue2 .sync 使用会作为 update 事件的反向引用', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-sync-event-usage-'))
+    const childUri = path.join(root, 'BusinessSwitchTakeCoinsDialog.vue')
+    const parentUri = path.join(root, 'Parent.vue')
+    const childContent = `
+<template><div /></template>
+<script>
+export default {
+  name: 'BusinessSwitchTakeCoinsDialog',
+  props: {
+    visible: Boolean,
+    userId: String,
+  },
+  computed: {
+    dialogVisible: {
+      set(val) {
+        this.$emit('update:visible', val)
+      },
+    },
+  },
+  methods: {
+    updateUser(val) {
+      this.$emit('update:userId', val)
+    },
+  },
+}
+</script>
+`
+    const parentContent = `
+<template>
+  <BusinessSwitchTakeCoinsDialog :visible.sync="switchTakeCoinsDialogVisible" :user-id.sync="userId" />
+</template>
+<script>
+import BusinessSwitchTakeCoinsDialog from './BusinessSwitchTakeCoinsDialog.vue'
+export default {
+  components: { BusinessSwitchTakeCoinsDialog },
+  data() {
+    return {
+      switchTakeCoinsDialogVisible: false,
+      userId: '1',
+    }
+  },
+}
+</script>
+`
+    localIndex.setWorkspaceVueVersion(root, 2)
+    localIndex.indexContent(childUri, childContent)
+    localIndex.indexContent(parentUri, parentContent)
+    const childDocument = new TestDocument(childUri, childContent) as any
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const eventPosition = positionAt(childContent, childContent.indexOf("'update:visible'") + 2)
+    const camelEventPosition = positionAt(childContent, childContent.indexOf("'update:userId'") + 2)
+    const propPosition = positionAt(childContent, childContent.indexOf('visible: Boolean') + 1)
+
+    const definitions = asArray(definitionProvider.provideDefinition(childDocument, eventPosition) as any)
+    const references = referenceProvider.provideReferences(childDocument, eventPosition) as any[]
+    const camelDefinitions = asArray(definitionProvider.provideDefinition(childDocument, camelEventPosition) as any)
+    const eventHover = hoverProvider.provideHover(childDocument, eventPosition) as any
+    const camelEventHover = hoverProvider.provideHover(childDocument, camelEventPosition) as any
+    const propHover = hoverProvider.provideHover(childDocument, propPosition) as any
+
+    expect(definitions.map((item) => item.uri.fsPath)).toEqual([parentUri])
+    expect(references.map((item) => item.uri.fsPath)).toEqual([parentUri])
+    expect(camelDefinitions.map((item) => item.uri.fsPath)).toEqual([parentUri])
+    expect(hoverText(eventHover)).toContain('Used by 1 listener')
+    expect(hoverText(eventHover)).toContain('Parent.vue')
+    expect(hoverText(camelEventHover)).toContain('Used by 1 listener')
+    expect(hoverText(propHover)).toContain('Used by 1 prop usage')
+  })
+
   it('prop 定义悬浮展示模板使用位置', () => {
     const content = readFixture('Child.vue')
     const document = new TestDocument(path.join(fixtureRoot, 'Child.vue'), content) as any
@@ -955,6 +1444,7 @@ export default { components: { NestedEmitChild }, methods: { ${handler}() {} } }
   it('Vue2 slot 定义和使用的 definition、hover、reference 可用', () => {
     const localIndex = new WorkspaceIndex()
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-slot-providers-'))
+    localIndex.setWorkspaceVueVersion(root, 2)
     const childUri = path.join(root, 'Child.vue')
     const parentUri = path.join(root, 'Parent.vue')
     const childContent = `
@@ -1129,6 +1619,7 @@ export default {
 }
 </script>`
     const localIndex = new WorkspaceIndex()
+    localIndex.setWorkspaceVueVersion(fixtureRoot, 2)
     localIndex.indexContent(unrelatedUri, unrelatedContent)
     localIndex.indexContent(arrayChildUri, arrayChildContent)
     localIndex.indexContent(objectChildUri, objectChildContent)
@@ -1306,8 +1797,28 @@ export default {
     expect(propDefinitions.map((item) => item.uri.fsPath)).toContain(path.join(fixtureRoot, 'MixinVueParent.vue'))
   })
 
+  it('mixin 源导出处支持反查继承和混入它的组件', () => {
+    const mixinUri = path.join(fixtureRoot, 'mixin-default.js')
+    const mixinContent = readFixture('mixin-default.js')
+    const mixinDocument = new TestDocument(mixinUri, mixinContent, 'javascript') as any
+    const definitionProvider = new VueDefinitionProvider(index)
+    const referenceProvider = new VueReferenceProvider(index)
+    const hoverProvider = new VueHoverProvider(index)
+    const exportOffset = mixinContent.indexOf('export default') + 1
+
+    const definitions = definitionProvider.provideDefinition(mixinDocument, positionAt(mixinContent, exportOffset)) as any[]
+    const references = referenceProvider.provideReferences(mixinDocument, positionAt(mixinContent, exportOffset)) as any[]
+    const hover = hoverProvider.provideHover(mixinDocument, positionAt(mixinContent, exportOffset)) as any
+
+    expect(definitions.map((item) => item.uri.fsPath)).toContain(path.join(fixtureRoot, 'MixinChild.vue'))
+    expect(references.map((item) => item.uri.fsPath)).toContain(path.join(fixtureRoot, 'MixinChild.vue'))
+    expect(hoverText(hover)).toContain('Used by 1 component')
+    expect(hoverText(hover)).toContain('MixinChild.vue')
+  })
+
   it('动态组件候选中的 mixin emit 支持跳到父模板监听', () => {
     const localIndex = new WorkspaceIndex()
+    localIndex.setWorkspaceVueVersion(fixtureRoot, 2)
     const mixinPath = path.join(fixtureRoot, 'mixin-default.js')
     const normalPath = path.join(fixtureRoot, 'ProviderDynamicNormal.vue')
     const bigPath = path.join(fixtureRoot, 'ProviderDynamicBig.vue')
@@ -1345,15 +1856,22 @@ export default {
     localIndex.indexContent(bigPath, childContent)
 
     const mixinContent = readFixture('mixin-default.js')
+    const parentDocument = new TestDocument(parentPath, parentContent) as any
     const mixinDocument = new TestDocument(mixinPath, mixinContent, 'javascript') as any
     const definitionProvider = new VueDefinitionProvider(localIndex)
     const referenceProvider = new VueReferenceProvider(localIndex)
     const hoverProvider = new VueHoverProvider(localIndex)
     const emitOffset = mixinContent.indexOf("'mixed-save'") + 2
+    const componentTagOffset = parentContent.indexOf('<component') + 2
+    const dynamicExpressionOffset = parentContent.indexOf('SCREEN_TYPE') + 1
 
     const definitions = definitionProvider.provideDefinition(mixinDocument, positionAt(mixinContent, emitOffset)) as any[]
     const references = referenceProvider.provideReferences(mixinDocument, positionAt(mixinContent, emitOffset)) as any[]
     const hover = hoverProvider.provideHover(mixinDocument, positionAt(mixinContent, emitOffset)) as any
+    const tagDefinitions = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, componentTagOffset)) as any[]
+    const expressionDefinitions = definitionProvider.provideDefinition(parentDocument, positionAt(parentContent, dynamicExpressionOffset)) as any[]
+    const tagHover = hoverProvider.provideHover(parentDocument, positionAt(parentContent, componentTagOffset)) as any
+    const expressionHover = hoverProvider.provideHover(parentDocument, positionAt(parentContent, dynamicExpressionOffset)) as any
 
     expect(definitions).toHaveLength(1)
     expect(definitions[0].uri.fsPath).toBe(parentPath)
@@ -1361,10 +1879,17 @@ export default {
     expect(references[0].uri.fsPath).toBe(parentPath)
     expect(hoverText(hover)).toContain('Used by 1 listener')
     expect(hoverText(hover)).toContain('[ProviderDynamicHost.vue:')
+    expect(tagDefinitions.map((item) => item.uri.fsPath).sort()).toEqual([bigPath, normalPath].sort())
+    expect(expressionDefinitions.map((item) => item.uri.fsPath).sort()).toEqual([bigPath, normalPath].sort())
+    expect(hoverText(tagHover)).toContain('ProviderDynamicNormal.vue')
+    expect(hoverText(tagHover)).toContain('ProviderDynamicBig.vue')
+    expect(hoverText(expressionHover)).toContain('ProviderDynamicNormal.vue')
+    expect(hoverText(expressionHover)).toContain('ProviderDynamicBig.vue')
   })
 
   it('动态组件候选中的 template $emit 支持跳到父模板监听', () => {
     const localIndex = new WorkspaceIndex()
+    localIndex.setWorkspaceVueVersion(fixtureRoot, 2)
     const categoryPath = path.join(fixtureRoot, 'ProviderCategoryList.vue')
     const channelPath = path.join(fixtureRoot, 'ProviderChannelList.vue')
     const parentPath = path.join(fixtureRoot, 'ProviderTernaryDynamicHost.vue')
@@ -1423,6 +1948,7 @@ export default {
 
   it('动态 ref 方法悬浮展示所有候选定义', () => {
     const localIndex = new WorkspaceIndex()
+    localIndex.setWorkspaceVueVersion(fixtureRoot, 2)
     const firstPath = path.join(fixtureRoot, 'DynamicRefFirst.vue')
     const secondPath = path.join(fixtureRoot, 'DynamicRefSecond.vue')
     const parentPath = path.join(fixtureRoot, 'DynamicRefHost.vue')
@@ -2045,6 +2571,7 @@ const service = inject(injectedServiceKey)
   it('Vue2 v-on $listeners 透传事件的 provider 关系可用', () => {
     const localIndex = new WorkspaceIndex()
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-provider-forwarded-listeners-'))
+    localIndex.setWorkspaceVueVersion(root, 2)
     const wrapperUri = path.join(root, 'src/GoodsDetail.vue')
     const physicalUri = path.join(root, 'src/PhysicalGoodsDetail.vue')
     const virtualUri = path.join(root, 'src/VirtualGoodsDetail.vue')
@@ -2301,6 +2828,55 @@ const childProps = {
     expect(hoverText(hover)).toContain('Used by 1 prop usage')
   })
 
+  it('Vue3 v-on 对象事件的 provider 反向引用可用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-provider-object-on-events-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const childContent = `
+<script setup lang="ts">
+const emit = defineEmits<{
+  saveSuccess: []
+}>()
+
+function save() {
+  emit('saveSuccess')
+}
+</script>
+`
+    const parentContent = `
+<template>
+  <Child v-on="listeners" />
+</template>
+<script setup lang="ts">
+import Child from './Child.vue'
+
+const onSaveSuccess = () => {}
+const listeners = {
+  saveSuccess: onSaveSuccess,
+}
+</script>
+`
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, childContent)
+    writeText(parentUri, parentContent)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const definitionProvider = new VueDefinitionProvider(localIndex)
+    const referenceProvider = new VueReferenceProvider(localIndex)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const childDocument = new TestDocument(childUri, childContent) as any
+    const eventPosition = positionAt(childContent, childContent.lastIndexOf("'saveSuccess'") + 2)
+
+    const definitions = asArray(definitionProvider.provideDefinition(childDocument, eventPosition) as any)
+    const references = referenceProvider.provideReferences(childDocument, eventPosition) as any[]
+    const hover = hoverProvider.provideHover(childDocument, eventPosition) as any
+
+    expect(definitions.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(references.map((location) => location.uri.fsPath)).toEqual([parentUri])
+    expect(hoverText(hover)).toContain('Used by 1 listener')
+  })
+
   it('Vue3 hook 返回方法可在源码处 hover 和查找反向引用', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-hook-return-usages-'))
     const hookUri = path.join(root, 'src/pages/channel-verify/hooks/use-verify.ts')
@@ -2507,6 +3083,7 @@ runVerifyWithCode('local')
   it('组件 template 处展示组件用法 CodeLens，单个用法也可点击执行命令', () => {
     const localIndex = new WorkspaceIndex()
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-component-usage-codelens-'))
+    localIndex.setWorkspaceVueVersion(root, 2)
     const childUri = path.join(root, 'src/Child.vue')
     const parentUri = path.join(root, 'src/Parent.vue')
     const childContent = `
@@ -2544,6 +3121,7 @@ export default { components: { Child } }
   it('组件有多个用法时 CodeLens 可点击打开用法列表', () => {
     const localIndex = new WorkspaceIndex()
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-component-usage-list-codelens-'))
+    localIndex.setWorkspaceVueVersion(root, 2)
     const childUri = path.join(root, 'src/Child.vue')
     const firstParentUri = path.join(root, 'src/FirstParent.vue')
     const secondParentUri = path.join(root, 'src/SecondParent.vue')

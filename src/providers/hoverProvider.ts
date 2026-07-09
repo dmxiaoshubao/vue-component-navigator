@@ -1,8 +1,8 @@
 import * as path from 'node:path'
 import * as vscode from 'vscode'
-import type { EmitInfo, EventBusCall, MethodInfo, PropInfo, SlotInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
+import type { EmitInfo, EventBusCall, MethodInfo, OptionMemberInfo, PropInfo, SlotInfo, SourceLocation, TextSpan, UsageInfo, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefMethodAccessInFile } from '../indexer/workspaceIndex'
-import { findEmit, findIndexedInjectUsages, findIndexedPropUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findInject, findProp, findProvideAtOffset, findResolvedRefComponents } from '../indexer/relationResolver'
+import { findEmit, findIndexedInjectUsages, findIndexedPropUsages, findIndexedProvideDefinitions, findIndexedRefMethodUsages, findIndexedTemplateEventUsages, findInject, findProp, findProvideAtOffset, findRegisteredComponentRegistration, findResolvedRefComponents, hasRegisteredComponent } from '../indexer/relationResolver'
 import { containsOffsetStrict, createLineStarts, offsetToPosition, positionToOffset } from '../utils/position'
 import { escapeMarkdownText, formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 import { commonDirectory, relativePath, shortestUniquePathLabels } from '../utils/pathDisplay'
@@ -21,13 +21,13 @@ type UsageCommandArgs =
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
-  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' | 'hook' }
+  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' | 'hook' | 'component-consumer' }
 
 function definitionLink(file: VueFileIndex, span: TextSpan, label: string, sourceLocation?: SourceLocation): string {
   const location = sourceLocation ?? { uri: file.uri, lineStarts: file.lineStarts, span }
   const position = offsetToPosition(location.lineStarts, location.span.start)
   const target = vscode.Uri.file(location.uri).with({ fragment: `L${position.line + 1},${position.character + 1}` })
-  return `[${escapeMarkdownText(label)}](${target.toString()})`
+  return `[${escapeMarkdownText(`${label}:${position.line + 1}`)}](${target.toString()})`
 }
 
 function markdownHover(value: string, trusted = false): vscode.Hover {
@@ -66,6 +66,12 @@ function propHover(child: VueFileIndex, prop: PropInfo, label: string): vscode.H
   const docs = formatJSDocMarkdown(prop.documentation)
   const docText = docs ? `${docs}\n\n` : ''
   return markdownHover(`${docText}${markdownCodeBlock(formatCodeBlock(prop.detail))}\n\nDefinition: ${definitionLink(child, prop.span, label, prop.sourceLocation)}`)
+}
+
+function optionMemberHover(file: VueFileIndex, member: OptionMemberInfo, label: string): vscode.Hover {
+  const docs = formatJSDocMarkdown(member.documentation)
+  const docText = docs ? `${docs}\n\n` : ''
+  return markdownHover(`${docText}Definition: ${definitionLink(file, member.span, label, member.sourceLocation)}`)
 }
 
 function definitionKey(file: VueFileIndex, span: TextSpan, sourceLocation?: SourceLocation): string {
@@ -331,6 +337,26 @@ function eventDefinitionsHover(definitions: Array<{ child: VueFileIndex, emit: E
   return markdownHover(`Definitions:\n\n${links}`)
 }
 
+function componentDefinitionsHover(children: VueFileIndex[], labels: Map<string, string>): vscode.Hover | undefined {
+  const unique = uniqueDefinitions(children.map((child) => ({
+    child,
+    span: { start: 0, end: 0 },
+  })))
+  if (unique.length === 0) {
+    return undefined
+  }
+
+  if (unique.length === 1) {
+    const { child } = unique[0]
+    return markdownHover(`Definition: ${definitionLink(child, { start: 0, end: 0 }, labelForDefinition(labels, child))}`)
+  }
+
+  const links = unique.map(({ child }) => {
+    return `- ${definitionLink(child, { start: 0, end: 0 }, labelForDefinition(labels, child))}`
+  }).join('\n')
+  return markdownHover(`Definitions:\n\n${links}`)
+}
+
 function isVueDocument(document: vscode.TextDocument): boolean {
   return document.languageId === 'vue' || document.uri.fsPath.endsWith('.vue')
 }
@@ -377,6 +403,12 @@ export class VueHoverProvider implements vscode.HoverProvider {
 
   provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.Hover> {
     const vueDocument = isVueDocument(document)
+    if (document.uri.scheme !== 'file') {
+      return undefined
+    }
+    if (vueDocument && !this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
+      return undefined
+    }
     if (!vueDocument && !this.index.hasIndexedDocumentContext(document.uri.fsPath)) {
       return undefined
     }
@@ -384,7 +416,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
     const content = document.getText()
     const file = vueDocument
       ? this.index.syncContent(document.uri.fsPath, content)
-      : this.index.getFile(document.uri.fsPath)
+      : this.index.syncDocumentContent(document.uri.fsPath, content, document.version) ?? this.index.getFile(document.uri.fsPath)
     const offset = vueDocument
       ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
       : positionToOffset(createLineStarts(content), { line: position.line, character: position.character })
@@ -451,6 +483,15 @@ export class VueHoverProvider implements vscode.HoverProvider {
         continue
       }
 
+      const isDynamicComponentExpression = component.dynamicExpressionSpan
+        ? containsOffsetStrict(component.dynamicExpressionSpan, offset)
+        : false
+      const registeredComponent = findRegisteredComponentRegistration(file, component.tag)
+      const shouldProvideComponentDefinition = !hasRegisteredComponent(file, component.tag) || Boolean(registeredComponent?.sourceLocation)
+      if ((containsOffsetStrict(component.span, offset) || isDynamicComponentExpression) && shouldProvideComponentDefinition) {
+        return componentDefinitionsHover(children, definitionLabels())
+      }
+
       for (const attr of component.attrs) {
         if (!containsOffsetStrict(attr.span, offset)) {
           continue
@@ -484,6 +525,11 @@ export class VueHoverProvider implements vscode.HoverProvider {
         }
         return slotDefinitionsHover(definitions, definitionLabels())
       }
+    }
+
+    const templateMember = this.index.findTemplateInstanceMemberAtOffset(file, offset)
+    if (templateMember) {
+      return optionMemberHover(file, templateMember.member, labelForDefinition(definitionLabels(), file, templateMember.member.sourceLocation))
     }
 
     for (const emit of file.scriptIndex.emits) {
@@ -547,6 +593,19 @@ export class VueHoverProvider implements vscode.HoverProvider {
         singular: 'defineProps type',
         plural: 'defineProps types',
         commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'prop-type' },
+        includeContext: false,
+      })
+      return markdownHover(summary.text, summary.trusted)
+    }
+
+    const mixinConsumers = this.index.findMixinConsumersFromSource(sourceUri, offset)
+    if (mixinConsumers.length > 0) {
+      const summary = usageSummary(mixinConsumers, this.workspaceBaseDirectory(), {
+        noneText: 'No component consumers found.',
+        title: 'Used by',
+        singular: 'component',
+        plural: 'components',
+        commandArgs: { kind: 'source-usages', sourceUri, offset, relation: 'component-consumer' },
         includeContext: false,
       })
       return markdownHover(summary.text, summary.trusted)
@@ -637,6 +696,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
       ...file.scriptIndex.props.map((item) => item.sourceLocation?.uri),
       file.scriptIndex.vue3PropType?.sourceLocation?.uri,
       ...file.scriptIndex.methods.map((item) => item.sourceLocation?.uri),
+      ...file.scriptIndex.optionMembers.map((item) => item.sourceLocation?.uri),
       ...file.scriptIndex.slots.map((item) => item.sourceLocation?.uri),
       ...file.scriptIndex.emits.map((item) => item.sourceLocation?.uri),
       ...file.scriptIndex.eventBusCalls.map((item) => item.sourceLocation?.uri),

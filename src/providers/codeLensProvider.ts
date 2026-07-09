@@ -24,6 +24,9 @@ export class VueCodeLensProvider implements vscode.CodeLensProvider {
     if (!isVueDocument(document) || document.uri.scheme !== 'file') {
       return []
     }
+    if (!this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
+      return []
+    }
 
     // CodeLens 不依赖 Inlay Hints 设置，直接复用现有的组件用法索引。
     const file = this.index.syncContent(document.uri.fsPath, document.getText())

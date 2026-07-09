@@ -1,7 +1,8 @@
 import * as vscode from 'vscode'
-import type { EventBusMethod, MethodInfo, VueFileIndex } from '../indexer/types'
+import type { EventBusMethod, MethodInfo, PropInfo, TemplateComponentUsage, VueFileIndex } from '../indexer/types'
 import { WorkspaceIndex, findRefCompletionContext, findRefCompletionContextInFile, findRefRootCompletionContext, findRefRootCompletionContextInFile } from '../indexer/workspaceIndex'
 import { findResolvedRefComponents } from '../indexer/relationResolver'
+import { toKebabCase } from '../utils/casing'
 import { formatJSDocMarkdown, markdownCodeBlock } from '../utils/jsdoc'
 import { createLineStarts, positionToOffset } from '../utils/position'
 import { maskStringsAndComments } from '../utils/scriptScan'
@@ -10,6 +11,7 @@ const HIGH_PRIORITY_SORT_PREFIX = '\u0000\u0000'
 const OPTIONAL_CHAIN_SORT_PREFIX = `${HIGH_PRIORITY_SORT_PREFIX}\u0000`
 const INJECT_SORT_PREFIX = `${HIGH_PRIORITY_SORT_PREFIX}\u0001`
 const EVENT_BUS_SORT_PREFIX = `${HIGH_PRIORITY_SORT_PREFIX}\u0002`
+const PROP_SORT_PREFIX = `${HIGH_PRIORITY_SORT_PREFIX}\u0003`
 const MAX_INJECT_CONTEXT_SCAN = 20000
 const eventBusMethodCompletions: EventBusMethod[] = ['$emit', '$on', '$once', '$off']
 const eventBusCompletionMethods = new Set<EventBusMethod>(eventBusMethodCompletions)
@@ -29,6 +31,15 @@ interface EventBusMethodCompletionContext {
   busName: string
   accessToken: '.' | '?.'
   partialMethodName: string
+}
+
+interface TemplatePropCompletionContext {
+  tag: string
+  component?: TemplateComponentUsage
+  prefix: '' | ':' | 'v-bind:'
+  partialName: string
+  tokenLength: number
+  existingPropNames: Set<string>
 }
 
 function isVueDocument(document: vscode.TextDocument): boolean {
@@ -107,6 +118,12 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
 
   provideCompletionItems(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.CompletionItem[]> {
     const vueDocument = isVueDocument(document)
+    if (document.uri.scheme !== 'file') {
+      return undefined
+    }
+    if (vueDocument && !this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
+      return undefined
+    }
     if (!vueDocument && !this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
       return undefined
     }
@@ -117,7 +134,7 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
     const content = document.getText()
     const file = vueDocument
       ? this.index.syncContent(document.uri.fsPath, content)
-      : this.index.getFile(document.uri.fsPath)
+      : this.index.syncDocumentContent(document.uri.fsPath, content, document.version) ?? this.index.getFile(document.uri.fsPath)
     const offset = vueDocument
       ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
       : offsetInContent(content, position)
@@ -145,6 +162,13 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
           ? this.index.findSourceConsumers(document.uri.fsPath)
           : []
       return this.provideKeyCompletions(consumers, injectContext, position)
+    }
+
+    const propContext = vueDocument && file?.vueVersion === 2
+      ? findTemplatePropCompletionContext(file, content, offset)
+      : undefined
+    if (propContext) {
+      return this.templatePropCompletions(file!, propContext, position)
     }
 
     if (file?.vueVersion === 3) {
@@ -340,6 +364,56 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
     }
     return results
   }
+
+  private templatePropCompletions(file: VueFileIndex, context: TemplatePropCompletionContext, position: vscode.Position): vscode.CompletionItem[] | undefined {
+    const childUris = context.component
+      ? this.index.resolveTemplateComponentUris(file, context.component)
+      : [this.index.resolveComponent(file, context.tag)].filter((uri): uri is string => Boolean(uri))
+    const props = this.uniqueProps(childUris, context.existingPropNames)
+    if (props.length === 0) {
+      return undefined
+    }
+
+    const range = new vscode.Range(
+      position.line,
+      position.character - context.tokenLength,
+      position.line,
+      position.character,
+    )
+
+    return props.map(({ file: owner, prop }) => {
+      const name = toKebabCase(prop.name)
+      const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Property)
+      item.detail = `${owner.scriptIndex.componentName ?? owner.fileName}.props.${prop.name}`
+      const documentation = formatJSDocMarkdown(prop.documentation)
+      if (documentation) {
+        item.documentation = new vscode.MarkdownString(`${markdownCodeBlock(prop.detail)}\n\n${documentation}`)
+      } else {
+        item.documentation = prop.detail
+      }
+      item.range = range
+      item.insertText = `${context.prefix}${name}`
+      item.filterText = `${context.prefix}${name}`
+      item.sortText = `${PROP_SORT_PREFIX}${name}`
+      return item
+    })
+  }
+
+  private uniqueProps(childUris: string[], existingPropNames: Set<string>): Array<{ file: VueFileIndex, prop: PropInfo }> {
+    const seen = new Set<string>()
+    const results: Array<{ file: VueFileIndex, prop: PropInfo }> = []
+    for (const childUri of childUris) {
+      for (const definition of this.index.findPropCompletionDefinitions(childUri)) {
+        const name = toKebabCase(definition.prop.name)
+        if (seen.has(name) || existingPropNames.has(name)) {
+          continue
+        }
+        seen.add(name)
+        results.push(definition)
+      }
+    }
+    return results
+  }
 }
 
 function uniqueRefNames(consumers: VueFileIndex[]): string[] {
@@ -357,6 +431,248 @@ function uniqueRefNames(consumers: VueFileIndex[]): string[] {
     }
   }
   return results
+}
+
+function findTemplatePropCompletionContext(file: VueFileIndex, content: string, offset: number): TemplatePropCompletionContext | undefined {
+  const templateStart = templateCompletionStart(file, content, offset)
+  if (templateStart === undefined) {
+    return undefined
+  }
+
+  const tagStart = findCurrentOpenTagStart(content, offset, templateStart)
+  if (tagStart === undefined || isInsideOpenTagQuote(content, tagStart, offset)) {
+    return undefined
+  }
+
+  const tagName = readTagName(content, tagStart + 1)
+  if (!tagName || offset <= tagName.end) {
+    return undefined
+  }
+
+  const tokenStart = findAttributeTokenStart(content, offset, tagName.end)
+  const token = content.slice(tokenStart, offset)
+  const parsed = parsePropCompletionToken(token)
+  if (!parsed) {
+    return undefined
+  }
+  const tagEnd = findOpenTagContentEnd(content, tagStart)
+
+  return {
+    tag: tagName.value,
+    component: file.templateIndex.components.find((component) => component.span.start === tagName.start),
+    ...parsed,
+    tokenLength: token.length,
+    existingPropNames: collectExistingPropNames(content, tagName.end, tagEnd, tokenStart, offset),
+  }
+}
+
+function templateCompletionStart(file: VueFileIndex, content: string, offset: number): number | undefined {
+  if (file.template && offset >= file.template.start && offset <= file.template.end) {
+    return file.template.start
+  }
+  if (isInsideBlock(file.script, offset) || isInsideBlock(file.scriptSetup, offset)) {
+    return undefined
+  }
+
+  const templateOpen = content.lastIndexOf('<template', offset)
+  if (templateOpen === -1) {
+    return undefined
+  }
+  const templateOpenEnd = content.indexOf('>', templateOpen)
+  if (templateOpenEnd === -1 || templateOpenEnd >= offset) {
+    return undefined
+  }
+  const templateClose = content.lastIndexOf('</template', offset)
+  return templateClose > templateOpen ? undefined : templateOpenEnd + 1
+}
+
+function isInsideBlock(block: { start: number, end: number } | undefined, offset: number): boolean {
+  return Boolean(block && offset >= block.start && offset <= block.end)
+}
+
+function findCurrentOpenTagStart(content: string, offset: number, templateStart: number): number | undefined {
+  const tagStart = content.lastIndexOf('<', offset)
+  if (tagStart < templateStart) {
+    return undefined
+  }
+  const tagEnd = content.lastIndexOf('>', offset)
+  if (tagEnd > tagStart) {
+    return undefined
+  }
+  const next = content[tagStart + 1]
+  if (next === '/' || next === '!' || next === '?') {
+    return undefined
+  }
+  return tagStart
+}
+
+function findOpenTagContentEnd(content: string, tagStart: number): number {
+  let quote: '\'' | '"' | undefined
+  for (let index = tagStart + 1; index < content.length; index += 1) {
+    const char = content[index]
+    if (quote) {
+      if (char === quote) {
+        quote = undefined
+      }
+      continue
+    }
+    if (char === '\'' || char === '"') {
+      quote = char
+      continue
+    }
+    if (char === '>' || char === '<') {
+      return index
+    }
+  }
+  return content.length
+}
+
+function isInsideOpenTagQuote(content: string, tagStart: number, offset: number): boolean {
+  let quote: '\'' | '"' | undefined
+  for (let index = tagStart; index < offset; index += 1) {
+    const char = content[index]
+    if (quote) {
+      if (char === quote) {
+        quote = undefined
+      }
+      continue
+    }
+    if (char === '\'' || char === '"') {
+      quote = char
+    }
+  }
+  return quote !== undefined
+}
+
+function readTagName(content: string, start: number): { value: string, start: number, end: number } | undefined {
+  const match = /^[A-Za-z][\w.-]*/.exec(content.slice(start))
+  if (!match) {
+    return undefined
+  }
+  return { value: match[0], start, end: start + match[0].length }
+}
+
+function findAttributeTokenStart(content: string, offset: number, min: number): number {
+  let cursor = offset
+  while (cursor > min) {
+    const char = content[cursor - 1]
+    if (/\s/.test(char) || char === '<' || char === '>') {
+      break
+    }
+    cursor -= 1
+  }
+  return cursor
+}
+
+function parsePropCompletionToken(token: string): { prefix: '' | ':' | 'v-bind:', partialName: string } | undefined {
+  if (token.includes('=') || token.startsWith('/') || token.startsWith('@') || token.startsWith('#')) {
+    return undefined
+  }
+
+  if (token === '') {
+    return { prefix: '', partialName: '' }
+  }
+
+  if (token.startsWith('v-bind:')) {
+    const partialName = token.slice('v-bind:'.length)
+    return isPropNamePartial(partialName) ? { prefix: 'v-bind:', partialName } : undefined
+  }
+
+  if (token.startsWith(':')) {
+    const partialName = token.slice(1)
+    return isPropNamePartial(partialName) ? { prefix: ':', partialName } : undefined
+  }
+
+  if (token.startsWith('v-')) {
+    return undefined
+  }
+
+  return isPropNamePartial(token) ? { prefix: '', partialName: token } : undefined
+}
+
+function isPropNamePartial(value: string): boolean {
+  return value === '' || /^[A-Za-z_][\w.-]*$/.test(value)
+}
+
+const ignoredCompletionPropNames = new Set(['class', 'style', 'key', 'ref', 'slot', 'slot-scope', 'is'])
+
+function collectExistingPropNames(content: string, start: number, end: number, currentStart: number, currentEnd: number): Set<string> {
+  const names = new Set<string>()
+  let index = start
+
+  while (index < end) {
+    while (index < end && /\s/.test(content[index])) {
+      index += 1
+    }
+    if (index >= end) {
+      break
+    }
+    if (content[index] === '/') {
+      index += 1
+      continue
+    }
+
+    const attrStart = index
+    while (index < end && !/[\s=/>]/.test(content[index])) {
+      index += 1
+    }
+    const attrName = content.slice(attrStart, index)
+    const propName = normalizeExistingPropName(attrName)
+    if (propName && !rangesOverlap(attrStart, index, currentStart, currentEnd)) {
+      names.add(toKebabCase(propName))
+    }
+
+    while (index < end && /\s/.test(content[index])) {
+      index += 1
+    }
+    if (content[index] !== '=') {
+      continue
+    }
+
+    index += 1
+    while (index < end && /\s/.test(content[index])) {
+      index += 1
+    }
+    const quote = content[index]
+    if (quote === '"' || quote === '\'') {
+      index += 1
+      while (index < end && content[index] !== quote) {
+        index += 1
+      }
+      index += content[index] === quote ? 1 : 0
+      continue
+    }
+    while (index < end && !/\s/.test(content[index]) && content[index] !== '>') {
+      index += 1
+    }
+  }
+
+  return names
+}
+
+function normalizeExistingPropName(attrName: string): string | undefined {
+  if (!attrName || attrName.startsWith('@') || attrName.startsWith('#')) {
+    return undefined
+  }
+  if (attrName.startsWith('v-bind:')) {
+    return cleanExistingPropName(attrName.slice('v-bind:'.length))
+  }
+  if (attrName.startsWith(':')) {
+    return cleanExistingPropName(attrName.slice(1))
+  }
+  if (attrName === 'v-bind' || attrName.startsWith('v-')) {
+    return undefined
+  }
+  return cleanExistingPropName(attrName)
+}
+
+function cleanExistingPropName(name: string): string | undefined {
+  const propName = name.split('.')[0]
+  return propName && !ignoredCompletionPropNames.has(propName) ? propName : undefined
+}
+
+function rangesOverlap(startA: number, endA: number, startB: number, endB: number): boolean {
+  return startA < endB && startB < endA
 }
 
 function findInjectCompletionContext(content: string, offset: number): StringContext | undefined {

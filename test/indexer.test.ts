@@ -507,6 +507,71 @@ export default {
     expect(index.findRefMethodUsages(inner.uri, 'focus')[0]?.sourceLocation?.uri).toBe(defaultMixinUri)
     expect(index.findProvideDefinitions(child, 'sharedService')[0]?.file.uri).toBe(parent.uri)
     expect(index.findInjectUsages(parent.uri, 'sharedService')[0]?.sourceLocation?.uri).toBe(namedMixinUri)
+
+    const defaultMixinContent = fs.readFileSync(defaultMixinUri, 'utf8')
+    const namedMixinContent = fs.readFileSync(namedMixinUri, 'utf8')
+    expect(index.findMixinConsumersFromSource(defaultMixinUri, defaultMixinContent.indexOf('export default') + 1).map((usage) => usage.file.uri)).toEqual([child.uri])
+    expect(index.findMixinConsumersFromSource(namedMixinUri, namedMixinContent.indexOf('namedMixin') + 1).map((usage) => usage.file.uri)).toEqual([child.uri])
+  })
+
+  it('合并静态 extends 中的 props、methods、emits 和 $refs 调用', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-static-extends-'))
+    const index = new WorkspaceIndex()
+    const baseUri = path.join(root, 'BaseDialog.js')
+    const childUri = path.join(root, 'Child.vue')
+    const parentUri = path.join(root, 'Parent.vue')
+
+    const baseContent = `
+export default {
+  props: {
+    inheritedTitle: String,
+  },
+  methods: {
+    inheritedOpen() {},
+    save() {
+      this.$emit('inherited-save')
+    },
+  },
+}
+`
+    writeText(baseUri, baseContent)
+    const child = index.indexContent(childUri, `
+<template><div /></template>
+<script>
+import BaseDialog from './BaseDialog'
+
+export default {
+  extends: BaseDialog,
+}
+</script>
+`)
+    index.indexContent(parentUri, `
+<template>
+  <Child ref="child" :inherited-title="title" @inherited-save="onSave" />
+</template>
+<script>
+import Child from './Child.vue'
+
+export default {
+  components: { Child },
+  methods: {
+    open() {
+      this.$refs.child.inheritedOpen()
+    },
+    onSave() {},
+  },
+}
+</script>
+`)
+
+    expect(child.scriptIndex.extendsRef?.targetUri).toBe(baseUri)
+    expect(findProp(child, 'inheritedTitle')?.sourceLocation?.uri).toBe(baseUri)
+    expect(findMethod(child, 'inheritedOpen')?.sourceLocation?.uri).toBe(baseUri)
+    expect(findEmit(child, 'inherited-save')[0]?.sourceLocation?.uri).toBe(baseUri)
+    expect(index.findTemplatePropUsages(child.uri, 'inheritedTitle').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplateEventUsages(child.uri, 'inherited-save').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findRefMethodUsages(child.uri, 'inheritedOpen').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findMixinConsumersFromSource(baseUri, baseContent.indexOf('export default') + 1).map((usage) => usage.file.uri)).toEqual([childUri])
   })
 
   it('静态可证明的动态组件参与 mixin prop、emit 和 ref 方法关系', () => {
@@ -561,6 +626,7 @@ export default {
     const propOffset = readFixture('mixin-default.js').indexOf('mixedTitle') + 1
 
     expect(dynamicUsage.dynamicTags).toEqual(['DynamicNormal', 'DynamicBig'])
+    expect(parent.content.slice(dynamicUsage.dynamicExpressionSpan!.start, dynamicUsage.dynamicExpressionSpan!.end)).toBe('SCREEN_TYPE[themeType]')
     expect(index.resolveTemplateComponentUris(parent, dynamicUsage).sort()).toEqual([bigUri, normalUri].sort())
     expect(index.findTemplatePropUsages(normalUri, 'mixedTitle')).toHaveLength(1)
     expect(index.findTemplatePropUsages(bigUri, 'mixedTitle')).toHaveLength(1)
@@ -647,6 +713,114 @@ export default {
     expect(index.findTemplateEventUsages(category.uri, 'onAddToCart')).toHaveLength(1)
     expect(index.findTemplateEventUsages(channel.uri, 'onAddToCart')).toHaveLength(1)
     expect(index.findTemplateEventUsages(objectChild.uri, 'save')).toHaveLength(2)
+  })
+
+  it('Vue2 动态组件对象映射支持 import 组件变量候选', () => {
+    const index = new WorkspaceIndex()
+    const singleUri = path.join(fixtureRoot, 'SingleBtn.vue')
+    const horizontalUri = path.join(fixtureRoot, 'HorizontalBtn.vue')
+    const parentUri = path.join(fixtureRoot, 'DialogFooterHost.vue')
+    const childContent = `
+<template><button /></template>
+<script>
+export default {
+  props: {
+    visible: Boolean,
+  },
+  methods: {
+    cancel() {
+      this.$emit('cancel')
+    },
+  },
+}
+</script>
+`
+    index.indexContent(singleUri, childContent)
+    index.indexContent(horizontalUri, childContent)
+    const parent = index.indexContent(parentUri, `
+<template>
+  <component
+    :is="footerTypeObj[footerType]"
+    :visible.sync="dialogVisible"
+    @cancel="handleCancel"
+  />
+</template>
+<script>
+import SingleBtn from './SingleBtn.vue'
+import HorizontalBtn from './HorizontalBtn.vue'
+
+const FOOTER_TYPE = {
+  SINGLE: SingleBtn,
+  HORIZONTAL: HorizontalBtn,
+}
+
+export default {
+  data() {
+    return {
+      footerTypeObj: FOOTER_TYPE,
+    }
+  },
+}
+</script>
+`)
+
+    const dynamicUsage = parent.templateIndex.components.find((component) => component.tag === 'component')!
+
+    expect(parent.scriptIndex.components).toEqual([])
+    expect(dynamicUsage.dynamicTags).toEqual(['SingleBtn', 'HorizontalBtn'])
+    expect(index.resolveTemplateComponentUris(parent, dynamicUsage).sort()).toEqual([horizontalUri, singleUri].sort())
+    expect(index.findTemplatePropUsages(singleUri, 'visible')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(horizontalUri, 'visible')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(singleUri, 'cancel')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(horizontalUri, 'cancel')).toHaveLength(1)
+  })
+
+  it('Vue2 动态组件 import 候选不会解析到不存在的 Vue 文件', () => {
+    const index = new WorkspaceIndex()
+    const existingUri = path.join(fixtureRoot, 'ExistingDynamicChild.vue')
+    const missingUri = path.join(fixtureRoot, 'MissingDynamicChild.vue')
+    const parentUri = path.join(fixtureRoot, 'MissingDynamicHost.vue')
+    const childContent = `
+<template><button /></template>
+<script>
+export default {
+  methods: {
+    save() {
+      this.$emit('save')
+    },
+  },
+}
+</script>
+`
+    index.indexContent(existingUri, childContent)
+    const parent = index.indexContent(parentUri, `
+<template>
+  <component :is="COMPONENTS[type]" @save="onSave" />
+</template>
+<script>
+import ExistingDynamicChild from './ExistingDynamicChild.vue'
+import MissingDynamicChild from './MissingDynamicChild.vue'
+
+const COMPONENTS = {
+  existing: ExistingDynamicChild,
+  missing: MissingDynamicChild,
+}
+
+export default {
+  data() {
+    return { COMPONENTS }
+  },
+}
+</script>
+`)
+
+    const dynamicUsage = parent.templateIndex.components.find((component) => component.tag === 'component')!
+
+    expect(dynamicUsage.dynamicTags).toEqual(['ExistingDynamicChild', 'MissingDynamicChild'])
+    expect(index.resolveTemplateComponentUris(parent, dynamicUsage)).toEqual([existingUri])
+    expect(index.findTemplateEventUsages(existingUri, 'save')).toHaveLength(1)
+    expect(index.findTemplateEventUsages(missingUri, 'save')).toHaveLength(0)
+    expect(findTemplateEventUsages([parent], missingUri, 'save')).toHaveLength(0)
   })
 
   it('Vue2 v-on $listeners 透传到 data 动态组件候选的事件关系', () => {
@@ -745,6 +919,50 @@ export default {
     expect(index.findTemplateEventUsages(virtual.uri, 'saveSuccess').map((usage) => usage.file.uri)).toEqual([parentUri])
   })
 
+  it('v-on 对象的静态事件名会建立模板事件关系', () => {
+    const index = new WorkspaceIndex()
+    const childUri = path.join(fixtureRoot, 'OnObjectChild.vue')
+    const parentUri = path.join(fixtureRoot, 'OnObjectParent.vue')
+    const child = index.indexContent(childUri, `
+<script>
+export default {
+  methods: {
+    save() {
+      this.$emit('saveSuccess')
+      this.$emit('cancel')
+    },
+  },
+}
+</script>
+`)
+    const parent = index.indexContent(parentUri, `
+<template>
+  <OnObjectChild v-on="listeners" />
+</template>
+<script>
+import OnObjectChild from './OnObjectChild.vue'
+
+const moreListeners = {
+  cancel: () => {},
+}
+const listeners = {
+  saveSuccess: () => {},
+  ...moreListeners,
+}
+
+export default {
+  components: { OnObjectChild },
+}
+</script>
+`)
+
+    const component = parent.templateIndex.components.find((component) => component.tag === 'OnObjectChild')!
+
+    expect(component.ons?.map((on) => on.expression)).toEqual(['listeners'])
+    expect(index.findTemplateEventUsages(child.uri, 'saveSuccess').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplateEventUsages(child.uri, 'cancel').map((usage) => usage.file.uri)).toEqual([parentUri])
+  })
+
   it('template $emit 只索引当前组件 emit 调用', () => {
     const index = new WorkspaceIndex()
     const file = index.indexContent(path.join(fixtureRoot, 'TemplateEmitBoundary.vue'), `
@@ -763,6 +981,37 @@ export default {}
 
     expect(file.scriptIndex.emits.map((emit) => emit.eventName)).toEqual(['direct', 'explicit'])
     expect(file.scriptIndex.eventBusCalls).toHaveLength(0)
+  })
+
+  it('template 实例成员索引过滤局部变量和未知标识符', () => {
+    const index = new WorkspaceIndex()
+    const file = index.indexContent(path.join(fixtureRoot, 'TemplateInstanceMemberScope.vue'), `
+<template>
+  <section>
+    <div>{{ known }} {{ unknown }}</div>
+    <button v-for="(item, index) in known" :key="item.id">
+      {{ item.name }} {{ index }}
+    </button>
+    <Child v-slot="{ slotItem }">
+      {{ slotItem.title }}
+    </Child>
+  </section>
+</template>
+<script>
+export default {
+  data() {
+    return {
+      known: [],
+      item: null,
+      index: 0,
+      slotItem: null,
+    }
+  },
+}
+</script>
+`)
+
+    expect(file.templateIndex.instanceMembers.map((member) => member.name)).toEqual(['known', 'known'])
   })
 
   it('解析入口注册后的 Vue 2 Event Bus 静态 emit 和 listener 调用', async () => {
@@ -2161,6 +2410,69 @@ const { runVerifyWithCode } = useVerify<string>()
     expect(usages[0].file.uri).toBe(consumerUri)
   })
 
+  it('深层静态父链也能解析 provide/inject 关系', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-deep-provide-chain-'))
+    const index = new WorkspaceIndex()
+    index.setWorkspaceVueVersion(root, 2)
+    const providerUri = path.join(root, 'src/Provider.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+    const levelUris = Array.from({ length: 10 }, (_, index) => path.join(root, `src/Level${index + 1}.vue`))
+
+    writeText(consumerUri, `
+<template><div /></template>
+<script>
+export default { inject: ['service'] }
+</script>
+`)
+    for (let index = levelUris.length - 1; index >= 0; index -= 1) {
+      const childName = index === levelUris.length - 1 ? 'Consumer' : `Level${index + 2}`
+      const childPath = index === levelUris.length - 1 ? './Consumer.vue' : `./Level${index + 2}.vue`
+      writeText(levelUris[index], `
+<template><${childName} /></template>
+<script>
+import ${childName} from '${childPath}'
+export default { components: { ${childName} } }
+</script>
+`)
+    }
+    writeText(providerUri, `
+<template><Level1 /></template>
+<script>
+import Level1 from './Level1.vue'
+export default {
+  components: { Level1 },
+  provide: { service: {} },
+}
+</script>
+`)
+
+    index.indexContent(consumerUri, fs.readFileSync(consumerUri, 'utf8'))
+    for (const uri of levelUris) {
+      index.indexContent(uri, fs.readFileSync(uri, 'utf8'))
+    }
+    const provider = index.indexContent(providerUri, fs.readFileSync(providerUri, 'utf8'))
+    const consumer = index.getFile(consumerUri)!
+
+    expect(index.findProvideDefinitions(consumer, 'service').map((usage) => usage.file.uri)).toEqual([provider.uri])
+    expect(index.findInjectUsages(provider.uri, 'service').map((usage) => usage.file.uri)).toEqual([consumerUri])
+  })
+
+  it('初始索引跳过超大脚本文件以避免扫描拖慢项目', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-large-script-skip-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const largeUri = path.join(root, 'src/generated-large.ts')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, '<template><div /></template><script setup lang="ts"></script>')
+    writeText(largeUri, `import Child from './Child.vue'\n${'x'.repeat(1_050_000)}`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.getFile(childUri)).toBeTruthy()
+    expect(index.findComponentUsages(childUri)).toEqual([])
+  })
+
   it('Vue3 useTemplateRef 换行声明可识别且注释不会产生 ref 方法误绑定', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-template-ref-comment-'))
     const numberPadUri = path.join(root, 'src/NumberPad.vue')
@@ -2704,6 +3016,48 @@ export const serviceKey = {}
     expect(index.hasVue3Source(keyUri)).toBe(false)
   })
 
+  it('Vue3 source 未变化时不会重复重建消费者', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-source-same-content-'))
+    const keyUri = path.join(root, 'src/keys.ts')
+    const providerUri = path.join(root, 'src/Provider.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+    const keyContent = `
+export const serviceKey = Symbol('service')
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(keyUri, keyContent)
+    writeText(providerUri, `
+<template><Consumer /></template>
+<script setup lang="ts">
+import Consumer from './Consumer.vue'
+import { serviceKey } from './keys'
+
+provide(serviceKey, { ready: true })
+</script>
+`)
+    writeText(consumerUri, `
+<template><div /></template>
+<script setup lang="ts">
+import { serviceKey } from './keys'
+
+const service = inject(serviceKey)
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    index.syncDocumentContent(keyUri, keyContent)
+    const providerAfterFirstSync = index.getFile(providerUri)!
+    const consumerAfterFirstSync = index.getFile(consumerUri)!
+
+    index.syncDocumentContent(keyUri, keyContent)
+
+    expect(index.getFile(providerUri)).toBe(providerAfterFirstSync)
+    expect(index.getFile(consumerUri)).toBe(consumerAfterFirstSync)
+  })
+
   it('Vue3 .vue key 源文件更新时会重建依赖文件', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-vue-key-source-rebuild-'))
     const keyUri = path.join(root, 'src/KeySource.vue')
@@ -2857,11 +3211,12 @@ const service = inject(serviceKey)
     expect(index.findInjectUsages(providerUri, symbolKey)).toEqual([])
   })
 
-  it('Vue2 全局组件与 require.context 结果不变时不会重建已索引 Vue 文件', async () => {
+  it('Vue2 动态 require.context 不参与全局组件推断', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-stable-global-refresh-'))
     const registerUri = path.join(root, 'src/register.js')
     const autoUri = path.join(root, 'src/auto-components.js')
     const childUri = path.join(root, 'src/components/AutoChild.vue')
+    const contextChildUri = path.join(root, 'src/components/ContextChild.vue')
     const parentUri = path.join(root, 'src/Parent.vue')
 
     writeText(registerUri, `
@@ -2881,9 +3236,19 @@ export default {
 }
 </script>
 `)
+    writeText(contextChildUri, `
+<template><div /></template>
+<script>
+export default {
+  name: 'ContextChild',
+  props: { title: String },
+}
+</script>
+`)
     writeText(parentUri, `
 <template>
   <AutoChild title="hello" />
+  <ContextChild title="ignored" />
 </template>
 <script>
 export default {}
@@ -2895,16 +3260,18 @@ export default {}
     const beforeParent = index.getFile(parentUri)!
 
     expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(contextChildUri, 'title')).toHaveLength(0)
 
     writeText(autoUri, `
 const files = require.context('./components', true, /\\.vue$/)
-// 保存注册文件但 require.context 结果不变
+// 保存动态注册文件不应影响静态索引
 files.keys().forEach((key) => Vue.component(files(key).default.name, files(key).default))
 `)
     await index.syncGlobalComponentFile(autoUri)
 
     expect(index.getFile(parentUri)).toBe(beforeParent)
     expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(contextChildUri, 'title')).toHaveLength(0)
 
     writeText(registerUri, `
 import AutoChild from './components/AutoChild.vue'
@@ -2915,6 +3282,7 @@ Vue.component(AutoChild.name, AutoChild)
 
     expect(index.getFile(parentUri)).toBe(beforeParent)
     expect(index.findTemplatePropUsages(childUri, 'title')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(contextChildUri, 'title')).toHaveLength(0)
   })
 
   it('Vue2 EventBus 名称变化时仍会重建已索引 Vue 文件', async () => {
@@ -3057,6 +3425,44 @@ describe('Vue2 relation resolver', () => {
     expect(findRefMethodAccess(parent.content, closeOffset + 1)?.methodName).toBe('close')
   })
 
+  it('未注册的普通静态 ref 不会通过 import fallback 解析', () => {
+    const index = new WorkspaceIndex()
+    const childUri = path.join(fixtureRoot, 'UnregisteredRefChild.vue')
+    const parentUri = path.join(fixtureRoot, 'UnregisteredRefParent.vue')
+
+    index.indexContent(childUri, `
+<template><div /></template>
+<script>
+export default {
+  methods: {
+    open() {},
+  },
+}
+</script>
+`)
+    const parent = index.indexContent(parentUri, `
+<template>
+  <UnregisteredRefChild ref="child" />
+</template>
+<script>
+import UnregisteredRefChild from './UnregisteredRefChild.vue'
+
+export default {
+  methods: {
+    callChild() {
+      this.$refs.child.open()
+    },
+  },
+}
+</script>
+`)
+
+    expect(parent.scriptIndex.components).toEqual([])
+    expect(findRefComponent(parent, 'child')).toBeUndefined()
+    expect(index.resolveRefComponents(parent, 'child')).toEqual([])
+    expect(index.findRefMethodUsages(childUri, 'open')).toEqual([])
+  })
+
   it('解析 template props 到子组件 props', async () => {
     const index = await buildIndex()
     const parent = index.getFile(path.join(fixtureRoot, 'Parent.vue'))!
@@ -3079,17 +3485,16 @@ describe('Vue2 relation resolver', () => {
     const globalChild = index.getFile(path.join(fixtureRoot, 'global-components/GlobalChild.vue'))!
     const globalDialog = index.getFile(path.join(fixtureRoot, 'global-components/dialog/index.vue'))!
     const namedOnlyDialog = index.getFile(path.join(fixtureRoot, 'global-components/NamedOnlyDialog.vue'))!
-    const autoWidget = index.getFile(path.join(fixtureRoot, 'global-components/auto-widget/index.vue'))!
 
     expect(index.getGlobalComponents().map((component) => component.tag)).toContain('GlobalChild')
     expect(index.resolveComponent(parent, 'GlobalChild')).toBe(globalChild.uri)
     expect(index.resolveComponent(parent, 'GlobalDialog')).toBe(globalDialog.uri)
     expect(index.resolveComponent(parent, 'NamedOnlyDialog')).toBe(namedOnlyDialog.uri)
-    expect(index.resolveComponent(parent, 'AutoWidget')).toBe(autoWidget.uri)
+    expect(index.resolveComponent(parent, 'AutoWidget')).toBeUndefined()
     expect(index.resolveRefComponent(parent, 'globalChild')).toBe(globalChild.uri)
     expect(index.resolveRefComponent(parent, 'dialog')).toBe(globalDialog.uri)
     expect(index.resolveRefComponent(parent, 'namedOnlyDialog')).toBe(namedOnlyDialog.uri)
-    expect(index.resolveRefComponent(parent, 'autoWidget')).toBe(autoWidget.uri)
+    expect(index.resolveRefComponent(parent, 'autoWidget')).toBeUndefined()
     expect(index.findTemplatePropUsages(globalChild.uri, 'label')).toHaveLength(1)
     expect(index.findTemplateEventUsages(globalChild.uri, 'ready')).toHaveLength(1)
     expect(index.findRefMethodUsages(globalChild.uri, 'focus')).toHaveLength(1)
@@ -3097,7 +3502,6 @@ describe('Vue2 relation resolver', () => {
     expect(index.findTemplateEventUsages(globalDialog.uri, 'confirm')).toHaveLength(1)
     expect(index.findTemplatePropUsages(namedOnlyDialog.uri, 'title')).toHaveLength(1)
     expect(index.findRefMethodUsages(namedOnlyDialog.uri, 'show')).toHaveLength(1)
-    expect(index.findRefMethodUsages(autoWidget.uri, 'refresh')).toHaveLength(1)
   })
 
   it('全局注册会过滤第三方 package 组件', async () => {

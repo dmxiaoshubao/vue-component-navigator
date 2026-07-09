@@ -22,10 +22,29 @@ type UsageCommandArgs =
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
-  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' | 'hook' }
+  | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' | 'hook' | 'component-consumer' }
 
 type PackageDependencies = Record<string, string | undefined> | undefined
 type EntryConfig = string | readonly string[] | undefined
+type CancellationLike = { readonly isCancellationRequested: boolean }
+
+const PACKAGE_SCAN_LIMIT = 200
+const packageScanIgnoredDirs = new Set([
+  'node_modules',
+  '.git',
+  '.vscode',
+  '.idea',
+  '.nuxt',
+  '.output',
+  'dist',
+  'out',
+  'build',
+  'coverage',
+  'public',
+  'vendor',
+  'tmp',
+  'temp',
+])
 
 interface PackageJson {
   dependencies?: PackageDependencies
@@ -156,11 +175,16 @@ export function activate(context: vscode.ExtensionContext): void {
           if (token.isCancellationRequested) {
             return false
           }
-          const vueVersion = await workspaceVueVersion(folder.uri.fsPath)
-          if (!vueVersion) {
+          const packages = await workspaceVuePackages(folder.uri.fsPath, token)
+          if (packages.length === 0) {
             continue
           }
-          await nextIndex.indexWorkspace(folder.uri.fsPath, token, getWorkspaceEntryConfig(folder), vueVersion)
+          for (const pkg of packages) {
+            if (token.isCancellationRequested) {
+              return false
+            }
+            await nextIndex.indexWorkspace(pkg.root, token, getWorkspaceEntryConfig(folder), pkg.version)
+          }
         }
         if (token.isCancellationRequested) {
           return false
@@ -208,7 +232,7 @@ export function activate(context: vscode.ExtensionContext): void {
     featuresRegistered = true
     featureDisposables.push(
       vscode.languages.registerDefinitionProvider(selector, new VueDefinitionProvider(index)),
-      vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?', '\'', '"'),
+      vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?', '\'', '"', ':'),
       vscode.languages.registerHoverProvider(selector, new VueHoverProvider(index)),
       vscode.languages.registerReferenceProvider(selector, new VueReferenceProvider(index)),
       vscode.languages.registerCodeLensProvider([{ language: 'vue', scheme: 'file' }], new VueCodeLensProvider(index)),
@@ -339,6 +363,12 @@ export function activate(context: vscode.ExtensionContext): void {
         return {
           usages: index.findComposableReturnUsagesFromSource(args.sourceUri, args.offset),
           placeHolder: 'Select hook usage',
+        }
+      }
+      if (args.relation === 'component-consumer') {
+        return {
+          usages: index.findMixinConsumersFromSource(args.sourceUri, args.offset),
+          placeHolder: 'Select component consumer',
         }
       }
       if (args.relation === 'provide') {
@@ -501,11 +531,55 @@ function isAliasConfigFile(filePath: string): boolean {
 
 async function hasSupportedVueWorkspace(): Promise<boolean> {
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    if (await workspaceVueVersion(folder.uri.fsPath)) {
+    if ((await workspaceVuePackages(folder.uri.fsPath)).length > 0) {
       return true
     }
   }
   return false
+}
+
+async function workspaceVuePackages(root: string, token?: CancellationLike): Promise<Array<{ root: string, version: VueMajorVersion }>> {
+  const rootVersion = await workspaceVueVersion(root)
+  if (rootVersion) {
+    return [{ root, version: rootVersion }]
+  }
+
+  const results: Array<{ root: string, version: VueMajorVersion }> = []
+
+  async function walk(directory: string): Promise<void> {
+    if (token?.isCancellationRequested || results.length >= PACKAGE_SCAN_LIMIT) {
+      return
+    }
+
+    let entries: Array<import('node:fs').Dirent>
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true })
+    } catch {
+      return
+    }
+
+    const packageEntry = entries.find((entry) => entry.isFile() && entry.name === 'package.json')
+    if (packageEntry) {
+      const version = await workspaceVueVersion(directory)
+      if (version) {
+        results.push({ root: directory, version })
+        return
+      }
+    }
+
+    for (const entry of entries) {
+      if (token?.isCancellationRequested || results.length >= PACKAGE_SCAN_LIMIT) {
+        return
+      }
+      if (!entry.isDirectory() || packageScanIgnoredDirs.has(entry.name)) {
+        continue
+      }
+      await walk(path.join(directory, entry.name))
+    }
+  }
+
+  await walk(root)
+  return results
 }
 
 async function workspaceVueVersion(root: string): Promise<VueMajorVersion | undefined> {

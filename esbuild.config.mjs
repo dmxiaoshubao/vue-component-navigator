@@ -1,5 +1,6 @@
 import { build } from 'esbuild'
 import { rm } from 'node:fs/promises'
+import path from 'node:path'
 
 await rm('dist', { recursive: true, force: true })
 
@@ -43,6 +44,15 @@ const optionalVueTemplateEngines = [
   'whiskers',
 ]
 
+const vscodeTypeScriptPlugin = {
+  name: 'vscode-typescript-runtime',
+  setup(build) {
+    build.onResolve({ filter: /^typescript$/ }, () => ({
+      path: path.resolve('src/utils/typescriptRuntime.ts'),
+    }))
+  },
+}
+
 await build({
   entryPoints: ['src/extension.ts'],
   outfile: 'dist/src/extension.js',
@@ -51,5 +61,6 @@ await build({
   format: 'cjs',
   target: 'node16',
   external: ['vscode', ...optionalVueTemplateEngines],
+  plugins: [vscodeTypeScriptPlugin],
   sourcemap: false,
 })

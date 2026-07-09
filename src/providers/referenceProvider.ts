@@ -29,6 +29,12 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
 
   provideReferences(document: vscode.TextDocument, position: vscode.Position): vscode.ProviderResult<vscode.Location[]> {
     const vueDocument = isVueDocument(document)
+    if (document.uri.scheme !== 'file') {
+      return []
+    }
+    if (vueDocument && !this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
+      return []
+    }
     if (!vueDocument && !this.index.hasIndexedDocumentContext(document.uri.fsPath)) {
       return []
     }
@@ -36,7 +42,7 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
     const content = document.getText()
     const file = vueDocument
       ? this.index.syncContent(document.uri.fsPath, content)
-      : this.index.getFile(document.uri.fsPath)
+      : this.index.syncDocumentContent(document.uri.fsPath, content, document.version) ?? this.index.getFile(document.uri.fsPath)
     const offset = vueDocument
       ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
       : positionToOffset(createLineStarts(content), { line: position.line, character: position.character })
@@ -118,6 +124,7 @@ export class VueReferenceProvider implements vscode.ReferenceProvider {
       ...this.index.findEventBusListenersFromSource(sourceUri, offset),
       ...this.index.findEventBusEmitsFromSource(sourceUri, offset),
       ...this.index.findInjectUsagesFromProvideSource(sourceUri, offset),
+      ...this.index.findMixinConsumersFromSource(sourceUri, offset),
     ].map((usage) => toLocation(usage.file, usage.span, usage.sourceLocation))
   }
 }

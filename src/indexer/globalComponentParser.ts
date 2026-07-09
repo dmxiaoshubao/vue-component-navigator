@@ -1,5 +1,5 @@
 import path from 'node:path'
-import type { GlobalComponentContext, GlobalComponentRegistration, ImportInfo, TextSpan } from './types'
+import type { GlobalComponentRegistration, ImportInfo, TextSpan } from './types'
 import { resolveImportPath } from './relationResolver'
 import { findCodeToken, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
 
@@ -251,30 +251,6 @@ function findNextComponentCall(content: string, startIndex: number): number {
   }
 
   return -1
-}
-
-export function guessGlobalComponentsFromRequireContext(uri: string, content: string): GlobalComponentContext[] {
-  if (!content.includes('require.context') || !content.includes('.component')) {
-    return []
-  }
-
-  const contextMatch = /require\.context\(\s*(['"])([^'"]+)\1\s*,\s*true\s*,\s*\/\\\.vue\$\/\s*\)/.exec(content)
-  if (!contextMatch) {
-    return []
-  }
-
-  const root = path.resolve(path.dirname(uri), contextMatch[2])
-  if (isInsideNodeModules(root)) {
-    return []
-  }
-
-  return [{
-    source: contextMatch[2],
-    targetUri: root,
-    nameSpan: { start: contextMatch.index, end: contextMatch.index + contextMatch[0].length },
-    registerSpan: { start: contextMatch.index, end: contextMatch.index + contextMatch[0].length },
-    fileUri: uri,
-  }]
 }
 
 function isInsideNodeModules(file: string): boolean {

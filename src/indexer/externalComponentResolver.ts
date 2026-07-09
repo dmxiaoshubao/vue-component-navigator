@@ -82,6 +82,14 @@ function parseDtsComponent(uri: string, componentName: string): VueFileIndex | u
       staticComponentNames: [],
       props: [],
       methods,
+      optionMembers: methods.map((method) => ({
+        name: method.name,
+        kind: 'method',
+        span: method.span,
+        detail: method.signature,
+        documentation: method.documentation,
+        sourceLocation: method.sourceLocation,
+      })),
       emits: [],
       eventBusCalls: [],
       provides: [],
@@ -90,7 +98,7 @@ function parseDtsComponent(uri: string, componentName: string): VueFileIndex | u
       composableReturnUsages: [],
       slots: [],
     },
-    templateIndex: { components: [], emits: [], eventBusCalls: [], slots: [] },
+    templateIndex: { components: [], emits: [], eventBusCalls: [], slots: [], instanceMembers: [] },
     refMethodCalls: [],
   }
 }

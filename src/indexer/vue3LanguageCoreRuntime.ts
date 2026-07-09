@@ -26,7 +26,7 @@ import type {
   Vue3PropUsage,
 } from './types'
 import type { VueRuntimeEngine } from './vueRuntime'
-import { createComposableReturnParseCache, parseComposableReturnUsages, resolveComposableImport, isComposableImport, type ComposableReturnParseCache } from './composableParser'
+import { cacheComposableReturnDefinitions, createComposableReturnParseCache, parseComposableReturnUsages, resolveComposableImport, isComposableImport, type ComposableReturnParseCache } from './composableParser'
 import { resolveImportPathWithExtensions } from './relationResolver'
 import { collectStaticComponentNameBindings } from './scriptParser'
 import { parseTemplate } from './templateParser'
@@ -157,6 +157,8 @@ export class Vue3LanguageCoreRuntime implements VueRuntimeEngine {
   private readonly staticKeyCache = new Map<string, StaticKeyCacheEntry>()
   private readonly composableReturnParseCache: ComposableReturnParseCache = createComposableReturnParseCache()
   private readonly forwardedRefMethodNameCache = new Map<string, ForwardedRefMethodNameCacheEntry>()
+  private readonly syncedSourceVersions = new Map<string, number>()
+  private readonly syncedSourceContents = new Map<string, string>()
 
   constructor(private readonly host: Vue3LanguageCoreRuntimeHost) {}
 
@@ -165,6 +167,8 @@ export class Vue3LanguageCoreRuntime implements VueRuntimeEngine {
     this.staticKeyCache.clear()
     this.composableReturnParseCache.clear()
     this.forwardedRefMethodNameCache.clear()
+    this.syncedSourceVersions.clear()
+    this.syncedSourceContents.clear()
   }
 
   replaceWith(other: Vue3LanguageCoreRuntime): void {
@@ -172,6 +176,8 @@ export class Vue3LanguageCoreRuntime implements VueRuntimeEngine {
     replaceMap(this.staticKeyCache, other.staticKeyCache, cloneStaticKeyCacheEntry)
     replaceMap(this.composableReturnParseCache, other.composableReturnParseCache)
     replaceMap(this.forwardedRefMethodNameCache, other.forwardedRefMethodNameCache, cloneForwardedRefMethodNameCacheEntry)
+    replaceMap(this.syncedSourceVersions, other.syncedSourceVersions)
+    replaceMap(this.syncedSourceContents, other.syncedSourceContents)
   }
 
   invalidate(uri: string): void {
@@ -179,6 +185,46 @@ export class Vue3LanguageCoreRuntime implements VueRuntimeEngine {
     this.staticKeyCache.delete(uri)
     this.composableReturnParseCache.delete(uri)
     this.forwardedRefMethodNameCache.delete(uri)
+    this.syncedSourceVersions.delete(uri)
+    this.syncedSourceContents.delete(uri)
+  }
+
+  syncSourceContent(uri: string, content: string, version?: number): boolean {
+    if (version !== undefined && this.syncedSourceVersions.get(uri) === version) {
+      return false
+    }
+    if (version === undefined && this.syncedSourceContents.get(uri) === content) {
+      return false
+    }
+    this.typeSourceCache.delete(uri)
+    this.staticKeyCache.delete(uri)
+    this.composableReturnParseCache.delete(uri)
+    this.forwardedRefMethodNameCache.delete(uri)
+
+    const context = createVue3LanguageCoreContext(uri, content)
+    this.typeSourceCache.set(uri, {
+      mtimeMs: -1,
+      size: -1,
+      source: {
+        uri,
+        lineStarts: context.lineStarts,
+        segments: contextSegments(context),
+      },
+    })
+    this.staticKeyCache.set(uri, {
+      mtimeMs: -1,
+      size: -1,
+      keys: collectLocalStaticKeys(uri, context.lineStarts, contextSegments(context)),
+    })
+    cacheComposableReturnDefinitions(uri, content, this.composableReturnParseCache)
+    if (version === undefined) {
+      this.syncedSourceVersions.delete(uri)
+      this.syncedSourceContents.set(uri, content)
+    } else {
+      this.syncedSourceVersions.set(uri, version)
+      this.syncedSourceContents.delete(uri)
+    }
+    return true
   }
 
   shouldIndexScriptContent(content: string): boolean {
@@ -189,7 +235,7 @@ export class Vue3LanguageCoreRuntime implements VueRuntimeEngine {
     const context = createVue3LanguageCoreContext(uri, sfc.content)
     const scriptIndex = this.createScriptIndex(context)
     const templateIndex = context.template
-      ? parseTemplate(context.template.content, context.template.start, componentTagAliases(scriptIndex), scriptIndex.staticComponentNames, [], true)
+      ? parseTemplate(context.template.content, context.template.start, componentTagAliases(scriptIndex), scriptIndex.staticComponentNames, [], true, new Set<string>())
       : emptyTemplateIndex(isScriptFile(uri) && !uri.endsWith('.vue') ? parseScriptRefComponentUsages(context, scriptIndex.imports, this.host.workspaceRoots()) : [])
     const mergedScriptIndex = mergeTemplateRelations(scriptIndex, templateIndex)
 
@@ -260,6 +306,7 @@ export class Vue3LanguageCoreRuntime implements VueRuntimeEngine {
       staticComponentNames: collectStaticComponentNames(segments),
       props: propsState.props,
       methods,
+      optionMembers: [],
       emits,
       eventBusCalls: [],
       provides: collectProvides(segments, staticKeys),
@@ -286,7 +333,7 @@ export class Vue3LanguageCoreRuntime implements VueRuntimeEngine {
     try {
       const stats = fsSync.statSync(uri)
       const cached = this.typeSourceCache.get(uri)
-      if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+      if (cached && (cached.mtimeMs === -1 || (cached.mtimeMs === stats.mtimeMs && cached.size === stats.size))) {
         return cached.source
       }
 
@@ -362,7 +409,7 @@ export class Vue3LanguageCoreRuntime implements VueRuntimeEngine {
     try {
       const stats = fsSync.statSync(sourceUri)
       const cached = this.forwardedRefMethodNameCache.get(sourceUri)
-      if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+      if (cached && (cached.mtimeMs === -1 || (cached.mtimeMs === stats.mtimeMs && cached.size === stats.size))) {
         return cached.methodsByExportName.get(exportName) ?? []
       }
 
@@ -511,6 +558,7 @@ function emptyScriptIndex(imports: ImportInfo[] = []): ScriptIndex {
     staticComponentNames: [],
     props: [],
     methods: [],
+    optionMembers: [],
     emits: [],
     eventBusCalls: [],
     provides: [],
@@ -527,6 +575,7 @@ function emptyTemplateIndex(components: TemplateComponentUsage[] = []): Template
     emits: [],
     eventBusCalls: [],
     slots: [],
+    instanceMembers: [],
   }
 }
 
@@ -1388,7 +1437,7 @@ function readCachedStaticKeys(targetUri: string, cache: Map<string, StaticKeyCac
   try {
     const stats = fsSync.statSync(targetUri)
     const cached = cache.get(targetUri)
-    if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+    if (cached && (cached.mtimeMs === -1 || (cached.mtimeMs === stats.mtimeMs && cached.size === stats.size))) {
       return cached.keys
     }
     const content = fsSync.readFileSync(targetUri, 'utf8')

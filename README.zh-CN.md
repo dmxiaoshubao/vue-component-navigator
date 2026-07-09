@@ -17,6 +17,7 @@
 - Vue 3 使用 `@vue/language-core` 获取 SFC 结构和宏相关 script ranges，不再走旧的 Vue 3 script parser 路径。
 - Vue 3 关系索引聚焦静态组件契约：`defineProps`、`defineEmits`、`defineModel`、`defineSlots`、`defineExpose`、typed template refs、composable 返回成员，以及静态 provide/inject key。
 - Vue 2 和 Vue 3 的缓存、反向索引和增量重建规则保持隔离。
+- VSIX 会复用 VS Code 内置 TypeScript runtime 做 Vue 3 索引，不再把完整 TypeScript 打进 `extension.js`。
 
 ## 功能演示
 

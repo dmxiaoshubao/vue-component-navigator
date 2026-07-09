@@ -41,6 +41,25 @@ describe('Extension lifecycle indexing', () => {
     vi.resetModules()
   })
 
+  it('从 VS Code 共享 node_modules 加载 TypeScript runtime', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const extensionRoot = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vscode-ts-')), 'typescript-language-features')
+    const runtimePath = path.join(extensionRoot, '../node_modules/typescript/lib/typescript.js')
+    writeText(runtimePath, `
+module.exports = {
+  version: 'fake-vscode-typescript',
+  createSourceFile() {},
+}
+`)
+    vscode.extensionValues.set('vscode.typescript-language-features', { extensionPath: extensionRoot })
+
+    const runtime = await import('../src/utils/typescriptRuntime')
+
+    expect(runtime.vscodeTypeScriptRuntimeCandidates(extensionRoot)).toContain('../node_modules/typescript/lib/typescript.js')
+    expect((runtime.loadTypeScript() as any).version).toBe('fake-vscode-typescript')
+  })
+
   it('reindex 时没有 Vue 2 package 会禁用索引', async () => {
     const vscode = await import('vscode') as any
     vscode.resetMockState()
@@ -331,6 +350,29 @@ export default {
     expect(vscode.providerRegistrations).not.toContain('inlayHint')
     expect(vscode.providerSelectors.flat().map((selector: any) => selector.language)).toContain('typescriptreact')
     expect(vscode.providerSelectors.flat().map((selector: any) => selector.language)).toContain('javascriptreact')
+    expect(vscode.informationMessages.at(-1)).toContain('Supported Vue package detected: yes')
+    expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: yes')
+  })
+
+  it('根 package 无 Vue 时会识别 monorepo 子包 Vue 项目', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-monorepo-vue-package-'))
+    const appRoot = path.join(root, 'packages/app')
+    const file = path.join(appRoot, 'src/App.vue')
+    writeText(path.join(root, 'package.json'), JSON.stringify({ private: true, workspaces: ['packages/*'] }))
+    writeText(path.join(appRoot, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(file, '<template><div /></template><script setup lang="ts"></script>')
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+    await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+    vscode.window.activeTextEditor = { document: new TestDocument(file, fs.readFileSync(file, 'utf8')) }
+    await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
+
     expect(vscode.informationMessages.at(-1)).toContain('Supported Vue package detected: yes')
     expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: yes')
   })

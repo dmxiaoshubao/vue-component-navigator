@@ -1,6 +1,6 @@
 import path from 'node:path'
 import fs from 'node:fs'
-import type { UsageInfo, VueFileIndex } from './types'
+import type { ComponentRegistration, UsageInfo, VueFileIndex } from './types'
 import type { WorkspaceIndex } from './workspaceIndex'
 import { matchesName, toCamelCase, toKebabCase } from '../utils/casing'
 
@@ -251,11 +251,16 @@ export function findRegisteredComponent(parent: VueFileIndex, tag: string): stri
     return cache.get(normalizedTag)
   }
 
-  const registration = parent.scriptIndex.components.find((component) => {
-    return component.tag === tag || toKebabCase(component.tag) === normalizedTag
-  })
+  const registration = findRegisteredComponentRegistration(parent, tag)
   cache.set(normalizedTag, registration?.targetUri)
   return registration?.targetUri
+}
+
+export function findRegisteredComponentRegistration(parent: VueFileIndex, tag: string): ComponentRegistration | undefined {
+  const normalizedTag = toKebabCase(tag)
+  return parent.scriptIndex.components.find((component) => {
+    return component.tag === tag || toKebabCase(component.tag) === normalizedTag
+  }) ?? parent.scriptIndex.components.find((component) => toKebabCase(component.localName) === normalizedTag)
 }
 
 export function hasRegisteredComponent(parent: VueFileIndex, tag: string): boolean {
@@ -286,8 +291,10 @@ export function findRefComponent(parent: VueFileIndex, refName: string): string 
   if (!usage) {
     return undefined
   }
-  const tags = usage.dynamicTags?.length ? usage.dynamicTags : [usage.tag]
-  return tags.map((tag) => findRegisteredComponent(parent, tag)).find(Boolean)
+  if (usage.dynamicTags?.length) {
+    return usage.dynamicTags.map((tag) => resolveTemplateComponentUriInFile(parent, tag, true)).find(Boolean)
+  }
+  return resolveTemplateComponentUriInFile(parent, usage.tag, false)
 }
 
 export function findResolvedRefComponent(index: WorkspaceIndex, parent: VueFileIndex, refName: string): string | undefined {
@@ -360,8 +367,23 @@ export function findIndexedEventBusListeners(index: WorkspaceIndex, busName: str
 }
 
 function templateComponentMatches(file: VueFileIndex, component: VueFileIndex['templateIndex']['components'][number], childUri: string): boolean {
-  const tags = component.dynamicTags?.length ? component.dynamicTags : [component.tag]
-  return tags.some((tag) => findRegisteredComponent(file, tag) === childUri)
+  if (component.dynamicTags?.length) {
+    return component.dynamicTags.some((tag) => resolveTemplateComponentUriInFile(file, tag, true) === childUri)
+  }
+  return resolveTemplateComponentUriInFile(file, component.tag, false) === childUri
+}
+
+function resolveTemplateComponentUriInFile(file: VueFileIndex, tag: string, allowImportFallback: boolean): string | undefined {
+  return findRegisteredComponent(file, tag) ?? (allowImportFallback ? resolveImportedVueComponentInFile(file, tag) : undefined)
+}
+
+function resolveImportedVueComponentInFile(file: VueFileIndex, tag: string): string | undefined {
+  const normalizedTag = toKebabCase(tag)
+  const imported = file.scriptIndex.imports.find((item) => {
+    return !item.isTypeOnly && (item.localName === tag || toKebabCase(item.localName) === normalizedTag)
+  })
+  const resolved = imported ? resolveImportPath(file.uri, imported.source) : undefined
+  return resolved?.endsWith('.vue') && fs.existsSync(resolved) ? resolved : undefined
 }
 
 export function findProvide(file: VueFileIndex, provideKey: string) {

@@ -1,4 +1,4 @@
-import type { ComponentRegistration, ImportInfo, MixinReference, PropInfo, ProvideInfo, ScriptIndex, StaticComponentNameBinding, TextSpan } from './types'
+import type { ComponentRegistration, ImportInfo, MixinReference, OptionMemberInfo, PropInfo, ProvideInfo, ScriptIndex, StaticComponentNameBinding, TextSpan } from './types'
 import { resolveImportPath, resolveImportPathWithExtensions } from './relationResolver'
 import { parseEventBusCalls } from './eventBusParser'
 import { findCodeToken, readStringLiteral, skipStringCommentOrRegex } from '../utils/scriptScan'
@@ -15,6 +15,12 @@ interface PropertyValue {
 interface StaticComponentAlias {
   localName?: string
   source?: string
+}
+
+interface ExportObject {
+  open: number
+  close: number
+  span: TextSpan
 }
 
 function skipWhitespace(content: string, index: number): number {
@@ -141,7 +147,7 @@ function findMatchingBracket(content: string, openIndex: number): number {
   return content.length - 1
 }
 
-function findDefaultExportObject(content: string): { open: number, close: number } | undefined {
+function findDefaultExportObject(content: string): ExportObject | undefined {
   const exportIndex = findCodeToken(content, 'export default')
   if (exportIndex === -1) {
     return undefined
@@ -158,13 +164,18 @@ function findDefaultExportObject(content: string): { open: number, close: number
       continue
     }
 
-    return { open: index, close: findMatchingBracket(content, index) }
+    const close = findMatchingBracket(content, index)
+    return {
+      open: index,
+      close,
+      span: { start: exportIndex, end: exportIndex + 'export default'.length },
+    }
   }
 
   return undefined
 }
 
-function findNamedExportObject(content: string, exportName: string): { open: number, close: number } | undefined {
+function findNamedExportObject(content: string, exportName: string): ExportObject | undefined {
   let index = 0
 
   while (index < content.length) {
@@ -195,7 +206,12 @@ function findNamedExportObject(content: string, exportName: string): { open: num
 
     cursor = skipTrivia(content, cursor + 1)
     if (content[cursor] === '{') {
-      return { open: cursor, close: findMatchingBracket(content, cursor) }
+      const close = findMatchingBracket(content, cursor)
+      return {
+        open: cursor,
+        close,
+        span: { start: name.start, end: name.end },
+      }
     }
     index = cursor
   }
@@ -203,10 +219,15 @@ function findNamedExportObject(content: string, exportName: string): { open: num
   return undefined
 }
 
-function findExportObject(content: string, exportName = 'default'): { open: number, close: number } | undefined {
+function findExportObject(content: string, exportName = 'default'): ExportObject | undefined {
   return exportName === 'default'
     ? findDefaultExportObject(content)
     : findNamedExportObject(content, exportName)
+}
+
+export function findScriptExportSourceSpan(content: string, exportName = 'default', scriptStart = 0): TextSpan | undefined {
+  const span = findExportObject(content, exportName)?.span
+  return span ? { start: scriptStart + span.start, end: scriptStart + span.end } : undefined
 }
 
 function findTopLevelProperty(content: string, open: number, close: number, name: string): PropertyValue | undefined {
@@ -1047,6 +1068,27 @@ function parseMixins(content: string, mixins: PropertyValue | undefined, imports
   return results
 }
 
+function parseExtends(content: string, extendsProperty: PropertyValue | undefined, imports: ImportInfo[], uri: string, scriptStart: number, workspaceRoots: string[]): MixinReference | undefined {
+  if (!extendsProperty) {
+    return undefined
+  }
+
+  const identifier = readIdentifier(content, extendsProperty.valueStart)
+  if (!identifier || skipTrivia(content, identifier.end) !== extendsProperty.valueEnd) {
+    return undefined
+  }
+
+  const imported = new Map(imports.map((item) => [item.localName, item])).get(identifier.value)
+  const source = imported?.source
+  return {
+    localName: identifier.value,
+    importedName: imported?.importedName,
+    source,
+    targetUri: source ? resolveImportPathWithExtensions(uri, source, workspaceRoots, ['.js', '.ts', '.vue']) : undefined,
+    span: { start: scriptStart + identifier.start, end: scriptStart + identifier.end },
+  }
+}
+
 function findArrayEntryEnd(content: string, start: number, end: number): number {
   let index = start
   let depth = 0
@@ -1166,6 +1208,119 @@ function parseMethods(content: string, methods: PropertyValue | undefined, scrip
     })
   })
   return results
+}
+
+function parseComputedMembers(content: string, computed: PropertyValue | undefined, scriptStart: number): OptionMemberInfo[] {
+  if (!computed || content[computed.valueStart] !== '{') {
+    return []
+  }
+
+  const results: OptionMemberInfo[] = []
+  eachObjectMember(content, computed.valueStart, computed.valueEnd - 1, (member) => {
+    results.push({
+      name: member.name,
+      kind: 'computed',
+      span: { start: scriptStart + member.nameSpan.start, end: scriptStart + member.nameSpan.end },
+      detail: content.slice(member.nameSpan.start, member.valueEnd).trim(),
+      documentation: member.documentation,
+    })
+  })
+  return results
+}
+
+function findReturnedObjectRange(content: string, bodyStart: number, bodyEnd: number): { open: number, close: number } | undefined {
+  let depth = 0
+
+  for (let index = bodyStart; index < bodyEnd; index += 1) {
+    const skipped = skipStringCommentOrRegex(content, index)
+    if (skipped !== undefined) {
+      index = skipped - 1
+      continue
+    }
+
+    const char = content[index]
+    if (char === '{' || char === '[' || char === '(') {
+      depth += 1
+      continue
+    }
+    if (char === '}' || char === ']' || char === ')') {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (depth !== 0 || !isCodeTokenAt(content, 'return', index)) {
+      continue
+    }
+
+    const objectStart = skipTrivia(content, index + 'return'.length)
+    if (content[objectStart] !== '{') {
+      continue
+    }
+    return { open: objectStart, close: findMatchingBracket(content, objectStart) }
+  }
+
+  return undefined
+}
+
+function findDataObjectRange(content: string, data: PropertyValue | undefined): { open: number, close: number } | undefined {
+  if (!data) {
+    return undefined
+  }
+
+  if (content[data.valueStart] === '{') {
+    return { open: data.valueStart, close: data.valueEnd - 1 }
+  }
+
+  const body = functionBodyRange(content, data.valueStart, data.valueEnd)
+  if (body) {
+    return findReturnedObjectRange(content, body.start, body.end)
+  }
+
+  let cursor = data.valueStart
+  const paramsEnd = content[cursor] === '(' ? findMatchingBracket(content, cursor) : undefined
+  if (paramsEnd === undefined) {
+    return undefined
+  }
+  cursor = skipTrivia(content, paramsEnd + 1)
+  if (content.slice(cursor, cursor + 2) !== '=>') {
+    return undefined
+  }
+  cursor = skipTrivia(content, cursor + 2)
+  if (content[cursor] === '(') {
+    cursor = skipTrivia(content, cursor + 1)
+  }
+  if (content[cursor] !== '{') {
+    return undefined
+  }
+  return { open: cursor, close: findMatchingBracket(content, cursor) }
+}
+
+function parseDataMembers(content: string, data: PropertyValue | undefined, scriptStart: number): OptionMemberInfo[] {
+  const objectRange = findDataObjectRange(content, data)
+  if (!objectRange) {
+    return []
+  }
+
+  const results: OptionMemberInfo[] = []
+  eachObjectMember(content, objectRange.open, objectRange.close, (member) => {
+    results.push({
+      name: member.name,
+      kind: 'data',
+      span: { start: scriptStart + member.nameSpan.start, end: scriptStart + member.nameSpan.end },
+      detail: content.slice(member.nameSpan.start, member.valueEnd).trim(),
+      documentation: member.documentation,
+    })
+  })
+  return results
+}
+
+function methodOptionMembers(methods: ScriptIndex['methods']): OptionMemberInfo[] {
+  return methods.map((method) => ({
+    name: method.name,
+    kind: 'method',
+    span: method.span,
+    detail: method.signature,
+    documentation: method.documentation,
+  }))
 }
 
 function parseEmits(content: string, scriptStart: number, start = 0, end = content.length): ScriptIndex['emits'] {
@@ -1327,11 +1482,13 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
   if (!exportObject) {
     return {
       imports,
+      extendsRef: undefined,
       mixins: [],
       components: [],
       staticComponentNames,
       props: [],
       methods: [],
+      optionMembers: [],
       emits: exportName === 'default' ? parseEmits(content, scriptStart) : [],
       eventBusCalls: exportName === 'default' ? parseEventBusCalls(content, scriptStart, eventBusNames) : [],
       provides: [],
@@ -1343,21 +1500,31 @@ export function parseScript(uri: string, content: string, scriptStart: number, w
   }
 
   const nameProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'name')
+  const extendsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'extends')
   const mixinsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'mixins')
   const componentsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'components')
   const propsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'props')
+  const dataProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'data')
+  const computedProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'computed')
   const methodsProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'methods')
   const provideProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'provide')
   const injectProperty = findTopLevelProperty(content, exportObject.open, exportObject.close, 'inject')
+  const methods = parseMethods(content, methodsProperty, scriptStart)
 
   return {
     componentName: nameProperty ? parseStringLiteral(content, nameProperty.valueStart, nameProperty.valueEnd) : undefined,
     imports,
+    extendsRef: parseExtends(content, extendsProperty, imports, uri, scriptStart, workspaceRoots),
     mixins: parseMixins(content, mixinsProperty, imports, uri, scriptStart, workspaceRoots),
     components: parseComponents(content, componentsProperty, imports, uri, scriptStart, workspaceRoots),
     staticComponentNames,
     props: parseProps(content, propsProperty, scriptStart),
-    methods: parseMethods(content, methodsProperty, scriptStart),
+    methods,
+    optionMembers: [
+      ...parseDataMembers(content, dataProperty, scriptStart),
+      ...parseComputedMembers(content, computedProperty, scriptStart),
+      ...methodOptionMembers(methods),
+    ],
     emits: parseEmits(content, scriptStart, exportObject.open, exportObject.close),
     eventBusCalls: parseEventBusCalls(content, scriptStart, eventBusNames, exportObject.open, exportObject.close),
     provides: parseProvides(content, provideProperty, scriptStart),

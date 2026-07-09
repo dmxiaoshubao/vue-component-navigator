@@ -17,6 +17,7 @@ Version `2.0.0` rebuilds the indexer around isolated Vue major-version runtimes.
 - Vue 3 uses `@vue/language-core` for SFC structure and macro-aware script ranges instead of the old Vue 3 script parser path.
 - Vue 3 relationship indexing is focused on static component contracts: `defineProps`, `defineEmits`, `defineModel`, `defineSlots`, `defineExpose`, typed template refs, composable return members, and static provide/inject keys.
 - Vue 2 and Vue 3 caches, reverse indexes, and incremental rebuild rules are intentionally separated.
+- The VSIX reuses VS Code's built-in TypeScript runtime for Vue 3 indexing instead of bundling a full TypeScript copy into `extension.js`.
 
 ## Demos
 

@@ -45,6 +45,14 @@ export function createComposableReturnParseCache(): ComposableReturnParseCache {
   return new Map()
 }
 
+export function cacheComposableReturnDefinitions(uri: string, content: string, cache: ComposableReturnParseCache): void {
+  cache.set(uri, {
+    mtimeMs: -1,
+    size: -1,
+    definitions: parseComposableReturnDefinitions(uri, content),
+  })
+}
+
 export function parseComposableReturnUsages(uri: string, sfc: ParsedSfc, imports: ImportInfo[], workspaceRoots: string[], cache?: ComposableReturnParseCache): ComposableReturnUsage[] {
   const composableImports = imports.filter(isComposableImport)
   const segments = [sfc.script, sfc.scriptSetup]
@@ -129,7 +137,7 @@ function readComposableReturnDefinitions(uri: string, cache?: ComposableReturnPa
   try {
     const stats = fsSync.statSync(uri)
     const cached = cache?.get(uri)
-    if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+    if (cached && (cached.mtimeMs === -1 || (cached.mtimeMs === stats.mtimeMs && cached.size === stats.size))) {
       return cached.definitions
     }
 
