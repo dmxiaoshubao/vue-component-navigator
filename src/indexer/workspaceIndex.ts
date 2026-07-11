@@ -1,7 +1,9 @@
 import fs from 'node:fs/promises'
+import fsSync from 'node:fs'
 import path from 'node:path'
 import type { ComposableReturnUsage, EmitInfo, EventBusCall, EventBusRegistration, EventBusUsageInfo, GlobalComponentRegistration, IndexCancellationToken, InjectInfo, MethodInfo, MixinReference, OptionMemberInfo, ParsedSfc, PropInfo, ProvideInfo, RefMethodAccess, ScriptIndex, SlotInfo, SourceLocation, TemplateIndex, TemplateComponentUsage, TextSpan, UsageInfo, VueFileIndex, Vue3PropTypeInfo, Vue3PropUsage, VueMajorVersion } from './types'
 import { isComposableImport, resolveComposableImport } from './composableParser'
+import { parseCommandComponentModule, parseCommandComponentUsages, type CommandComponentModule, type CommandComponentUsage } from './commandComponentParser'
 import { parseEventBusRegistrations, parseStaticImportSources } from './eventBusParser'
 import { resolveExternalRefComponent } from './externalComponentResolver'
 import { parseGlobalComponents } from './globalComponentParser'
@@ -27,6 +29,7 @@ const MAX_INITIAL_SCRIPT_SCAN_BYTES = 1_000_000
 interface ScriptComponentUsageFile {
   file: VueFileIndex
   usages: Array<{ childUri: string, span: TextSpan }>
+  commandUsages: CommandComponentUsage[]
 }
 
 interface ScriptComponentUsageImport {
@@ -57,7 +60,17 @@ function cloneScriptComponentUsageFile(usageFile: ScriptComponentUsageFile): Scr
   return {
     file: usageFile.file,
     usages: [...usageFile.usages],
+    commandUsages: [...usageFile.commandUsages],
   }
+}
+
+function cloneCommandComponentModule(module: CommandComponentModule | undefined): CommandComponentModule | undefined {
+  return module ? {
+    ...module,
+    componentUris: [...module.componentUris],
+    anchorSpan: { ...module.anchorSpan },
+    methods: module.methods.map((method) => ({ ...method, span: { ...method.span } })),
+  } : undefined
 }
 
 function cloneWeakSetTracking(files: VueFileIndex[], source: WeakMap<VueFileIndex, Set<string>>): WeakMap<VueFileIndex, Set<string>> {
@@ -112,6 +125,8 @@ export class WorkspaceIndex {
   private readonly eventBusRegistrations = new Map<string, EventBusRegistration[]>()
   private readonly propUsages = new Map<string, UsageInfo[]>()
   private readonly componentUsages = new Map<string, UsageInfo[]>()
+  private readonly commandComponentUsages = new Map<string, UsageInfo[]>()
+  private readonly commandComponentMethodUsages = new Map<string, UsageInfo[]>()
   private readonly eventUsages = new Map<string, UsageInfo[]>()
   private readonly slotUsages = new Map<string, UsageInfo[]>()
   private readonly eventBusEmits = new Map<string, EventBusUsageInfo[]>()
@@ -137,6 +152,7 @@ export class WorkspaceIndex {
   private readonly vue3ScriptImportConsumers = new Map<string, Set<string>>()
   private readonly parentComponents = new Map<string, Set<string>>()
   private readonly scriptComponentUsageFiles = new Map<string, ScriptComponentUsageFile>()
+  private readonly commandComponentModules = new Map<string, CommandComponentModule | undefined>()
   private readonly vue2Runtime = new Vue2Runtime({
     workspaceRoots: () => this.workspaceRoots,
     eventBusNames: () => this.getEventBusNames(),
@@ -151,7 +167,7 @@ export class WorkspaceIndex {
         await task()
       } finally {
         this.isBulkIndexing = false
-        this.rebuildReverseIndexes()
+        this.rebuildReverseIndexes(2)
       }
     },
   })
@@ -166,7 +182,7 @@ export class WorkspaceIndex {
         await task()
       } finally {
         this.isBulkIndexing = false
-        this.rebuildReverseIndexes()
+        this.rebuildReverseIndexes(3)
       }
     },
   })
@@ -189,6 +205,7 @@ export class WorkspaceIndex {
     this.globalComponentRegistrations.clear()
     this.eventBusRegistrations.clear()
     this.scriptComponentUsageFiles.clear()
+    this.commandComponentModules.clear()
     this.vue2Runtime.clear()
     this.vue3Runtime.clear()
     this.clearReverseIndexes()
@@ -210,6 +227,7 @@ export class WorkspaceIndex {
     replaceMap(this.globalComponentRegistrations, other.globalComponentRegistrations, cloneArray)
     replaceMap(this.eventBusRegistrations, other.eventBusRegistrations, cloneArray)
     replaceMap(this.scriptComponentUsageFiles, other.scriptComponentUsageFiles, cloneScriptComponentUsageFile)
+    replaceMap(this.commandComponentModules, other.commandComponentModules, cloneCommandComponentModule)
     this.vue2Runtime.replaceWith(other.vue2Runtime)
     this.vue3Runtime.replaceWith(other.vue3Runtime)
     this.replaceReverseIndexesWith(other)
@@ -230,7 +248,10 @@ export class WorkspaceIndex {
   }
 
   hasIndexedDocumentContext(uri: string): boolean {
-    return Boolean(this.getFile(uri)) || this.hasSourceRelations(uri) || this.hasVue3Source(uri)
+    return Boolean(this.getFile(uri))
+      || this.scriptComponentUsageFiles.has(uri)
+      || this.hasSourceRelations(uri)
+      || this.hasVue3Source(uri)
   }
 
   setEventBusEntries(root: string, entries: EventBusEntryConfig): void {
@@ -303,8 +324,9 @@ export class WorkspaceIndex {
   }
 
   resolveComponent(parent: VueFileIndex, tag: string): string | undefined {
-    return findRegisteredComponentInFile(parent, tag)
+    const targetUri = findRegisteredComponentInFile(parent, tag)
       ?? (parent.vueVersion === 2 ? this.resolveGlobalComponent(tag, parent.uri) : undefined)
+    return targetUri && this.isSameVueVersionRelation(parent, targetUri) ? targetUri : undefined
   }
 
   resolveTemplateComponentUris(parent: VueFileIndex, component: TemplateComponentUsage): string[] {
@@ -348,6 +370,12 @@ export class WorkspaceIndex {
     }
     const file = this.runtimeFor(vueVersion).indexContent(uri, sfc)
     this.files.set(uri, file)
+    const scriptUsageFile = this.scriptComponentUsageFiles.get(uri)
+    if (vueVersion === 3 && scriptUsageFile && scriptUsageFile.file !== file) {
+      // standalone 脚本已经拥有完整索引时复用同一个文件对象，避免常驻两套源码与行号数据。
+      this.removeTrackedFileUsages(scriptUsageFile.file)
+      scriptUsageFile.file = file
+    }
     if (this.isBulkIndexing) {
       return file
     }
@@ -364,12 +392,12 @@ export class WorkspaceIndex {
       || !sameStringSet(previousRelationshipChildren, relationshipChildren)
       || hasForwardedListeners(file)
       || (previous ? hasForwardedListeners(previous) : false)
-      || ((hasTemplateEventAttrs(file) || (previous ? hasTemplateEventAttrs(previous) : false)) && this.hasAnyForwardedListeners())
+      || ((hasTemplateEventAttrs(file) || (previous ? hasTemplateEventAttrs(previous) : false)) && this.hasAnyForwardedListeners(file.vueVersion))
       || hasForwardedAttrs(file)
       || (previous ? hasForwardedAttrs(previous) : false)
-      || ((hasTemplatePropAttrs(file) || (previous ? hasTemplatePropAttrs(previous) : false)) && this.hasAnyForwardedAttrs())
+      || ((hasTemplatePropAttrs(file) || (previous ? hasTemplatePropAttrs(previous) : false)) && this.hasAnyForwardedAttrs(file.vueVersion))
     ) {
-      this.rebuildReverseIndexes()
+      this.rebuildReverseIndexes(file.vueVersion)
     }
     if (wasMixinSource) {
       this.rebuildIndexedFilesByVersion(2)
@@ -448,7 +476,7 @@ export class WorkspaceIndex {
       this.parentComponents.delete(uri)
     }
     if (hadRelationships) {
-      this.rebuildReverseIndexes()
+      this.rebuildReverseIndexes(file?.vueVersion)
     }
     if (wasMixinSource) {
       this.rebuildIndexedFilesByVersion(2)
@@ -462,7 +490,7 @@ export class WorkspaceIndex {
     return this.indexContent(uri, await fs.readFile(uri, 'utf8'))
   }
 
-  async indexWorkspace(root: string, token?: IndexCancellationToken, eventBusEntries?: EventBusEntryConfig, vueVersion: VueMajorVersion = 2): Promise<void> {
+  async indexWorkspace(root: string, token?: IndexCancellationToken, eventBusEntries?: EventBusEntryConfig, vueVersion: VueMajorVersion = 2, excludedRoots: string[] = []): Promise<void> {
     this.setWorkspaceVueVersion(root, vueVersion)
     if (eventBusEntries !== undefined) {
       this.setEventBusEntries(root, eventBusEntries)
@@ -475,7 +503,7 @@ export class WorkspaceIndex {
       } else if (isScriptFile(file)) {
         scriptFiles.push(file)
       }
-    }, token)
+    }, token, excludedRoots)
     if (token?.isCancellationRequested) {
       return
     }
@@ -542,10 +570,13 @@ export class WorkspaceIndex {
   }
 
   async removeGlobalComponentFile(uri: string): Promise<void> {
+    const version = this.vueVersionForUri(uri)
+    const wasCommandModule = Boolean(this.resolveCommandComponentModule(uri))
     this.removeScriptComponentUsageFile(uri)
-    if (this.vueVersionForUri(uri) === 3) {
+    if (version === 3) {
       this.vue3Runtime.invalidate(uri)
       this.remove(uri)
+      if (wasCommandModule) this.rebuildReverseIndexes(version)
       return
     }
     const wasMixinSource = this.vue2Runtime.hasMixinSource(uri)
@@ -561,6 +592,8 @@ export class WorkspaceIndex {
       || beforeGlobals !== this.globalComponentsSignature()
     ) {
       this.rebuildIndexedFilesByVersion(2)
+    } else if (wasCommandModule) {
+      this.rebuildReverseIndexes(version)
     }
   }
 
@@ -632,6 +665,31 @@ export class WorkspaceIndex {
 
   findComponentUsages(childUri: string): UsageInfo[] {
     return dedupeUsages(this.componentUsages.get(childUri) ?? [])
+  }
+
+  getCommandComponentModule(uri: string): CommandComponentModule | undefined {
+    return this.resolveCommandComponentModule(uri)
+  }
+
+  findCommandComponentUsages(commandUri: string): UsageInfo[] {
+    return dedupeUsages(this.commandComponentUsages.get(commandUri) ?? [])
+  }
+
+  findCommandComponentMethodUsages(commandUri: string, methodName: string): UsageInfo[] {
+    return dedupeUsages(this.commandComponentMethodUsages.get(usageKey(commandUri, methodName)) ?? [])
+  }
+
+  findCommandComponentMethodAtOffset(uri: string, offset: number) {
+    const module = this.resolveCommandComponentModule(uri)
+    const method = module?.methods.find((item) => offset >= item.span.start && offset <= item.span.end)
+    return module && method ? { module, method } : undefined
+  }
+
+  syncScriptComponentUsageContent(uri: string, content: string, rebuild = true): void {
+    if (this.scriptComponentUsageFiles.get(uri)?.file.content === content) {
+      return
+    }
+    this.indexScriptComponentUsageContent(uri, content, rebuild)
   }
 
   findEventDefinitions(childUri: string, eventName: string): Array<{ file: VueFileIndex, emit: EmitInfo }> {
@@ -1113,6 +1171,8 @@ export class WorkspaceIndex {
   private clearReverseIndexes(): void {
     this.propUsages.clear()
     this.componentUsages.clear()
+    this.commandComponentUsages.clear()
+    this.commandComponentMethodUsages.clear()
     this.eventUsages.clear()
     this.slotUsages.clear()
     this.eventBusEmits.clear()
@@ -1148,6 +1208,8 @@ export class WorkspaceIndex {
   private replaceReverseIndexesWith(other: WorkspaceIndex): void {
     replaceMap(this.propUsages, other.propUsages, cloneArray)
     replaceMap(this.componentUsages, other.componentUsages, cloneArray)
+    replaceMap(this.commandComponentUsages, other.commandComponentUsages, cloneArray)
+    replaceMap(this.commandComponentMethodUsages, other.commandComponentMethodUsages, cloneArray)
     replaceMap(this.eventUsages, other.eventUsages, cloneArray)
     replaceMap(this.slotUsages, other.slotUsages, cloneArray)
     replaceMap(this.eventBusEmits, other.eventBusEmits, cloneArray)
@@ -1176,6 +1238,8 @@ export class WorkspaceIndex {
     const trackedUsageMapRemap = new Map<TrackedUsageMap, TrackedUsageMap>([
       [other.propUsages as TrackedUsageMap, this.propUsages as TrackedUsageMap],
       [other.componentUsages as TrackedUsageMap, this.componentUsages as TrackedUsageMap],
+      [other.commandComponentUsages as TrackedUsageMap, this.commandComponentUsages as TrackedUsageMap],
+      [other.commandComponentMethodUsages as TrackedUsageMap, this.commandComponentMethodUsages as TrackedUsageMap],
       [other.eventUsages as TrackedUsageMap, this.eventUsages as TrackedUsageMap],
       [other.slotUsages as TrackedUsageMap, this.slotUsages as TrackedUsageMap],
       [other.eventBusEmits as TrackedUsageMap, this.eventBusEmits as TrackedUsageMap],
@@ -1195,30 +1259,39 @@ export class WorkspaceIndex {
   }
 
   private reverseIndexTrackingFiles(): VueFileIndex[] {
-    return [
+    return [...new Set([
       ...this.files.values(),
       ...[...this.scriptComponentUsageFiles.values()].map((usageFile) => usageFile.file),
-    ]
+    ])]
   }
 
   private indexScriptComponentUsageContent(uri: string, content: string, rebuild = true): void {
     this.removeScriptComponentUsageFile(uri)
+    this.commandComponentModules.delete(uri)
+    const commandModule = parseCommandComponentModule(uri, content, this.workspaceRoots)
+    this.commandComponentModules.set(uri, commandModule)
+    const commandComponentUris = new Set(commandModule?.componentUris ?? [])
     const usages = parseScriptComponentUsages(uri, content, this.workspaceRoots)
       .filter((usage) => this.isInsideWorkspace(usage.childUri) && !isInsideNodeModules(usage.childUri))
-    if (usages.length === 0) {
+      .filter((usage) => this.isSameVueVersionUri(uri, usage.childUri))
+      .filter((usage) => !commandComponentUris.has(usage.childUri))
+    const commandUsages = this.parseCommandUsages(uri, content)
+    if (usages.length === 0 && commandUsages.length === 0 && !commandModule) {
       return
     }
 
     this.scriptComponentUsageFiles.set(uri, {
       file: scriptUsageFile(uri, content, this.vueVersionForUri(uri)),
       usages,
+      commandUsages,
     })
     if (rebuild && !this.isBulkIndexing) {
-      this.rebuildReverseIndexes()
+      this.rebuildReverseIndexes(this.vueVersionForUri(uri))
     }
   }
 
   private removeScriptComponentUsageFile(uri: string): void {
+    this.commandComponentModules.delete(uri)
     const usageFile = this.scriptComponentUsageFiles.get(uri)
     if (!usageFile) {
       return
@@ -1227,11 +1300,55 @@ export class WorkspaceIndex {
     this.scriptComponentUsageFiles.delete(uri)
   }
 
-  private addScriptComponentUsages(): void {
+  private addScriptComponentUsages(version?: VueMajorVersion): void {
     for (const usageFile of this.scriptComponentUsageFiles.values()) {
+      if (version !== undefined && usageFile.file.vueVersion !== version) {
+        continue
+      }
       for (const usage of usageFile.usages) {
         this.addUsage(this.componentUsages, usage.childUri, { file: usageFile.file, span: usage.span })
       }
+      // 已作为 Vue 3 standalone 文件建模时，command 关系会由 addRelationshipUsages 写入。
+      if (!this.files.has(usageFile.file.uri)) {
+        this.addCommandComponentUsageRelations(usageFile.file, usageFile.commandUsages)
+      }
+    }
+  }
+
+  private addCommandComponentUsageRelations(file: VueFileIndex, usages: CommandComponentUsage[]): void {
+    for (const usage of usages) {
+      const usageInfo = { file, span: usage.span }
+      this.addUsage(this.commandComponentUsages, usage.commandUri, usageInfo)
+      this.addUsage(this.commandComponentMethodUsages, usageKey(usage.commandUri, usage.methodName), usageInfo)
+      for (const componentUri of usage.componentUris) {
+        this.addUsage(this.componentUsages, componentUri, usageInfo)
+      }
+    }
+  }
+
+  private parseCommandUsages(uri: string, content: string): CommandComponentUsage[] {
+    return parseCommandComponentUsages(uri, content, this.workspaceRoots, (commandUri) => this.resolveCommandComponentModule(commandUri))
+      .filter((usage) => usage.componentUris.every((componentUri) => this.isSameVueVersionUri(uri, componentUri)))
+  }
+
+  private resolveCommandComponentModule(uri: string): CommandComponentModule | undefined {
+    if (this.commandComponentModules.has(uri)) {
+      return this.commandComponentModules.get(uri)
+    }
+    if (!this.isInsideWorkspace(uri) || isInsideNodeModules(uri)) {
+      this.commandComponentModules.set(uri, undefined)
+      return undefined
+    }
+    try {
+      const module = parseCommandComponentModule(uri, fsSync.readFileSync(uri, 'utf8'), this.workspaceRoots)
+      const valid = module && module.componentUris.every((componentUri) => this.isSameVueVersionUri(uri, componentUri))
+        ? module
+        : undefined
+      this.commandComponentModules.set(uri, valid)
+      return valid
+    } catch {
+      this.commandComponentModules.set(uri, undefined)
+      return undefined
     }
   }
 
@@ -1558,15 +1675,20 @@ export class WorkspaceIndex {
       this.addUsage(this.vue3PropInternalUsages, usageKey(file.uri, usage.propName), { file, span: usage.span })
     }
 
+    this.addCommandComponentUsageRelations(file, this.parseCommandUsages(file.uri, file.content))
+
     return relationshipChildren
   }
 
-  private addForwardedAttrEventUsages(): void {
+  private addForwardedAttrEventUsages(version?: VueMajorVersion): void {
     let changed = true
     while (changed) {
       changed = false
       const incomingEvents = this.collectIncomingTemplateEventUsages()
       for (const file of this.files.values()) {
+        if (version !== undefined && file.vueVersion !== version) {
+          continue
+        }
         const fileIncomingEvents = incomingEvents.get(file.uri)
         if (!fileIncomingEvents?.length) {
           continue
@@ -1589,12 +1711,15 @@ export class WorkspaceIndex {
     }
   }
 
-  private addForwardedAttrPropUsages(): void {
+  private addForwardedAttrPropUsages(version?: VueMajorVersion): void {
     let changed = true
     while (changed) {
       changed = false
       const incomingProps = this.collectIncomingTemplatePropUsages()
       for (const file of this.files.values()) {
+        if (version !== undefined && file.vueVersion !== version) {
+          continue
+        }
         const fileIncomingProps = incomingProps.get(file.uri)
         if (!fileIncomingProps?.length) {
           continue
@@ -1734,12 +1859,12 @@ export class WorkspaceIndex {
     return definitions
   }
 
-  private hasAnyForwardedListeners(): boolean {
-    return [...this.files.values()].some((file) => hasForwardedListeners(file))
+  private hasAnyForwardedListeners(version?: VueMajorVersion): boolean {
+    return [...this.files.values()].some((file) => (version === undefined || file.vueVersion === version) && hasForwardedListeners(file))
   }
 
-  private hasAnyForwardedAttrs(): boolean {
-    return [...this.files.values()].some((file) => hasForwardedAttrs(file))
+  private hasAnyForwardedAttrs(version?: VueMajorVersion): boolean {
+    return [...this.files.values()].some((file) => (version === undefined || file.vueVersion === version) && hasForwardedAttrs(file))
   }
 
   private collectIncomingTemplateEventUsages(): Map<string, Array<{ eventName: string, usage: UsageInfo }>> {
@@ -1849,6 +1974,11 @@ export class WorkspaceIndex {
         this.removeScriptComponentUsageFile(uri)
       }
     }
+    for (const uri of [...this.commandComponentModules.keys()]) {
+      if (inRoot(uri)) {
+        this.commandComponentModules.delete(uri)
+      }
+    }
 
     const globalStateFiles = new Set([
       ...this.globalComponentRegistrations.keys(),
@@ -1862,9 +1992,21 @@ export class WorkspaceIndex {
 
     this.vue2Runtime.clearWorkspaceRoot(inRoot)
 
-    this.externalRefComponents.clear()
-    this.externalRefComponentUris.clear()
-    this.vue3Runtime.clear()
+    this.clearExternalRefComponentsForRoot(root)
+    this.vue3Runtime.clearWorkspaceRoot(inRoot)
+  }
+
+  private clearExternalRefComponentsForRoot(root: string): void {
+    const prefix = `${root}\0`
+    for (const [key, component] of [...this.externalRefComponents]) {
+      if (!key.startsWith(prefix)) {
+        continue
+      }
+      this.externalRefComponents.delete(key)
+      if (component) {
+        this.externalRefComponentUris.delete(component.uri)
+      }
+    }
   }
 
   private hasVueNameBasedGlobals(): boolean {
@@ -1911,7 +2053,6 @@ export class WorkspaceIndex {
       return
     }
 
-    this.clearReverseIndexes()
     this.isBulkIndexing = true
     try {
       for (const file of indexedFiles) {
@@ -1919,7 +2060,10 @@ export class WorkspaceIndex {
       }
     } finally {
       this.isBulkIndexing = false
-      this.rebuildReverseIndexes()
+      const version = indexedFiles
+        .map((item) => this.files.get(item.uri)?.vueVersion)
+        .find((item): item is VueMajorVersion => item !== undefined)
+      this.rebuildReverseIndexes(version)
     }
   }
 
@@ -1943,25 +2087,39 @@ export class WorkspaceIndex {
       }
     } finally {
       this.isBulkIndexing = false
-      this.rebuildReverseIndexes()
+      this.rebuildReverseIndexes(3)
     }
   }
 
-  private rebuildReverseIndexes(): void {
-    this.clearReverseIndexes()
-    for (const file of this.files.values()) {
+  private rebuildReverseIndexes(version?: VueMajorVersion): void {
+    const files = [...this.files.values()]
+      .filter((file) => version === undefined || file.vueVersion === version)
+    if (version === undefined) {
+      this.clearReverseIndexes()
+    } else {
+      for (const file of files) {
+        this.removeReverseIndex(file)
+      }
+      for (const usageFile of this.scriptComponentUsageFiles.values()) {
+        if (usageFile.file.vueVersion === version) {
+          this.removeTrackedFileUsages(usageFile.file)
+          usageFile.commandUsages = this.parseCommandUsages(usageFile.file.uri, usageFile.file.content)
+        }
+      }
+    }
+    for (const file of files) {
       this.addSourceRelations(file)
       this.addVue3ScriptImportConsumers(file)
       this.addProvideDefinitions(file)
     }
-    for (const file of this.files.values()) {
+    for (const file of files) {
       this.addRelationshipUsages(file)
       this.addEventBusUsages(file)
     }
-    this.addScriptComponentUsages()
-    this.addForwardedAttrPropUsages()
-    this.addForwardedAttrEventUsages()
-    for (const file of this.files.values()) {
+    this.addScriptComponentUsages(version)
+    this.addForwardedAttrPropUsages(version)
+    this.addForwardedAttrEventUsages(version)
+    for (const file of files) {
       this.addInjectUsages(file)
     }
   }
@@ -2067,6 +2225,31 @@ export class WorkspaceIndex {
     return this.workspaceRoots
       .filter((root) => uri === root || isInsideDirectory(uri, root))
       .sort((a, b) => b.length - a.length)[0]
+  }
+
+  /**
+   * Vue 2 与 Vue 3 的关系图必须完全隔离。目标文件版本未知时保留原有
+   * 单文件测试和未注册 workspace 的行为；一旦双方版本可确定，则必须一致。
+   */
+  private isSameVueVersionRelation(parent: VueFileIndex, targetUri: string): boolean {
+    const sourceVersion = this.getWorkspaceVueVersionForUri(parent.uri)
+    const targetVersion = this.files.get(targetUri)?.vueVersion
+      ?? this.getWorkspaceVueVersionForUri(targetUri)
+    if (sourceVersion !== undefined && targetVersion === undefined) {
+      return false
+    }
+    return targetVersion === undefined || targetVersion === parent.vueVersion
+  }
+
+  private isSameVueVersionUri(sourceUri: string, targetUri: string): boolean {
+    const sourceVersion = this.files.get(sourceUri)?.vueVersion
+      ?? this.getWorkspaceVueVersionForUri(sourceUri)
+    const targetVersion = this.files.get(targetUri)?.vueVersion
+      ?? this.getWorkspaceVueVersionForUri(targetUri)
+    if (sourceVersion !== undefined && targetVersion === undefined) {
+      return false
+    }
+    return sourceVersion === undefined || targetVersion === undefined || sourceVersion === targetVersion
   }
 
   private vueVersionForUri(uri: string, sfc?: ParsedSfc): VueMajorVersion {
@@ -2205,8 +2388,9 @@ function scriptUsageFile(uri: string, content: string, vueVersion: VueMajorVersi
     uri,
     fileName: path.basename(uri),
     vueVersion,
-    content: '',
-    searchableContent: '',
+    content,
+    // 轻量 usage 文件不会执行基于 searchableContent 的语义查询，复用源码引用可避免等长副本。
+    searchableContent: content,
     lineStarts: createLineStarts(content),
     scriptIndex: emptyScriptIndex(),
     templateIndex: { components: [], emits: [], eventBusCalls: [], slots: [], instanceMembers: [] },
@@ -2432,7 +2616,7 @@ async function readTextIfExists(uri: string): Promise<string | undefined> {
   }
 }
 
-async function walkIndexableFiles(root: string, visit: (file: string) => Promise<void>, token?: IndexCancellationToken): Promise<void> {
+async function walkIndexableFiles(root: string, visit: (file: string) => Promise<void>, token?: IndexCancellationToken, excludedRoots: string[] = []): Promise<void> {
   const ignored = new Set([
     'node_modules',
     '.git',
@@ -2449,13 +2633,20 @@ async function walkIndexableFiles(root: string, visit: (file: string) => Promise
     'tmp',
     'temp',
   ])
+  const normalizedExcludedRoots = excludedRoots.map((item) => path.resolve(item))
 
   async function walk(directory: string): Promise<void> {
     if (token?.isCancellationRequested) {
       return
     }
 
-    const entries = await fs.readdir(directory, { withFileTypes: true })
+    let entries: Array<import('node:fs').Dirent>
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true })
+    } catch {
+      return
+    }
+
     for (const entry of entries) {
       if (token?.isCancellationRequested) {
         return
@@ -2463,14 +2654,19 @@ async function walkIndexableFiles(root: string, visit: (file: string) => Promise
 
       const fullPath = path.join(directory, entry.name)
       if (entry.isDirectory()) {
-        if (!ignored.has(entry.name)) {
+        if (!ignored.has(entry.name) && !isExcludedRoot(fullPath, normalizedExcludedRoots)) {
           await walk(fullPath)
         }
         continue
       }
       if (entry.isFile() && (entry.name.endsWith('.vue') || isScriptFile(entry.name))) {
         if (isScriptFile(entry.name)) {
-          const stats = await fs.stat(fullPath)
+          let stats: import('node:fs').Stats
+          try {
+            stats = await fs.stat(fullPath)
+          } catch {
+            continue
+          }
           if (stats.size > MAX_INITIAL_SCRIPT_SCAN_BYTES) {
             continue
           }
@@ -2481,6 +2677,11 @@ async function walkIndexableFiles(root: string, visit: (file: string) => Promise
   }
 
   await walk(root)
+}
+
+function isExcludedRoot(directory: string, excludedRoots: readonly string[]): boolean {
+  const normalized = path.resolve(directory)
+  return excludedRoots.some((root) => normalized === root)
 }
 
 export function findRefMethodAccess(content: string, offset: number): RefMethodAccess | undefined {

@@ -6,7 +6,7 @@
 
 这个插件主要处理 Vue 项目里容易断开的静态关系。它是 Vue 官方工具的补充，不会替代官方扩展；局部组件标签名的定义跳转会交给 Vue 语言扩展处理，避免同一个位置出现重复结果。
 
-当前文档对应功能版本：`2.0.1`。
+当前文档对应功能版本：`2.1.0`。
 
 ## 2.0 运行时隔离
 
@@ -16,7 +16,7 @@
 - Vue 2 SFC block 通过轻量的词法块扫描切分，`v-bind.sync` 等合法的 Vue 2 模板语法不会再中断索引。
 - Vue 3 使用 `@vue/language-core` 获取 SFC 结构和宏相关 script ranges，不再走旧的 Vue 3 script parser 路径。
 - Vue 3 关系索引聚焦静态组件契约：`defineProps`、`defineEmits`、`defineModel`、`defineSlots`、`defineExpose`、typed template refs、composable 返回成员，以及静态 provide/inject key。
-- Vue 2 和 Vue 3 的缓存、反向索引和增量重建规则保持隔离。
+- Vue 2 和 Vue 3 的关系图与反向索引重建按检测到的 package 版本隔离。跨版本组件 import 会被忽略，runtime 缓存失效仅作用于所属 package root。
 - VSIX 会复用 VS Code 内置 TypeScript runtime 做 Vue 3 索引，不再把完整 TypeScript 打进 `extension.js`。
 
 ## 功能演示
@@ -50,7 +50,7 @@
 | 能力             | 支持的关系                                                                               | Vue 2                                                        | Vue 3                                                                                           |
 | ---------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
 | 编辑器动作       | 已索引关系上的定义跳转、引用查询、hover、补全和 CodeLens。                               | 支持                                                         | 支持已索引的静态关系                                                                            |
-| 组件用法         | 静态组件 import、异步组件 import、简单别名、用法 CodeLens，以及静态 `.vue` import 用法。 | 支持                                                         | 支持 `<script setup>` 局部 import 和静态动态组件 map                                            |
+| 组件用法         | 静态组件 import、异步组件 import、简单别名、用法 CodeLens、命令式组件 API 调用，以及静态 `.vue` import 用法。 | 支持，包括 `Vue.extend` / JSX 命令模块                        | 支持 `<script setup>`、`createApp` / `h` / JSX 命令模块和静态动态组件 map                        |
 | Props            | 模板 prop 使用到子组件 prop 定义，包括 `$attrs` wrapper 透传。                           | 支持                                                         | `defineProps` 内联类型、命名类型、导入类型、命名泛型类型成员、组件内部 prop 使用、`$attrs` / `useAttrs()` / `mergeProps()` 透传、静态对象 `v-bind` |
 | Events / emits   | 模板监听到组件事件声明和 emit 调用点。                                                   | `this.$emit(...)` 和 `$listeners` wrapper 透传               | `defineEmits` 内联对象/数组、调用签名、命名/导入/泛型类型成员，以及 emit 调用                   |
 | Models           | model 使用到组件 model 契约。                                                            | 静态可见时通过 prop 和 event 关系覆盖                        | `defineModel()` 和 `defineModel('name')` 到 `v-model` / `v-model:name` 的 model prop 与 `update:*` event |
@@ -108,6 +108,33 @@ Event Bus 名称需要能从入口文件里的 Vue prototype 注册中识别。
 | `Vue Component Navigator: Show Status`       | 查看索引状态，以及当前文件是否已被索引。                |
 | `Vue Component Navigator: Reindex Workspace` | 手动重建 workspace 索引。大型重构或配置变更后可以使用。 |
 
+## 命令式组件
+
+当关系可以被静态证明时，命令式组件包装器会关联到最终业务调用位置。识别依据是文件内容，不要求文件必须命名为 `command.tsx` 或 `index.js`。
+
+一个 command module 需要同时满足：
+
+- 默认导入 workspace 内的 `.vue` 组件。
+- 通过 Vue 2 JSX，或 Vue 3 JSX、`h()`、`createVNode()` 渲染该组件。
+- 直接默认导出命令对象，或默认导出本地声明的命令对象。
+
+支持对象方法、async 对象方法、本地 handler 引用、函数表达式和箭头函数：
+
+```ts
+const Dialog = {
+  open() {},
+  async confirm() {},
+  alert: alertHandler,
+  close: () => {},
+}
+
+export default Dialog
+```
+
+`Dialog.open()`、`Dialog.confirm()` 等业务调用会计入真实组件的 usage CodeLens；command 脚本自身也会展示可点击的 `Used by N usages` CodeLens。将鼠标悬停在导出方法上时，只展示该方法的 usage 数量和调用位置。
+
+索引只处理默认导入后的直接成员调用。调用未出现在导出对象中的方法时不会计入 usage。解构调用、计算属性调用、CommonJS 导入、运行时生成的方法名和跨 Vue 主版本关系不在支持范围内。
+
 ## 配置
 
 | 配置                          | 说明                                             |
@@ -117,11 +144,13 @@ Event Bus 名称需要能从入口文件里的 Vue prototype 注册中识别。
 ## 边界
 
 - Vue 2 和 Vue 3 workspace 会按检测到的 Vue 主版本分别索引，两套能力边界保持隔离。
+- 组件关系不会跨越 Vue 主版本。Vue 2 package 导入 Vue 3 组件或 Vue 3 package 导入 Vue 2 组件时，不会产生组件、prop、event、slot、ref 或 provide/inject 关系。
 - 忽略 workspace 外部文件。
 - 动态组件名、计算得出的 `provide` / `inject` key、运行时事件名和动态 Event Bus 名称不在支持范围内。
 - 路由懒加载组件 import 和 `<router-view>` slot 组件属于路由配置关系，不作为模板父子组件用法索引。
 - 运行时变量形式的 `<component :is="...">` 会被忽略，除非静态 map 能证明候选组件。
 - conditional、mapped、intersection 等复杂 TypeScript 类型展开会保持有限支持。
 - 静态对象 `v-bind` 会保持保守策略。如果值来自运行时控制流、导入对象或无法在本地解析的函数返回，会被忽略。
+- 命令式组件只追踪静态可见的默认导入、导出对象方法和 `Dialog.open()` 形式的直接成员调用。
 
 解析策略会尽量保守。静态证明不了的关系，不返回猜测结果。

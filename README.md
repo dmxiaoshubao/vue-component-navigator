@@ -6,7 +6,7 @@ VS Code navigation helpers for Vue 2 Options API projects and Vue 3 `<script set
 
 This extension focuses on static relationships that are easy to miss in Vue codebases. It complements the official Vue tooling instead of replacing it, so local component tag definitions are intentionally left to the Vue language extension to avoid duplicate results.
 
-Current documented feature set: `2.0.1`.
+Current documented feature set: `2.1.0`.
 
 ## 2.0 Runtime Split
 
@@ -16,7 +16,7 @@ Version `2.0.0` rebuilds the indexer around isolated Vue major-version runtimes.
 - Vue 2 SFC blocks are split by a lightweight lexical block scanner, so valid Vue 2 template syntax such as `v-bind.sync` cannot break indexing.
 - Vue 3 uses `@vue/language-core` for SFC structure and macro-aware script ranges instead of the old Vue 3 script parser path.
 - Vue 3 relationship indexing is focused on static component contracts: `defineProps`, `defineEmits`, `defineModel`, `defineSlots`, `defineExpose`, typed template refs, composable return members, and static provide/inject keys.
-- Vue 2 and Vue 3 caches, reverse indexes, and incremental rebuild rules are intentionally separated.
+- Vue 2 and Vue 3 relationship graphs and reverse-index rebuilds are isolated by detected package version. Cross-version component imports are ignored, and runtime cache invalidation is scoped to the owning package root.
 - The VSIX reuses VS Code's built-in TypeScript runtime for Vue 3 indexing instead of bundling a full TypeScript copy into `extension.js`.
 
 ## Demos
@@ -50,7 +50,7 @@ Shows jumping from static `inject` keys to the nearest static provider, and from
 | Area                       | Supported relationships                                                                                             | Vue 2                                                                          | Vue 3                                                                                                                         |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
 | Editor actions             | Definitions, references, hover, completion, and CodeLens where the indexed relationship supports them.              | Supported                                                                      | Supported for indexed static relationships                                                                                    |
-| Component usage            | Static component imports, async component imports, simple aliases, usage CodeLens, and static `.vue` import usages. | Supported                                                                      | Supported for `<script setup>` local imports and static dynamic component maps                                                |
+| Component usage            | Static component imports, async component imports, simple aliases, usage CodeLens, command-component API calls, and static `.vue` import usages. | Supported, including `Vue.extend` / JSX command modules                         | Supported for `<script setup>`, `createApp` / `h` / JSX command modules, and static dynamic component maps                    |
 | Props                      | Template prop usage to child prop definitions, including fallthrough through `$attrs` wrappers.                     | Supported                                                                      | `defineProps` inline, named, imported, and generic named type members; internal prop usages; `$attrs` / `useAttrs()` / `mergeProps()` fallthrough; static object `v-bind` |
 | Events / emits             | Template listeners to component emit declarations and emit call sites.                                              | `this.$emit(...)` and listener fallthrough through `$listeners` wrappers       | `defineEmits` inline object/array, call signatures, named/imported/generic type members, and emit calls                       |
 | Models                     | Model usage to component model contracts.                                                                           | Covered through event and prop relationships where statically visible          | `defineModel()` and `defineModel('name')` to both model props and `update:*` events from `v-model` / `v-model:name`           |
@@ -108,6 +108,33 @@ Event Bus usage is ignored until the bus name is found from these entry files. T
 | `Vue Component Navigator: Show Status`       | Shows index status and whether the active file is indexed.                    |
 | `Vue Component Navigator: Reindex Workspace` | Rebuilds the workspace index. Use it after large refactors or config changes. |
 
+## Command Components
+
+Imperative component wrappers are linked to their final business call sites when the relationship can be proven statically. Detection is content-based; command files do not need to use a specific filename.
+
+A command module must:
+
+- Default-import a workspace `.vue` component.
+- Render that component through Vue 2 JSX or Vue 3 JSX, `h()`, or `createVNode()`.
+- Default-export a command object, either inline or through a local variable.
+
+Supported exported methods include object methods, async object methods, local handler references, function expressions, and arrow functions:
+
+```ts
+const Dialog = {
+  open() {},
+  async confirm() {},
+  alert: alertHandler,
+  close: () => {},
+}
+
+export default Dialog
+```
+
+Business calls such as `Dialog.open()` and `Dialog.confirm()` appear in the real component's usage CodeLens. The command script also shows a clickable `Used by N usages` CodeLens. Hovering an exported method shows only that method's usage count and call locations.
+
+Only default imports followed by direct member calls are indexed. Calls to methods that are not present in the exported command object are ignored. Destructured calls, computed property calls, CommonJS imports, runtime-generated method names, and cross-Vue-version relationships are intentionally out of scope.
+
 ## Configuration
 
 | Setting                       | Description                                                                   |
@@ -117,11 +144,13 @@ Event Bus usage is ignored until the bus name is found from these entry files. T
 ## Boundaries
 
 - Vue 2 and Vue 3 workspaces are indexed by detected Vue major version; their feature sets are intentionally separated.
+- Component relationships never cross Vue major versions. A Vue 2 package importing a Vue 3 component, or the reverse, produces no component, prop, event, slot, ref, or provide/inject relationship.
 - Files outside the workspace are ignored.
 - Dynamic component names, computed `provide` / `inject` keys, runtime-only event names, and dynamic Event Bus names are out of scope.
 - Route lazy component imports and `<router-view>` slot components are route configuration relationships, not template parent-child component usages.
 - Runtime-only `<component :is="...">` variables are ignored unless a static map can prove the candidate components.
 - Complex TypeScript expansion such as conditional, mapped, or intersection type evaluation is intentionally limited.
 - Static object `v-bind` support is intentionally conservative. When the value comes from runtime control flow, an imported object, or a function return that cannot be resolved locally, it is ignored.
+- Command-component analysis only follows statically visible default imports, exported object methods, and direct member calls such as `Dialog.open()`.
 
 The parser is deliberately conservative. When a relationship cannot be proven statically, the extension avoids returning a misleading result.

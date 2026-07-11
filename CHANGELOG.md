@@ -1,5 +1,53 @@
 # Changelog
 
+## 2.1.0 - 2026-07-11
+
+### English
+
+#### Added
+
+- Added command-component usage indexing for Vue 2 `Vue.extend` / JSX wrappers and Vue 3 `createApp` / `h` / JSX wrappers. Final calls such as `Dialog.open()` and `Dialog.confirm()` now appear in both the real component and command-script CodeLens.
+- Added method-level hover and usage navigation for exported command-component APIs, with stale relation cleanup and stricter script-index boundaries.
+- Added Vue 2 command-object method hover with the same compact, method-specific usage summary as Vue 3.
+
+#### Breaking
+
+- Component relationships no longer cross Vue major-version package boundaries. Vue 2 packages cannot create navigation relationships to Vue 3 components, and Vue 3 packages cannot create them to Vue 2 components.
+
+#### Changed
+
+- Scoped Vue 3 runtime cache cleanup to the package root whose Vue version changed, preventing one package from clearing another Vue 3 package's cached sources.
+- Scoped reverse-index rebuilds by Vue major version so Vue 2 updates do not clear or recompute Vue 3 relationships, and vice versa.
+- Excluded nested Vue package roots from parent-package scans so every file is indexed only by its nearest Vue package version.
+- Registered all detected package versions before indexing files, and rejected unknown-version targets from registered packages, closing an indexing-order gap in cross-version isolation.
+- Prevented repeated version rebuilds from accumulating duplicate standalone-script component usages in internal reverse-index arrays.
+- Filtered command calls against the methods actually exported by the command object and excluded obvious state properties from method hover.
+- Reduced large-workspace memory usage by avoiding duplicate masked source strings for lightweight script indexes and reusing Vue 3 standalone file indexes.
+- Scoped third-party ref component cache cleanup to the package root whose version changed.
+
+### 中文
+
+#### 新增
+
+- 新增命令式组件 usage 索引，支持 Vue 2 `Vue.extend` / JSX 包装器以及 Vue 3 `createApp` / `h` / JSX 包装器。`Dialog.open()`、`Dialog.confirm()` 等最终调用现在会同时展示在真实组件和 command 脚本的 CodeLens 中。
+- 新增命令式组件导出方法的独立 hover 与 usage 跳转，并补齐陈旧关系清理和脚本索引边界。
+- 新增 Vue 2 命令对象方法 hover，与 Vue 3 一样只展示精简的方法级 usage 摘要。
+
+#### 破坏性变更
+
+- 组件关系不再跨越 Vue 主版本 package 边界。Vue 2 package 不会再与 Vue 3 组件建立导航关系，反向亦然。
+
+#### 变更
+
+- Vue 3 runtime 缓存改为仅清理发生版本变化的 package root，避免一个 package 清空其他 Vue 3 package 的源文件缓存。
+- 反向索引改为按 Vue 主版本重建，Vue 2 更新不会再清理或重算 Vue 3 关系，反向亦然。
+- 父 package 扫描时排除嵌套 Vue package root，保证每个文件只按最近 package 的 Vue 主版本索引。
+- 文件索引前先注册全部 package 版本，并拒绝已注册 package 指向版本未知目标的关系，关闭跨版本隔离中的索引顺序缺口。
+- 修复重复执行版本重建时，standalone script 组件用法在内部反向索引数组中持续累积的问题。
+- command 调用现在只匹配导出对象中真实存在的方法，并排除明显的状态属性，避免产生错误的方法 hover。
+- 轻量脚本索引不再保留重复的 masked 源码，Vue 3 standalone 文件复用完整索引对象，降低大型 workspace 的常驻内存。
+- 第三方 ref 组件缓存改为仅清理发生版本变化的 package root。
+
 ## 2.0.1 - 2026-07-09
 
 ### English

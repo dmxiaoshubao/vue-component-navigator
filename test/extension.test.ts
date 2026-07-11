@@ -36,6 +36,12 @@ function writePackageJson(root: string, vueVersion = '^2.7.16'): void {
   writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: vueVersion } }))
 }
 
+async function fireListeners<T>(listeners: Array<(event: T) => any>, event: T): Promise<void> {
+  for (const listener of [...listeners]) {
+    await listener(event)
+  }
+}
+
 describe('Extension lifecycle indexing', () => {
   beforeEach(() => {
     vi.resetModules()
@@ -107,9 +113,7 @@ module.exports = {
     vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
     await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
 
-    const renameListener = vscode.renameListeners.find((listener) => typeof listener === 'function')
-    expect(renameListener).toBeDefined()
-    await renameListener!({ files: [{ oldUri: vscode.Uri.file(oldFile), newUri: vscode.Uri.file(newFile) }] })
+    await fireListeners(vscode.renameListeners, { files: [{ oldUri: vscode.Uri.file(oldFile), newUri: vscode.Uri.file(newFile) }] })
     vscode.window.activeTextEditor = { document: new TestDocument(oldFile, fs.readFileSync(oldFile, 'utf8')) }
     await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
     expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: no')
@@ -316,7 +320,7 @@ export default {
     }))
     const configDocument = new TestDocument(jsconfigPath, fs.readFileSync(jsconfigPath, 'utf8'))
     configDocument.languageId = 'json'
-    await vscode.saveListeners[0](configDocument)
+    await fireListeners(vscode.saveListeners, configDocument)
 
     await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
       kind: 'event-bus-listeners',
@@ -370,6 +374,238 @@ export default {
     await flushPromises()
     vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
     await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+    vscode.window.activeTextEditor = { document: new TestDocument(file, fs.readFileSync(file, 'utf8')) }
+    await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
+
+    expect(vscode.informationMessages.at(-1)).toContain('Supported Vue package detected: yes')
+    expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: yes')
+  })
+
+  it('启动时无 Vue，保存 package.json 加 Vue 后会自动启用并索引', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-package-save-enable-'))
+    const file = path.join(root, 'src/App.vue')
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: {} }))
+    writeText(file, '<template><div /></template><script setup lang="ts"></script>')
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+
+    writePackageJson(root, '^3.5.0')
+    const packageDocument = new TestDocument(path.join(root, 'package.json'), fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+    packageDocument.languageId = 'json'
+    await fireListeners(vscode.saveListeners, packageDocument)
+
+    vscode.window.activeTextEditor = { document: new TestDocument(file, fs.readFileSync(file, 'utf8')) }
+    await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
+
+    expect(vscode.providerRegistrations).toContain('definition')
+    expect(vscode.informationMessages.at(-1)).toContain('Supported Vue package detected: yes')
+    expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: yes')
+  })
+
+  it('保存 package.json 移除 Vue 依赖后会禁用并清空索引', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-package-save-disable-'))
+    const file = path.join(root, 'src/App.vue')
+    writePackageJson(root, '^3.5.0')
+    writeText(file, '<template><div /></template><script setup lang="ts"></script>')
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+    await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: {} }))
+    const packageDocument = new TestDocument(path.join(root, 'package.json'), fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+    packageDocument.languageId = 'json'
+    await fireListeners(vscode.saveListeners, packageDocument)
+
+    vscode.window.activeTextEditor = { document: new TestDocument(file, fs.readFileSync(file, 'utf8')) }
+    await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
+
+    expect(vscode.informationMessages.at(-1)).toContain('Supported Vue package detected: no')
+    expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: no')
+  })
+
+  it('根 package 有 Vue 时仍会按子包 Vue 版本索引 monorepo', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-monorepo-nested-vue-version-'))
+    const appRoot = path.join(root, 'packages/app')
+    const childFile = path.join(appRoot, 'src/Child.vue')
+    const parentFile = path.join(appRoot, 'src/Parent.vue')
+    writePackageJson(root, '^2.7.16')
+    writePackageJson(appRoot, '^3.5.0')
+    writeText(childFile, `
+<template><div /></template>
+<script setup lang="ts">
+defineProps<{
+  title: string
+}>()
+</script>
+`)
+    writeText(parentFile, `
+<template>
+  <Child title="nested" />
+</template>
+<script setup lang="ts">
+import Child from './Child.vue'
+</script>
+`)
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+    await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'prop-usages',
+      childUri: childFile,
+      propName: 'title',
+    })
+
+    expect(vscode.quickPickCalls.at(-1)?.items[0].label).toContain('Parent.vue')
+    expect(vscode.shownDocuments.at(-1)?.uri.fsPath).toBe(parentFile)
+  })
+
+  it('保存 package 从 Vue2 改 Vue3 后会按新 runtime 重建索引', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-package-save-runtime-'))
+    const childFile = path.join(root, 'src/Child.vue')
+    const parentFile = path.join(root, 'src/Parent.vue')
+    writePackageJson(root, '^2.7.16')
+    writeText(childFile, `
+<template><div /></template>
+<script setup lang="ts">
+defineProps<{
+  title: string
+}>()
+</script>
+`)
+    writeText(parentFile, `
+<template>
+  <Child title="root" />
+</template>
+<script setup lang="ts">
+import Child from './Child.vue'
+</script>
+`)
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+    await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'prop-usages',
+      childUri: childFile,
+      propName: 'title',
+    })
+    expect(vscode.quickPickCalls).toHaveLength(0)
+
+    writePackageJson(root, '^3.5.0')
+    const packageDocument = new TestDocument(path.join(root, 'package.json'), fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+    packageDocument.languageId = 'json'
+    await fireListeners(vscode.saveListeners, packageDocument)
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'prop-usages',
+      childUri: childFile,
+      propName: 'title',
+    })
+
+    expect(vscode.quickPickCalls.at(-1)?.items[0].label).toContain('Parent.vue')
+    expect(vscode.shownDocuments.at(-1)?.uri.fsPath).toBe(parentFile)
+  })
+
+  it('创建和删除子包 package.json 会重建 runtime roots', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-package-create-delete-'))
+    const appRoot = path.join(root, 'packages/app')
+    const packagePath = path.join(appRoot, 'package.json')
+    const childFile = path.join(appRoot, 'src/Child.vue')
+    const parentFile = path.join(appRoot, 'src/Parent.vue')
+    writePackageJson(root, '^2.7.16')
+    writeText(childFile, `
+<template><div /></template>
+<script setup lang="ts">
+defineProps<{
+  title: string
+}>()
+</script>
+`)
+    writeText(parentFile, `
+<template>
+  <Child title="nested" />
+</template>
+<script setup lang="ts">
+import Child from './Child.vue'
+</script>
+`)
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+    await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'prop-usages',
+      childUri: childFile,
+      propName: 'title',
+    })
+    expect(vscode.quickPickCalls).toHaveLength(0)
+
+    writePackageJson(appRoot, '^3.5.0')
+    await fireListeners(vscode.createListeners, { files: [vscode.Uri.file(packagePath)] })
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'prop-usages',
+      childUri: childFile,
+      propName: 'title',
+    })
+    expect(vscode.quickPickCalls.at(-1)?.items[0].label).toContain('Parent.vue')
+
+    fs.unlinkSync(packagePath)
+    const quickPickCount = vscode.quickPickCalls.length
+    await fireListeners(vscode.deleteListeners, { files: [vscode.Uri.file(packagePath)] })
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'prop-usages',
+      childUri: childFile,
+      propName: 'title',
+    })
+
+    expect(vscode.quickPickCalls).toHaveLength(quickPickCount)
+  })
+
+  it('重命名为 package.json 后会自动启用 Vue workspace', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-package-rename-enable-'))
+    const file = path.join(root, 'src/App.vue')
+    const oldPackagePath = path.join(root, 'package.tmp')
+    const newPackagePath = path.join(root, 'package.json')
+    writeText(oldPackagePath, JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(file, '<template><div /></template><script setup lang="ts"></script>')
+    vscode.workspace.workspaceFolders = []
+
+    const { activate } = await import('../src/extension')
+    activate({ subscriptions: [] } as any)
+    await flushPromises()
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+
+    fs.renameSync(oldPackagePath, newPackagePath)
+    await fireListeners(vscode.renameListeners, { files: [{ oldUri: vscode.Uri.file(oldPackagePath), newUri: vscode.Uri.file(newPackagePath) }] })
     vscode.window.activeTextEditor = { document: new TestDocument(file, fs.readFileSync(file, 'utf8')) }
     await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
 

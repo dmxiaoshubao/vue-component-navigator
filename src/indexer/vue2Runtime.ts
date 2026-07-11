@@ -139,7 +139,14 @@ export class Vue2Runtime implements VueRuntimeEngine {
 
   async indexWorkspace(root: string, vueFiles: string[], scriptFiles: string[], token?: IndexCancellationToken): Promise<void> {
     for (const file of scriptFiles) {
-      await this.host.indexGlobalComponentFile(file, false)
+      try {
+        await this.host.indexGlobalComponentFile(file, false)
+      } catch (error) {
+        if (!isUnreadableFileError(error)) {
+          throw error
+        }
+        // 初始索引期间文件可能被删除或不可读，静默跳过即可。
+      }
       if (token?.isCancellationRequested) {
         return
       }
@@ -152,7 +159,14 @@ export class Vue2Runtime implements VueRuntimeEngine {
 
     await this.host.withBulkIndexing(async () => {
       for (const file of vueFiles) {
-        await this.host.indexFile(file)
+        try {
+          await this.host.indexFile(file)
+        } catch (error) {
+          if (!isUnreadableFileError(error)) {
+            throw error
+          }
+          // 初始索引期间文件可能被删除或不可读，静默跳过即可。
+        }
         if (token?.isCancellationRequested) {
           return
         }
@@ -367,4 +381,9 @@ function withRefSourceLocation(call: RefMethodAccess, offset: number, source: (s
 
 function isInsideNodeModules(file: string): boolean {
   return file.split(/[\\/]/).includes('node_modules')
+}
+
+function isUnreadableFileError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code
+  return code === 'ENOENT' || code === 'EACCES' || code === 'EPERM' || code === 'EISDIR' || code === 'ENOTDIR'
 }

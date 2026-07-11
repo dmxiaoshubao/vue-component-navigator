@@ -14,6 +14,8 @@ import { commonDirectory, relativePath, usagePathLabels } from './utils/pathDisp
 
 type UsageCommandArgs =
   | { kind: 'component-usages', childUri: string }
+  | { kind: 'command-component-usages', commandUri: string }
+  | { kind: 'command-component-method-usages', commandUri: string, methodName: string }
   | { kind?: 'event-listeners', childUri: string, eventName: string }
   | { kind: 'event-bus-listeners', busName: string, eventName: string }
   | { kind: 'event-bus-emits', busName: string, eventName: string }
@@ -171,6 +173,7 @@ export function activate(context: vscode.ExtensionContext): void {
         cancellable: true,
       }, async (_progress, token) => {
         const nextIndex = new WorkspaceIndex()
+        const packageGroups: Array<{ folder: vscode.WorkspaceFolder, packages: Array<{ root: string, version: VueMajorVersion }> }> = []
         for (const folder of vscode.workspace.workspaceFolders ?? []) {
           if (token.isCancellationRequested) {
             return false
@@ -179,11 +182,26 @@ export function activate(context: vscode.ExtensionContext): void {
           if (packages.length === 0) {
             continue
           }
+          packageGroups.push({ folder, packages })
+        }
+
+        // 必须先注册全部 package 版本，避免先索引的 package 将尚未注册的
+        // 跨版本目标当成“版本未知”关系写入索引。
+        for (const { packages } of packageGroups) {
+          for (const pkg of packages) {
+            nextIndex.setWorkspaceVueVersion(pkg.root, pkg.version)
+          }
+        }
+
+        for (const { folder, packages } of packageGroups) {
           for (const pkg of packages) {
             if (token.isCancellationRequested) {
               return false
             }
-            await nextIndex.indexWorkspace(pkg.root, token, getWorkspaceEntryConfig(folder), pkg.version)
+            const nestedRoots = packages
+              .map((candidate) => candidate.root)
+              .filter((candidateRoot) => candidateRoot !== pkg.root && isInsideDirectory(candidateRoot, pkg.root))
+            await nextIndex.indexWorkspace(pkg.root, token, getWorkspaceEntryConfig(folder), pkg.version, nestedRoots)
           }
         }
         if (token.isCancellationRequested) {
@@ -225,6 +243,40 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  async function refreshForPackageJsonChanges(filePaths: string[]): Promise<void> {
+    if (!filePaths.some(isPackageJsonFile)) {
+      return
+    }
+
+    if (await ensureSupportedVueWorkspace(false)) {
+      await indexWorkspaceFolders('Indexing Vue files...', false)
+    }
+  }
+
+  function registerPackageJsonWatcher(): vscode.Disposable {
+    const disposables = [
+      vscode.workspace.onDidSaveTextDocument((document) => {
+        if (document.uri.scheme === 'file' && isPackageJsonFile(document.uri.fsPath)) {
+          return refreshForPackageJsonChanges([document.uri.fsPath])
+        }
+      }),
+      vscode.workspace.onDidDeleteFiles((event) =>
+        refreshForPackageJsonChanges(event.files.map((file) => file.fsPath))),
+      vscode.workspace.onDidCreateFiles((event) =>
+        refreshForPackageJsonChanges(event.files.map((file) => file.fsPath))),
+      vscode.workspace.onDidRenameFiles((event) =>
+        refreshForPackageJsonChanges(event.files.flatMap((file) => [file.oldUri.fsPath, file.newUri.fsPath]))),
+    ]
+
+    return {
+      dispose: () => {
+        for (const disposable of disposables) {
+          disposable.dispose()
+        }
+      },
+    }
+  }
+
   function registerWorkspaceFeatures(): void {
     if (featuresRegistered) {
       return
@@ -235,7 +287,7 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?', '\'', '"', ':'),
       vscode.languages.registerHoverProvider(selector, new VueHoverProvider(index)),
       vscode.languages.registerReferenceProvider(selector, new VueReferenceProvider(index)),
-      vscode.languages.registerCodeLensProvider([{ language: 'vue', scheme: 'file' }], new VueCodeLensProvider(index)),
+      vscode.languages.registerCodeLensProvider(selector, new VueCodeLensProvider(index)),
       vscode.workspace.onDidSaveTextDocument((document) => {
         if (document.languageId === 'vue' && document.uri.scheme === 'file') {
           clearPendingSync(document.uri.fsPath)
@@ -411,6 +463,21 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
 
+
+    if (args.kind === 'command-component-usages') {
+      return {
+        usages: index.findCommandComponentUsages(args.commandUri),
+        placeHolder: 'Select command component usage',
+      }
+    }
+
+    if (args.kind === 'command-component-method-usages') {
+      return {
+        usages: index.findCommandComponentMethodUsages(args.commandUri, args.methodName),
+        placeHolder: `Select ${args.methodName} command method usage`,
+      }
+    }
+
     if (args.kind === 'event-bus-listeners') {
       return {
         usages: index.findEventBusListeners(args.busName, args.eventName),
@@ -455,6 +522,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   context.subscriptions.push(
+    registerPackageJsonWatcher(),
     vscode.commands.registerCommand('vueComponentNavigator.showStatus', () => {
       const activeDocument = vscode.window.activeTextEditor?.document
       const indexedCurrentFile = activeDocument?.uri.scheme === 'file'
@@ -480,7 +548,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return
       }
 
-      if (args.kind === 'component-usages' && usages.length === 1) {
+      if ((args.kind === 'component-usages' || args.kind === 'command-component-usages') && usages.length === 1) {
         await openUsage(usages[0])
         return
       }
@@ -529,6 +597,10 @@ function isAliasConfigFile(filePath: string): boolean {
   return fileName === 'jsconfig.json' || fileName === 'tsconfig.json'
 }
 
+function isPackageJsonFile(filePath: string): boolean {
+  return path.basename(filePath) === 'package.json'
+}
+
 async function hasSupportedVueWorkspace(): Promise<boolean> {
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
     if ((await workspaceVuePackages(folder.uri.fsPath)).length > 0) {
@@ -539,11 +611,6 @@ async function hasSupportedVueWorkspace(): Promise<boolean> {
 }
 
 async function workspaceVuePackages(root: string, token?: CancellationLike): Promise<Array<{ root: string, version: VueMajorVersion }>> {
-  const rootVersion = await workspaceVueVersion(root)
-  if (rootVersion) {
-    return [{ root, version: rootVersion }]
-  }
-
   const results: Array<{ root: string, version: VueMajorVersion }> = []
 
   async function walk(directory: string): Promise<void> {
@@ -563,7 +630,6 @@ async function workspaceVuePackages(root: string, token?: CancellationLike): Pro
       const version = await workspaceVueVersion(directory)
       if (version) {
         results.push({ root: directory, version })
-        return
       }
     }
 
@@ -633,4 +699,9 @@ export function isVue3Version(version: string): boolean {
     return true
   }
   return /(?:^|\s)(?:>=|>|=)?\s*3(?:$|[.\s*x-])/.test(normalized) && !/(?:^|\s)<\s*3(?:$|[.\s*x-])/.test(normalized)
+}
+
+function isInsideDirectory(file: string, directory: string): boolean {
+  const relative = path.relative(directory, file)
+  return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative)
 }

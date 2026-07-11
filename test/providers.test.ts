@@ -143,6 +143,70 @@ describe('Vue providers', () => {
     await index.indexWorkspace(fixtureRoot)
   })
 
+  it('命令式组件导出对象的方法会展示独立 usage hover', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-command-method-hover-'))
+    const dialogUri = path.join(root, 'src/Dialog.vue')
+    const commandUri = path.join(root, 'src/command.ts')
+    const consumerUri = path.join(root, 'src/consumer.ts')
+    const commandContent = `
+import { createApp, h } from 'vue'
+import DialogView from './Dialog.vue'
+const confirmHandler = () => createApp({ render: () => h(DialogView) })
+const Dialog = { instance: null, options: {}, confirm: confirmHandler, alert() {} }
+export default Dialog
+`
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(dialogUri, '<template><div /></template>')
+    writeText(commandUri, commandContent)
+    writeText(consumerUri, "import Dialog from './command'\nDialog.confirm()\nDialog.alert()\nDialog.notExists()\n")
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const document = new TestDocument(commandUri, commandContent, 'typescript') as any
+    const hover = hoverProvider.provideHover(document, positionAt(commandContent, commandContent.indexOf('confirm:') + 1)) as any
+
+    expect(hoverText(hover)).toContain('Used by 1 usage')
+    expect(hoverText(hover)).toContain('consumer.ts:2')
+    expect(hoverText(hover)).not.toContain('(command component method)')
+    expect(hoverText(hover)).not.toContain('Dialog.vue')
+    expect(localIndex.findCommandComponentMethodUsages(commandUri, 'alert')).toHaveLength(1)
+    expect(localIndex.findCommandComponentMethodUsages(commandUri, 'notExists')).toEqual([])
+    expect(localIndex.findCommandComponentMethodAtOffset(commandUri, commandContent.indexOf('instance') + 1)).toBeUndefined()
+    expect(localIndex.findCommandComponentMethodAtOffset(commandUri, commandContent.indexOf('options') + 1)).toBeUndefined()
+  })
+
+  it('Vue2 命令式组件脚本的方法也会展示精简 usage hover', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-command-method-hover-'))
+    const dialogUri = path.join(root, 'src/Dialog.vue')
+    const commandUri = path.join(root, 'src/index.js')
+    const consumerUri = path.join(root, 'src/consumer.js')
+    const commandContent = `
+import Vue from 'vue'
+import DialogView from './Dialog.vue'
+export default {
+  open() {
+    const VM = Vue.extend({ render: () => <DialogView /> })
+    return new VM()
+  },
+}
+`
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^2.7.0' } }))
+    writeText(dialogUri, '<template><div /></template>')
+    writeText(commandUri, commandContent)
+    writeText(consumerUri, "import Dialog from './index'\nDialog.open()\n")
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 2)
+    const hoverProvider = new VueHoverProvider(localIndex)
+    const document = new TestDocument(commandUri, commandContent, 'javascript') as any
+    const hover = hoverProvider.provideHover(document, positionAt(commandContent, commandContent.indexOf('open()') + 1)) as any
+
+    expect(hoverText(hover)).toContain('Used by 1 usage')
+    expect(hoverText(hover)).toContain('consumer.js:2')
+    expect(hoverText(hover)).not.toContain('Dialog.vue')
+  })
+
   it('$refs 方法定义跳转、补全、悬浮可用', () => {
     const content = readFixture('Parent.vue')
     const document = new TestDocument(path.join(fixtureRoot, 'Parent.vue'), content) as any
@@ -3189,6 +3253,37 @@ import MemberLogin from './MemberLogin.vue'
     expect(lenses).toHaveLength(1)
     expect(lenses[0].range.start.line).toBe(1)
     expect(lenses[0].command.title).toBe('Used by 1 usage')
+  })
+
+  it('命令式组件的 command 脚本展示最终业务调用 CodeLens', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-command-component-codelens-'))
+    const componentUri = path.join(root, 'src/dialog/index.vue')
+    const commandUri = path.join(root, 'src/dialog/command.tsx')
+    const consumerUri = path.join(root, 'src/use-dialog.ts')
+    const componentContent = '<template><div /></template><script setup lang="ts"></script>'
+    const commandContent = `
+import { createApp, h } from 'vue'
+import Dialog from './index.vue'
+const command = { open: () => createApp({ render: () => h(Dialog) }) }
+export default command
+`
+    writeText(componentUri, componentContent)
+    writeText(commandUri, commandContent)
+    writeText(consumerUri, `import command from './dialog/command'\ncommand.open()`)
+
+    const localIndex = new WorkspaceIndex()
+    await localIndex.indexWorkspace(root, undefined, undefined, 3)
+    const provider = new VueCodeLensProvider(localIndex)
+    const commandDocument = new TestDocument(commandUri, commandContent, 'typescriptreact') as any
+    const commandLenses = provider.provideCodeLenses(commandDocument) as any[]
+    const componentDocument = new TestDocument(componentUri, componentContent) as any
+    const componentLenses = provider.provideCodeLenses(componentDocument) as any[]
+
+    expect(commandLenses).toHaveLength(1)
+    expect(commandLenses[0].command.title).toBe('Used by 1 usage')
+    expect(commandLenses[0].command.arguments).toEqual([{ kind: 'command-component-usages', commandUri }])
+    expect(componentLenses).toHaveLength(1)
+    expect(componentLenses[0].command.title).toBe('Used by 1 usage')
   })
 
   it('没有组件用法时不展示 CodeLens', () => {

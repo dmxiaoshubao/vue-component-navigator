@@ -171,6 +171,15 @@ export class Vue3LanguageCoreRuntime implements VueRuntimeEngine {
     this.syncedSourceContents.clear()
   }
 
+  clearWorkspaceRoot(inRoot: (uri: string) => boolean): void {
+    clearMapEntriesInRoot(this.typeSourceCache, inRoot)
+    clearMapEntriesInRoot(this.staticKeyCache, inRoot)
+    clearMapEntriesInRoot(this.composableReturnParseCache, inRoot)
+    clearMapEntriesInRoot(this.forwardedRefMethodNameCache, inRoot)
+    clearMapEntriesInRoot(this.syncedSourceVersions, inRoot)
+    clearMapEntriesInRoot(this.syncedSourceContents, inRoot)
+  }
+
   replaceWith(other: Vue3LanguageCoreRuntime): void {
     replaceMap(this.typeSourceCache, other.typeSourceCache)
     replaceMap(this.staticKeyCache, other.staticKeyCache, cloneStaticKeyCacheEntry)
@@ -275,7 +284,14 @@ export class Vue3LanguageCoreRuntime implements VueRuntimeEngine {
 
     await this.host.withBulkIndexing(async () => {
       for (const file of vueFiles) {
-        await this.host.indexFile(file)
+        try {
+          await this.host.indexFile(file)
+        } catch (error) {
+          if (!isUnreadableFileError(error)) {
+            throw error
+          }
+          // 初始索引期间文件可能被删除或不可读，静默跳过即可。
+        }
         if (token?.isCancellationRequested) {
           return
         }
@@ -2172,4 +2188,17 @@ function hasExportModifier(node: ts.Node): boolean {
 
 function hasDefaultModifier(node: ts.Node): boolean {
   return Boolean(ts.canHaveModifiers(node) && ts.getModifiers(node)?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword))
+}
+
+function isUnreadableFileError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code
+  return code === 'ENOENT' || code === 'EACCES' || code === 'EPERM' || code === 'EISDIR' || code === 'ENOTDIR'
+}
+
+function clearMapEntriesInRoot<T>(cache: Map<string, T>, inRoot: (uri: string) => boolean): void {
+  for (const uri of [...cache.keys()]) {
+    if (inRoot(uri)) {
+      cache.delete(uri)
+    }
+  }
 }

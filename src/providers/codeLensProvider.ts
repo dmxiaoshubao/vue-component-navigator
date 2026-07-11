@@ -1,6 +1,6 @@
 import * as vscode from 'vscode'
 import { WorkspaceIndex } from '../indexer/workspaceIndex'
-import { offsetToPosition } from '../utils/position'
+import { createLineStarts, offsetToPosition } from '../utils/position'
 import { SHOW_USAGES_COMMAND } from './hoverProvider'
 
 function isVueDocument(document: vscode.TextDocument): boolean {
@@ -21,11 +21,32 @@ export class VueCodeLensProvider implements vscode.CodeLensProvider {
   constructor(private readonly index: WorkspaceIndex) {}
 
   provideCodeLenses(document: vscode.TextDocument): vscode.ProviderResult<vscode.CodeLens[]> {
-    if (!isVueDocument(document) || document.uri.scheme !== 'file') {
+    if (document.uri.scheme !== 'file') {
       return []
     }
     if (!this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
       return []
+    }
+
+    if (!isVueDocument(document)) {
+      const content = document.getText()
+      this.index.syncScriptComponentUsageContent(document.uri.fsPath, content, false)
+      const commandModule = this.index.getCommandComponentModule(document.uri.fsPath)
+      if (!commandModule) {
+        return []
+      }
+      const usages = this.index.findCommandComponentUsages(document.uri.fsPath)
+      if (usages.length === 0) {
+        return []
+      }
+      const position = toVsCodePosition(createLineStarts(content), commandModule.anchorSpan.start)
+      return [
+        new vscode.CodeLens(new vscode.Range(position, position), {
+          title: usageTitle(usages.length),
+          command: SHOW_USAGES_COMMAND,
+          arguments: [{ kind: 'command-component-usages', commandUri: document.uri.fsPath }],
+        }),
+      ]
     }
 
     // CodeLens 不依赖 Inlay Hints 设置，直接复用现有的组件用法索引。

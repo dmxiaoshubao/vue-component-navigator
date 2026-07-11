@@ -1679,6 +1679,98 @@ export default {
     expect(file.scriptIndex.props.map((prop) => prop.name)).toEqual(['title'])
   })
 
+  it('Vue2 与 Vue3 package 双向导入组件时不会建立跨版本关系', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-cross-version-components-'))
+    const vue2Root = path.join(root, 'packages/vue2-app')
+    const vue3Root = path.join(root, 'packages/vue3-app')
+    const vue2ChildUri = path.join(vue2Root, 'src/Vue2Child.vue')
+    const vue2ParentUri = path.join(vue2Root, 'src/Vue2Parent.vue')
+    const vue3ChildUri = path.join(vue3Root, 'src/Vue3Child.vue')
+    const vue3ParentUri = path.join(vue3Root, 'src/Vue3Parent.vue')
+    const index = new WorkspaceIndex()
+
+    index.setWorkspaceVueVersion(vue2Root, 2)
+    index.setWorkspaceVueVersion(vue3Root, 3)
+    index.indexContent(vue2ChildUri, `
+<template><div /></template>
+<script>
+export default { props: { title: String } }
+</script>
+`)
+    index.indexContent(vue3ChildUri, `
+<template><div /></template>
+<script setup lang="ts">
+defineProps<{ title: string }>()
+</script>
+`)
+    const vue2Parent = index.indexContent(vue2ParentUri, `
+<template><Vue3Child title="from-vue2" /></template>
+<script>
+import Vue3Child from '../../vue3-app/src/Vue3Child.vue'
+export default { components: { Vue3Child } }
+</script>
+`)
+    const vue3Parent = index.indexContent(vue3ParentUri, `
+<template><Vue2Child title="from-vue3" /></template>
+<script setup lang="ts">
+import Vue2Child from '../../vue2-app/src/Vue2Child.vue'
+</script>
+`)
+
+    expect(index.resolveComponent(vue2Parent, 'Vue3Child')).toBeUndefined()
+    expect(index.resolveComponent(vue3Parent, 'Vue2Child')).toBeUndefined()
+    expect(index.findComponentUsages(vue2ChildUri)).toEqual([])
+    expect(index.findComponentUsages(vue3ChildUri)).toEqual([])
+    expect(index.findPropUsages(vue2ChildUri, 'title')).toEqual([])
+    expect(index.findPropUsages(vue3ChildUri, 'title')).toEqual([])
+  })
+
+  it('目标 package 尚未注册时不会暂时写入跨 workspace 关系', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-unknown-target-version-'))
+    const vue2Root = path.join(root, 'vue2-app')
+    const vue3Root = path.join(root, 'vue3-app')
+    const parentUri = path.join(vue2Root, 'src/Parent.vue')
+    const childUri = path.join(vue3Root, 'src/Child.vue')
+    const index = new WorkspaceIndex()
+
+    index.setWorkspaceVueVersion(vue2Root, 2)
+    index.indexContent(parentUri, `
+<template><Child /></template>
+<script>
+import Child from '../../vue3-app/src/Child.vue'
+export default { components: { Child } }
+</script>
+`)
+    index.setWorkspaceVueVersion(vue3Root, 3)
+    index.indexContent(childUri, '<template><div /></template><script setup lang="ts"></script>')
+
+    expect(index.findComponentUsages(childUri)).toEqual([])
+  })
+
+  it('一个 package 切换 Vue 主版本时不会清理另一版本的文件和关系', async () => {
+    const vue2Root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-version-isolation-vue2-'))
+    const vue3Root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-version-isolation-vue3-'))
+    const vue2File = path.join(vue2Root, 'src/App.vue')
+    const vue3Child = path.join(vue3Root, 'src/Child.vue')
+    const vue3Parent = path.join(vue3Root, 'src/Parent.vue')
+
+    writeText(vue2File, '<template><div /></template><script>export default {}</script>')
+    writeText(vue3Child, '<template><div /></template><script setup lang="ts">defineProps<{ title: string }>()</script>')
+    writeText(vue3Parent, '<template><Child title="stable" /></template><script setup lang="ts">import Child from \'./Child.vue\'</script>')
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(vue2Root, undefined, undefined, 2)
+    await index.indexWorkspace(vue3Root, undefined, undefined, 3)
+    const vue3ChildBefore = index.getFile(vue3Child)
+    const vue3ParentBefore = index.getFile(vue3Parent)
+
+    await index.indexWorkspace(vue2Root, undefined, undefined, 3)
+
+    expect(index.getFile(vue3Child)).toBe(vue3ChildBefore)
+    expect(index.getFile(vue3Parent)).toBe(vue3ParentBefore)
+    expect(index.findPropUsages(vue3Child, 'title')).toHaveLength(1)
+  })
+
   it('解析 script setup props 类型、emits、provide/inject，并隔离 ref/eventBus/global/外部 prop', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-indexer-'))
     const typeUri = path.join(root, 'src/components/confirm-dialog/type.ts')
@@ -2585,6 +2677,26 @@ export default {
 
     expect(index.getFile(childUri)).toBeTruthy()
     expect(index.findComponentUsages(childUri)).toEqual([])
+  })
+
+  it('初始索引静默跳过不可读目录', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-unreadable-directory-skip-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const blockedDir = path.join(root, 'src/blocked')
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(childUri, '<template><div /></template><script setup lang="ts"></script>')
+    writeText(path.join(blockedDir, 'Hidden.vue'), '<template><div /></template><script setup lang="ts"></script>')
+    fs.chmodSync(blockedDir, 0)
+
+    try {
+      const index = new WorkspaceIndex()
+      await index.indexWorkspace(root, undefined, undefined, 3)
+
+      expect(index.getFile(childUri)).toBeTruthy()
+    } finally {
+      fs.chmodSync(blockedDir, 0o700)
+    }
   })
 
   it('Vue3 useTemplateRef 换行声明可识别且注释不会产生 ref 方法误绑定', async () => {
@@ -4045,6 +4157,93 @@ export default [{
     expect(routerContent.slice(usages[0].span.start, usages[0].span.end)).toBe('@/pages/GoodsEdit.vue')
   })
 
+  it('Vue2 JSX 命令式组件会将 open 调用投影为真实组件用法', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-command-component-'))
+    const componentUri = path.join(root, 'src/dialog/index.vue')
+    const commandUri = path.join(root, 'src/dialog/index.js')
+    const consumerUri = path.join(root, 'src/Page.vue')
+    writeText(componentUri, '<template><div /></template><script>export default { name: \'device-dialog\' }</script>')
+    writeText(commandUri, `
+import Vue from 'vue'
+import DeviceDialog from './index.vue'
+export default {
+  open() {
+    return Vue.extend({ render: () => <DeviceDialog /> })
+  },
+}
+`)
+    writeText(consumerUri, `
+<template><div /></template>
+<script>
+import SelectDeviceDialog from './dialog'
+export default { mounted() { SelectDeviceDialog.open({}) } }
+</script>
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 2)
+
+    expect(index.getCommandComponentModule(commandUri)?.componentUris).toEqual([componentUri])
+    expect(index.findCommandComponentUsages(commandUri).map((usage) => usage.file.uri)).toEqual([consumerUri])
+    expect(index.findComponentUsages(componentUri).map((usage) => usage.file.uri)).toEqual([consumerUri])
+    const vue2UsageFile = (index as any).scriptComponentUsageFiles.get(commandUri)
+    expect(vue2UsageFile.file.searchableContent).toBe(vue2UsageFile.file.content)
+  })
+
+  it('Vue3 h 命令式组件会将 command.open 调用投影为真实组件用法', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-h-command-component-'))
+    const componentUri = path.join(root, 'src/dialog/index.vue')
+    const commandUri = path.join(root, 'src/dialog/command.tsx')
+    const consumerUri = path.join(root, 'src/use-dialog.ts')
+    writeText(componentUri, '<template><div /></template><script setup lang="ts"></script>')
+    writeText(commandUri, `
+import { createApp, h } from 'vue'
+import Dialog from './index.vue'
+const command = { open: () => createApp({ render: () => h(Dialog) }) }
+export default command
+`)
+    writeText(consumerUri, `
+import command from './dialog/command'
+export const open = () => command.open()
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findCommandComponentUsages(commandUri)).toHaveLength(1)
+    expect(index.findComponentUsages(componentUri).map((usage) => usage.file.uri)).toEqual([consumerUri])
+    const vue3UsageFile = (index as any).scriptComponentUsageFiles.get(commandUri)
+    expect(vue3UsageFile.file).toBe(index.getFile(commandUri))
+  })
+
+  it('Vue3 JSX 命令式组件支持多个命令方法调用', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-jsx-command-component-'))
+    const componentUri = path.join(root, 'src/alert/index.vue')
+    const commandUri = path.join(root, 'src/alert/command.tsx')
+    const consumerUri = path.join(root, 'src/use-alert.ts')
+    writeText(componentUri, '<template><div /></template><script setup lang="ts"></script>')
+    writeText(commandUri, `
+import { createApp } from 'vue'
+import AlertDialog from './index.vue'
+const Dialog = {
+  confirm: () => createApp({ render: () => <AlertDialog /> }),
+  alert: () => createApp({ render: () => <AlertDialog /> }),
+}
+export default Dialog
+`)
+    writeText(consumerUri, `
+import Dialog from './alert/command'
+Dialog.confirm('ok')
+Dialog.alert('done')
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+
+    expect(index.findCommandComponentUsages(commandUri)).toHaveLength(2)
+    expect(index.findComponentUsages(componentUri)).toHaveLength(2)
+  })
+
   it('脚本中的静态 vue import 标识符使用会参与组件用法关系', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-script-static-component-usage-'))
     const childUri = path.join(root, 'src/components/member-login/member-login-dialog.vue')
@@ -4074,6 +4273,53 @@ export function renderDialog() {
     expect(usages).toHaveLength(1)
     expect(usages[0].file.uri).toBe(commandUri)
     expect(commandContent.slice(usages[0].span.start, usages[0].span.end)).toBe('MemberLoginDialog')
+  })
+
+  it('版本反向索引重复重建不会累积脚本组件用法', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-script-usage-rebuild-memory-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const commandUri = path.join(root, 'src/command.ts')
+
+    writeText(childUri, '<template><div /></template><script setup lang="ts">provide(\'service\', true)</script>')
+    writeText(commandUri, `
+import { h } from 'vue'
+import Child from './Child.vue'
+export const render = () => h(Child)
+`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    for (let count = 0; count < 5; count += 1) {
+      index.syncContent(childUri, `<template><div /></template><script setup lang="ts">provide('service', ${count})</script>`)
+    }
+
+    const rawUsages = (index as any).componentUsages.get(childUri) as unknown[]
+    expect(rawUsages).toHaveLength(1)
+    expect(index.findComponentUsages(childUri)).toHaveLength(1)
+  })
+
+  it('切换一个 root 的版本只清理该 root 的外部组件缓存', () => {
+    const firstRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-external-cache-first-'))
+    const secondRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-external-cache-second-'))
+    const index = new WorkspaceIndex()
+    const firstUri = path.join(firstRoot, 'node_modules/ui/first.d.ts')
+    const secondUri = path.join(secondRoot, 'node_modules/ui/second.d.ts')
+    const externalRefComponents = (index as any).externalRefComponents as Map<string, { uri: string }>
+    const externalRefComponentUris = (index as any).externalRefComponentUris as Map<string, { uri: string }>
+
+    index.setWorkspaceVueVersion(firstRoot, 2)
+    index.setWorkspaceVueVersion(secondRoot, 2)
+    externalRefComponents.set(`${firstRoot}\0first`, { uri: firstUri })
+    externalRefComponents.set(`${secondRoot}\0second`, { uri: secondUri })
+    externalRefComponentUris.set(firstUri, { uri: firstUri })
+    externalRefComponentUris.set(secondUri, { uri: secondUri })
+
+    index.setWorkspaceVueVersion(firstRoot, 3)
+
+    expect(externalRefComponents.has(`${firstRoot}\0first`)).toBe(false)
+    expect(externalRefComponents.has(`${secondRoot}\0second`)).toBe(true)
+    expect(externalRefComponentUris.has(firstUri)).toBe(false)
+    expect(externalRefComponentUris.has(secondUri)).toBe(true)
   })
 
   it('忽略注释中的 $refs 调用', () => {

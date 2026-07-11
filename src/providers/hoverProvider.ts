@@ -19,6 +19,7 @@ type UsageCommandArgs =
   | { kind: 'prop-usages', childUri: string, propName: string }
   | { kind: 'slot-usages', childUri: string, slotName: string }
   | { kind: 'ref-method-usages', childUri: string, methodName: string }
+  | { kind: 'command-component-method-usages', commandUri: string, methodName: string }
   | { kind: 'provide-definitions', consumerUri: string, injectKey: string }
   | { kind: 'inject-usages', providerUri: string, provideKey: string }
   | { kind: 'source-usages', sourceUri: string, offset: number, relation: 'prop' | 'prop-type' | 'method' | 'event' | 'provide' | 'inject' | 'hook' | 'component-consumer' }
@@ -428,6 +429,25 @@ export class VueHoverProvider implements vscode.HoverProvider {
       : undefined
     if (sourceHover) {
       return sourceHover
+    }
+    if (!vueDocument) {
+      this.index.syncScriptComponentUsageContent(document.uri.fsPath, content, false)
+      const commandMethod = this.index.findCommandComponentMethodAtOffset(document.uri.fsPath, offset)
+      if (commandMethod) {
+        const usages = this.index.findCommandComponentMethodUsages(document.uri.fsPath, commandMethod.method.name)
+        const summary = usageSummary(usages, this.workspaceBaseDirectory(), {
+          noneText: 'No command method usages found.',
+          title: 'Used by',
+          singular: 'usage',
+          plural: 'usages',
+          commandArgs: {
+            kind: 'command-component-method-usages',
+            commandUri: document.uri.fsPath,
+            methodName: commandMethod.method.name,
+          },
+        })
+        return markdownHover(summary.text, summary.trusted)
+      }
     }
     if (!file) {
       return undefined
