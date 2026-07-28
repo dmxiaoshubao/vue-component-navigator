@@ -3,6 +3,8 @@
 src/**
 test/**
 test-fixtures/**
+test-host/**
+.test-host-dist/**
 scripts/**
 coverage/**
 .vscode-test/**
@@ -15,6 +17,7 @@ package-lock.json
 tsconfig.json
 vitest.config.ts
 esbuild.config.mjs
+esbuild.host.config.mjs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

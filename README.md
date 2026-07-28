@@ -106,7 +106,7 @@ Event Bus usage is ignored until the bus name is found from these entry files. T
 | Command                                      | Description                                                                   |
 | -------------------------------------------- | ----------------------------------------------------------------------------- |
 | `Vue Component Navigator: Show Status`       | Shows index status and whether the active file is indexed.                    |
-| `Vue Component Navigator: Reindex Workspace` | Rebuilds the workspace index. Use it after large refactors or config changes. |
+| `Vue Component Navigator: Reindex Workspace` | Rebuilds all saved files and relationships from disk. Use it after AI or other external tools change files, large refactors, or config changes. |
 
 ## Command Components
 

@@ -9,6 +9,7 @@ const fixtureRoot = path.resolve(__dirname, './fixtures/vue2-basic')
 
 class TestDocument {
   uri: { fsPath: string, scheme: string }
+  isDirty = false
 
   constructor(public filePath: string, private readonly content: string, public languageId = 'vue') {
     this.uri = { fsPath: filePath, scheme: 'file' }
@@ -313,7 +314,7 @@ export default {
     expect(provider.provideDefinition(document, positionAt(parentContent, parentContent.indexOf('open()') + 1))).toBeUndefined()
   })
 
-  it('非 Vue 源文件未保存内容会同步刷新 Vue3 反向关系', async () => {
+  it('非 Vue 源文件未保存时不会刷新 Vue3 反向关系', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provider-unsaved-ts-source-'))
     const hookUri = path.join(root, 'src/hooks/use-verify.ts')
     const pageUri = path.join(root, 'src/Page.vue')
@@ -345,14 +346,16 @@ runVerifyWithCode()
     await localIndex.indexWorkspace(root, undefined, undefined, 3)
     const referenceProvider = new VueReferenceProvider(localIndex)
     const hookDocument = new TestDocument(hookUri, nextHookContent, 'typescript') as any
+    hookDocument.isDirty = true
+    const getText = vi.spyOn(hookDocument, 'getText')
 
     const references = referenceProvider.provideReferences(
       hookDocument,
       positionAt(nextHookContent, nextHookContent.indexOf('runVerifyWithCode =') + 1),
     ) as any[]
 
-    expect(references).toHaveLength(2)
-    expect(references.every((reference) => reference.uri.fsPath === pageUri)).toBe(true)
+    expect(references).toEqual([])
+    expect(getText).not.toHaveBeenCalled()
   })
 
   it('普通 JS/TS 没有补全语境时不读取全文', () => {
@@ -367,6 +370,52 @@ runVerifyWithCode()
     localIndex.setWorkspaceVueVersion(root, 2)
 
     expect(completionProvider.provideCompletionItems(document, positionAt(content, content.length))).toBeUndefined()
+    expect(getText).not.toHaveBeenCalled()
+  })
+
+  it('普通 Vue 文案补全请求不读取全文也不同步索引', () => {
+    const localIndex = new WorkspaceIndex()
+    const completionProvider = new VueCompletionProvider(localIndex)
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue-completion-fast-path-'))
+    const uri = path.join(root, 'src/Editor.vue')
+    const indexedContent = '<template>初始文案</template><script>export default {}</script>'
+    const dirtyContent = '<template>正在编辑普通文案</template><script>export default {}</script>'
+    localIndex.setWorkspaceVueVersion(root, 2)
+    localIndex.indexContent(uri, indexedContent)
+    const document = new TestDocument(uri, dirtyContent) as any
+    document.isDirty = true
+    const getText = vi.spyOn(document, 'getText')
+    const attributeContent = '<template><div title="正在编辑普通文案" /></template><script>export default {}</script>'
+    const attributeDocument = new TestDocument(uri, attributeContent) as any
+    attributeDocument.isDirty = true
+    const getAttributeText = vi.spyOn(attributeDocument, 'getText')
+    const syncContent = vi.spyOn(localIndex, 'syncContent')
+
+    expect(completionProvider.provideCompletionItems(document, positionAt(dirtyContent, dirtyContent.indexOf('</template>')))).toBeUndefined()
+    expect(completionProvider.provideCompletionItems(attributeDocument, positionAt(attributeContent, attributeContent.indexOf('" />')))).toBeUndefined()
+    expect(getText).not.toHaveBeenCalled()
+    expect(getAttributeText).not.toHaveBeenCalled()
+    expect(syncContent).not.toHaveBeenCalled()
+  })
+
+  it('未保存 Vue 文档的所有位置型 Provider 都直接退出', () => {
+    const localIndex = new WorkspaceIndex()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-dirty-provider-gate-'))
+    const uri = path.join(root, 'src/Editor.vue')
+    const savedContent = '<template><div /></template><script>export default { props: { title: String } }</script>'
+    const dirtyContent = '<template><div>{{ title }}</div></template><script>export default { props: { title: String } }</script>'
+    localIndex.setWorkspaceVueVersion(root, 2)
+    localIndex.indexContent(uri, savedContent)
+    const document = new TestDocument(uri, dirtyContent) as any
+    document.isDirty = true
+    const getText = vi.spyOn(document, 'getText')
+    const position = positionAt(dirtyContent, dirtyContent.indexOf('title') + 1)
+
+    expect(new VueDefinitionProvider(localIndex).provideDefinition(document, position)).toBeUndefined()
+    expect(new VueReferenceProvider(localIndex).provideReferences(document, position)).toEqual([])
+    expect(new VueHoverProvider(localIndex).provideHover(document, position)).toBeUndefined()
+    expect(new VueCompletionProvider(localIndex).provideCompletionItems(document, position)).toBeUndefined()
+    expect(new VueCodeLensProvider(localIndex).provideCodeLenses(document)).toEqual([])
     expect(getText).not.toHaveBeenCalled()
   })
 
@@ -488,6 +537,15 @@ import Outer from './Outer.vue'
 export default { components: { Outer } }
 </script>
 `
+    const parentPlainContent = `
+<template>
+  <Outer op />
+</template>
+<script>
+import Outer from './Outer.vue'
+export default { components: { Outer } }
+</script>
+`
     const parentOpenTagContent = `
 <template>
   <Outer :
@@ -521,6 +579,7 @@ export default { components: { Outer } }
     localIndex.indexContent(childUri, childContent)
     localIndex.indexContent(middleUri, middleContent)
     localIndex.indexContent(outerUri, outerContent)
+    localIndex.indexContent(parentUri, parentContent)
     const completionProvider = new VueCompletionProvider(localIndex)
     const document = new TestDocument(parentUri, parentContent) as any
 
@@ -528,21 +587,31 @@ export default { components: { Outer } }
       document,
       positionAt(parentContent, parentContent.indexOf('<Outer :') + '<Outer :'.length),
     ) as any[]
+    localIndex.syncContent(parentUri, parentBindContent)
     const bindDocument = new TestDocument(parentUri, parentBindContent) as any
     const bindCompletions = completionProvider.provideCompletionItems(
       bindDocument,
       positionAt(parentBindContent, parentBindContent.indexOf('v-bind:o') + 'v-bind:o'.length),
     ) as any[]
+    localIndex.syncContent(parentUri, parentPlainContent)
+    const plainDocument = new TestDocument(parentUri, parentPlainContent) as any
+    const plainCompletions = completionProvider.provideCompletionItems(
+      plainDocument,
+      positionAt(parentPlainContent, parentPlainContent.indexOf('<Outer op') + '<Outer op'.length),
+    ) as any[]
+    localIndex.syncContent(parentUri, parentOpenTagContent)
     const openTagDocument = new TestDocument(parentUri, parentOpenTagContent) as any
     const openTagCompletions = completionProvider.provideCompletionItems(
       openTagDocument,
       positionAt(parentOpenTagContent, parentOpenTagContent.indexOf('<Outer :') + '<Outer :'.length),
     ) as any[]
+    localIndex.syncContent(parentUri, parentValueContent)
     const valueDocument = new TestDocument(parentUri, parentValueContent) as any
     const valueCompletions = completionProvider.provideCompletionItems(
       valueDocument,
       positionAt(parentValueContent, parentValueContent.indexOf('title=":"') + 'title=":'.length),
     )
+    localIndex.syncContent(parentUri, parentExistingContent)
     const existingDocument = new TestDocument(parentUri, parentExistingContent) as any
     const existingCompletions = completionProvider.provideCompletionItems(
       existingDocument,
@@ -557,6 +626,7 @@ export default { components: { Outer } }
     expect(completions.find((item) => item.label === 'operate-type')?.detail).toBe('Child.props.operateType')
     expect(completions.find((item) => item.label === 'operate-type')?.insertText).toBe(':operate-type')
     expect(bindCompletions.find((item) => item.label === 'operate-type')?.insertText).toBe('v-bind:operate-type')
+    expect(plainCompletions.find((item) => item.label === 'operate-type')?.insertText).toBe('operate-type')
     expect(openTagCompletions.find((item) => item.label === 'operate-type')?.insertText).toBe(':operate-type')
     expect(valueCompletions).toBeUndefined()
     expect(existingCompletions.map((item) => item.label)).not.toContain('operate-type')
@@ -813,7 +883,9 @@ export default {
 }
 </script>
 `
-    const completionDocument = new TestDocument(path.join(root, 'EventBusCompletion.vue'), completionContent) as any
+    const completionUri = path.join(root, 'EventBusCompletion.vue')
+    localIndex.indexContent(completionUri, completionContent)
+    const completionDocument = new TestDocument(completionUri, completionContent) as any
     const completionResult = (needle: string) => {
       return completionProvider.provideCompletionItems(completionDocument, positionAt(completionContent, completionContent.indexOf(needle) + needle.length)) as any[] | undefined
     }
@@ -1284,6 +1356,7 @@ export default { components: { Child, Nested } }
 
     const definition = provider.provideDefinition(document, positionAt(content, titleOffset)) as any
     const hover = hoverProvider.provideHover(document, positionAt(content, titleOffset)) as any
+    index.syncContent(path.join(fixtureRoot, 'Parent.vue'), unknownContent)
     const missing = provider.provideDefinition(unknownDocument, positionAt(unknownContent, unknownOffset))
 
     expect(definition.uri.fsPath.endsWith('Child.vue')).toBe(true)
@@ -3043,8 +3116,7 @@ runVerifyWithCode('code')
 
     expect(referenceProvider.provideReferences(hookDocument, positionAt(initialHookContent, initialHookContent.indexOf('runVerifyWithCode =') + 1)) as any[]).toEqual([])
 
-    writeText(hookUri, nextHookContent)
-    await localIndex.syncGlobalComponentFile(hookUri)
+    await localIndex.syncGlobalComponentContent(hookUri, nextHookContent)
     referenceProvider = new VueReferenceProvider(localIndex)
     hookDocument = new TestDocument(hookUri, nextHookContent, 'typescript') as any
 
@@ -3172,6 +3244,7 @@ export default { components: { Child } }
     localIndex.indexContent(parentUri, parentContent)
     const provider = new VueCodeLensProvider(localIndex)
     const document = new TestDocument(childUri, childContent) as any
+    const getText = vi.spyOn(document, 'getText')
     const lenses = provider.provideCodeLenses(document) as any[]
 
     expect(lenses).toHaveLength(1)
@@ -3180,6 +3253,7 @@ export default { components: { Child } }
     expect(lenses[0].command.title).toBe('Used by 1 usage')
     expect(lenses[0].command.command).toBe('vueComponentNavigator.showUsages')
     expect(lenses[0].command.arguments).toEqual([{ kind: 'component-usages', childUri }])
+    expect(getText).not.toHaveBeenCalled()
   })
 
   it('组件有多个用法时 CodeLens 可点击打开用法列表', () => {
@@ -3275,6 +3349,7 @@ export default command
     await localIndex.indexWorkspace(root, undefined, undefined, 3)
     const provider = new VueCodeLensProvider(localIndex)
     const commandDocument = new TestDocument(commandUri, commandContent, 'typescriptreact') as any
+    const getText = vi.spyOn(commandDocument, 'getText')
     const commandLenses = provider.provideCodeLenses(commandDocument) as any[]
     const componentDocument = new TestDocument(componentUri, componentContent) as any
     const componentLenses = provider.provideCodeLenses(componentDocument) as any[]
@@ -3282,6 +3357,7 @@ export default command
     expect(commandLenses).toHaveLength(1)
     expect(commandLenses[0].command.title).toBe('Used by 1 usage')
     expect(commandLenses[0].command.arguments).toEqual([{ kind: 'command-component-usages', commandUri }])
+    expect(getText).not.toHaveBeenCalled()
     expect(componentLenses).toHaveLength(1)
     expect(componentLenses[0].command.title).toBe('Used by 1 usage')
   })

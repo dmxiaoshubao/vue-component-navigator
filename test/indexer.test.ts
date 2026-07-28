@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { WorkspaceIndex, findRefMethodAccess } from '../src/indexer/workspaceIndex'
 import { clearTsConfigCache, findEmit, findMethod, findProp, findRefComponent, findRefMethodUsages, findRegisteredComponent, findTemplateEventUsages, findTemplatePropUsages, resolveProjectPathWithExtensions } from '../src/indexer/relationResolver'
 import { parseSfc } from '../src/indexer/sfcParser'
@@ -3274,11 +3274,11 @@ const service = inject(serviceKey)
     const index = new WorkspaceIndex()
     await index.indexWorkspace(root, undefined, undefined, 3)
 
-    index.syncDocumentContent(keyUri, keyContent)
+    await index.syncGlobalComponentContent(keyUri, keyContent)
     const providerAfterFirstSync = index.getFile(providerUri)!
     const consumerAfterFirstSync = index.getFile(consumerUri)!
 
-    index.syncDocumentContent(keyUri, keyContent)
+    await index.syncGlobalComponentContent(keyUri, keyContent)
 
     expect(index.getFile(providerUri)).toBe(providerAfterFirstSync)
     expect(index.getFile(consumerUri)).toBe(consumerAfterFirstSync)
@@ -4366,5 +4366,255 @@ export default {
 
     expect(findTemplatePropUsages(files, otherUri, 'title')).toHaveLength(1)
     expect(findTemplateEventUsages(files, otherUri, 'save')).toHaveLength(1)
+  })
+
+  it('Vue2 普通文案插入和属性删除只增量更新当前来源的透传关系', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue2-forwarding-hot-path-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const middleUri = path.join(root, 'src/Middle.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const childContent = `<template><div /></template><script>export default { props: { label: String } }</script>`
+    const middleContent = `
+<template><Child v-bind="$attrs" v-on="$listeners" /></template>
+<script>
+import Child from './Child.vue'
+export default { components: { Child } }
+</script>
+`
+    const parentContent = `
+<template><section><Middle :label="label" @save="save" />初始文案</section></template>
+<script>
+import Middle from './Middle.vue'
+export default { components: { Middle }, methods: { save() {} } }
+</script>
+`
+
+    writeText(childUri, childContent)
+    writeText(middleUri, middleContent)
+    writeText(parentUri, parentContent)
+    const index = new WorkspaceIndex()
+    index.setWorkspaceVueVersion(root, 2)
+    index.indexContent(childUri, childContent)
+    index.indexContent(middleUri, middleContent)
+    index.indexContent(parentUri, parentContent)
+    const rebuild = vi.spyOn(index as any, 'rebuildReverseIndexes')
+
+    for (let count = 0; count < 5; count += 1) {
+      index.syncContent(parentUri, parentContent.replace('初始文案', `编辑后的文案${count}`))
+    }
+
+    expect(rebuild).not.toHaveBeenCalled()
+    expect(index.findTemplatePropUsages(childUri, 'label').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplateEventUsages(childUri, 'save').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect((index as any).propUsages.get(`${childUri}\0label`)).toHaveLength(1)
+    expect((index as any).eventUsages.get(`${childUri}\0save`)).toHaveLength(1)
+
+    index.syncContent(parentUri, parentContent.replace(':label="label" @save="save"', ''))
+
+    expect(rebuild).not.toHaveBeenCalled()
+    expect(index.findTemplatePropUsages(childUri, 'label')).toEqual([])
+    expect(index.findTemplateEventUsages(childUri, 'save')).toEqual([])
+  })
+
+  it('透传组件的声明边界变化会精确触发全量失效', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-forwarding-boundary-change-'))
+    const childUri = path.join(root, 'src/Child.vue')
+    const middleUri = path.join(root, 'src/Middle.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const childContent = `<template><div /></template><script>export default { props: { label: String } }</script>`
+    const middleContent = `
+<template><Child v-bind="$attrs" /></template>
+<script>
+import Child from './Child.vue'
+export default { components: { Child } }
+</script>
+`
+    const parentContent = `
+<template><Middle :label="label" /></template>
+<script>
+import Middle from './Middle.vue'
+export default { components: { Middle } }
+</script>
+`
+
+    writeText(childUri, childContent)
+    writeText(middleUri, middleContent)
+    writeText(parentUri, parentContent)
+    const index = new WorkspaceIndex()
+    index.setWorkspaceVueVersion(root, 2)
+    index.indexContent(childUri, childContent)
+    index.indexContent(middleUri, middleContent)
+    index.indexContent(parentUri, parentContent)
+    const rebuild = vi.spyOn(index as any, 'rebuildReverseIndexes')
+
+    index.syncContent(middleUri, middleContent.replace(
+      'export default { components: { Child } }',
+      'export default { components: { Child }, props: { label: String } }',
+    ))
+
+    expect(rebuild).toHaveBeenCalledTimes(1)
+    expect(index.findTemplatePropUsages(middleUri, 'label').map((usage) => usage.file.uri)).toEqual([parentUri])
+    expect(index.findTemplatePropUsages(childUri, 'label')).toEqual([])
+  })
+
+  it('循环透传关系会终止传播且不会累积重复 usage', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-forwarding-cycle-'))
+    const firstUri = path.join(root, 'src/First.vue')
+    const secondUri = path.join(root, 'src/Second.vue')
+    const parentUri = path.join(root, 'src/Parent.vue')
+    const firstContent = `
+<template><Second v-bind="$attrs" /></template>
+<script>
+import Second from './Second.vue'
+export default { components: { Second } }
+</script>
+`
+    const secondContent = `
+<template><First v-bind="$attrs" /></template>
+<script>
+import First from './First.vue'
+export default { components: { First } }
+</script>
+`
+    const parentContent = `
+<template><First :label="label" /></template>
+<script>
+import First from './First.vue'
+export default { components: { First } }
+</script>
+`
+
+    writeText(firstUri, firstContent)
+    writeText(secondUri, secondContent)
+    writeText(parentUri, parentContent)
+    const index = new WorkspaceIndex()
+    index.setWorkspaceVueVersion(root, 2)
+    index.indexContent(firstUri, firstContent)
+    index.indexContent(secondUri, secondContent)
+    index.indexContent(parentUri, parentContent)
+
+    expect(index.findTemplatePropUsages(firstUri, 'label')).toHaveLength(1)
+    expect(index.findTemplatePropUsages(secondUri, 'label')).toHaveLength(1)
+    expect((index as any).propUsages.get(`${firstUri}\0label`)).toHaveLength(1)
+    expect((index as any).propUsages.get(`${secondUri}\0label`)).toHaveLength(1)
+  })
+
+  it('provide 键不变时只刷新受影响的 inject 消费者', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-provide-hot-path-'))
+    const providerUri = path.join(root, 'src/Provider.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+    const consumerContent = `<template><div /></template><script>export default { inject: ['service'] }</script>`
+    const providerContent = `
+<template><section><Consumer />初始文案</section></template>
+<script>
+import Consumer from './Consumer.vue'
+export default { components: { Consumer }, provide: { service: {} } }
+</script>
+`
+
+    writeText(providerUri, providerContent)
+    writeText(consumerUri, consumerContent)
+    const index = new WorkspaceIndex()
+    index.setWorkspaceVueVersion(root, 2)
+    index.indexContent(consumerUri, consumerContent)
+    index.indexContent(providerUri, providerContent)
+    const rebuild = vi.spyOn(index as any, 'rebuildReverseIndexes')
+
+    index.syncContent(providerUri, providerContent.replace('初始文案', '编辑后的文案'))
+
+    expect(rebuild).not.toHaveBeenCalled()
+    expect(index.findInjectUsages(providerUri, 'service').map((usage) => usage.file.uri)).toEqual([consumerUri])
+
+    index.syncContent(providerUri, providerContent.replace('service: {}', 'nextService: {}'))
+
+    expect(rebuild).toHaveBeenCalledTimes(1)
+    expect(index.findInjectUsages(providerUri, 'service')).toEqual([])
+  })
+
+  it('inject 消费者反复编辑不会在 provider 跟踪集合中累积旧键', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-inject-tracking-cleanup-'))
+    const providerUri = path.join(root, 'src/Provider.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+    const providerContent = `
+<template><Consumer /></template>
+<script>
+import Consumer from './Consumer.vue'
+export default { components: { Consumer }, provide: { service: {} } }
+</script>
+`
+    const consumerContent = (key: string) => `<template><div /></template><script>export default { inject: ['${key}'] }</script>`
+
+    writeText(providerUri, providerContent)
+    writeText(consumerUri, consumerContent('service'))
+    const index = new WorkspaceIndex()
+    index.setWorkspaceVueVersion(root, 2)
+    index.indexContent(consumerUri, consumerContent('service'))
+    index.indexContent(providerUri, providerContent)
+
+    for (let count = 0; count < 5; count += 1) {
+      index.syncContent(consumerUri, consumerContent(`missing${count}`))
+      index.syncContent(consumerUri, consumerContent('service'))
+    }
+
+    const provider = index.getFile(providerUri)!
+    const trackedKeys = (index as any).injectUsageKeysByProvider.get(provider) as Set<string>
+    expect(trackedKeys.size).toBe(1)
+    expect(index.findInjectUsages(providerUri, 'service')).toHaveLength(1)
+  })
+
+  it('Vue2 mixin 源变化只重新解析真实消费者并使用本次同步内容', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-mixin-targeted-refresh-'))
+    const mixinUri = path.join(root, 'src/SharedMixin.vue')
+    const consumerUri = path.join(root, 'src/Consumer.vue')
+    const unrelatedUri = path.join(root, 'src/Unrelated.vue')
+    const initialMixinContent = `<script>export default { methods: { oldMethod() {} } }</script>`
+    const nextMixinContent = `<script>export default { methods: { nextMethod() {} } }</script>`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^2.7.0' } }))
+    writeText(mixinUri, initialMixinContent)
+    writeText(consumerUri, `
+<template><div /></template>
+<script>
+import SharedMixin from './SharedMixin.vue'
+export default { mixins: [SharedMixin] }
+</script>
+`)
+    writeText(unrelatedUri, `<template><div /></template><script>export default { methods: { untouched() {} } }</script>`)
+
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 2)
+    const runtimeIndexContent = vi.spyOn((index as any).vue2Runtime, 'indexContent')
+
+    index.syncContent(mixinUri, nextMixinContent)
+
+    const indexedUris = runtimeIndexContent.mock.calls.map(([uri]) => uri)
+    expect(indexedUris).toContain(mixinUri)
+    expect(indexedUris).toContain(consumerUri)
+    expect(indexedUris).not.toContain(unrelatedUri)
+    expect(index.getFile(consumerUri)?.scriptIndex.methods.map((method) => method.name)).toContain('nextMethod')
+    expect(index.getFile(consumerUri)?.scriptIndex.methods.map((method) => method.name)).not.toContain('oldMethod')
+  })
+
+  it('Vue3 普通文案编辑不会把当前文件作为 source consumer 再解析一次', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-vue3-self-consumer-'))
+    const uri = path.join(root, 'src/Probe.vue')
+    const content = `
+<template><div>{{ props.label }}</div></template>
+<script setup lang="ts">
+const props = defineProps<{ label?: string }>()
+</script>
+`
+
+    writeText(path.join(root, 'package.json'), JSON.stringify({ dependencies: { vue: '^3.5.0' } }))
+    writeText(uri, content)
+    const index = new WorkspaceIndex()
+    await index.indexWorkspace(root, undefined, undefined, 3)
+    const runtimeIndexContent = vi.spyOn((index as any).vue3Runtime, 'indexContent')
+    const rebuild = vi.spyOn(index as any, 'rebuildReverseIndexes')
+
+    index.syncContent(uri, content.replace('</div>', '编辑文案</div>'))
+
+    expect(runtimeIndexContent).toHaveBeenCalledTimes(1)
+    expect(rebuild).not.toHaveBeenCalled()
   })
 })

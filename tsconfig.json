@@ -13,6 +13,6 @@
     "ignoreDeprecations": "6.0",
     "types": ["node", "vscode", "vitest/globals"]
   },
-  "include": ["src"],
+  "include": ["src", "test-host"],
   "exclude": ["node_modules", "dist", "test", "test-fixtures"]
 }

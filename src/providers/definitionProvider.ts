@@ -53,6 +53,10 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
     if (document.uri.scheme !== 'file') {
       return undefined
     }
+    // 索引只对应已保存内容；脏文档的偏移可能已经变化，避免返回错误跳转。
+    if (document.isDirty) {
+      return undefined
+    }
     if (vueDocument && !this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
       return undefined
     }
@@ -61,9 +65,7 @@ export class VueDefinitionProvider implements vscode.DefinitionProvider {
     }
 
     const content = document.getText()
-    const file = vueDocument
-      ? this.index.syncContent(document.uri.fsPath, content)
-      : this.index.syncDocumentContent(document.uri.fsPath, content, document.version) ?? this.index.getFile(document.uri.fsPath)
+    const file = this.index.getIndexedDocumentFile(document.uri.fsPath)
     const offset = vueDocument
       ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
       : positionToOffset(createLineStarts(content), { line: position.line, character: position.character })

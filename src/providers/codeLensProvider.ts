@@ -1,6 +1,6 @@
 import * as vscode from 'vscode'
 import { WorkspaceIndex } from '../indexer/workspaceIndex'
-import { createLineStarts, offsetToPosition } from '../utils/position'
+import { offsetToPosition } from '../utils/position'
 import { SHOW_USAGES_COMMAND } from './hoverProvider'
 
 function isVueDocument(document: vscode.TextDocument): boolean {
@@ -18,10 +18,25 @@ function usageTitle(usageCount: number): string {
 }
 
 export class VueCodeLensProvider implements vscode.CodeLensProvider {
+  private readonly changeEmitter = new vscode.EventEmitter<void>()
+  readonly onDidChangeCodeLenses = this.changeEmitter.event
+
   constructor(private readonly index: WorkspaceIndex) {}
+
+  refresh(): void {
+    this.changeEmitter.fire()
+  }
+
+  dispose(): void {
+    this.changeEmitter.dispose()
+  }
 
   provideCodeLenses(document: vscode.TextDocument): vscode.ProviderResult<vscode.CodeLens[]> {
     if (document.uri.scheme !== 'file') {
+      return []
+    }
+    // CodeLens 的位置来自已保存快照，编辑期间隐藏以避免使用过期偏移。
+    if (document.isDirty) {
       return []
     }
     if (!this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
@@ -29,17 +44,16 @@ export class VueCodeLensProvider implements vscode.CodeLensProvider {
     }
 
     if (!isVueDocument(document)) {
-      const content = document.getText()
-      this.index.syncScriptComponentUsageContent(document.uri.fsPath, content, false)
       const commandModule = this.index.getCommandComponentModule(document.uri.fsPath)
-      if (!commandModule) {
+      const file = this.index.getIndexedDocumentFile(document.uri.fsPath)
+      if (!commandModule || !file) {
         return []
       }
       const usages = this.index.findCommandComponentUsages(document.uri.fsPath)
       if (usages.length === 0) {
         return []
       }
-      const position = toVsCodePosition(createLineStarts(content), commandModule.anchorSpan.start)
+      const position = toVsCodePosition(file.lineStarts, commandModule.anchorSpan.start)
       return [
         new vscode.CodeLens(new vscode.Range(position, position), {
           title: usageTitle(usages.length),
@@ -50,7 +64,10 @@ export class VueCodeLensProvider implements vscode.CodeLensProvider {
     }
 
     // CodeLens 不依赖 Inlay Hints 设置，直接复用现有的组件用法索引。
-    const file = this.index.syncContent(document.uri.fsPath, document.getText())
+    const file = this.index.getFile(document.uri.fsPath)
+    if (!file) {
+      return []
+    }
     if (!file.template) {
       return []
     }

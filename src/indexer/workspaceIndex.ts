@@ -41,6 +41,27 @@ interface ScriptComponentUsageImport {
   spans: TextSpan[]
 }
 
+interface ForwardedUsageSeed {
+  targetUri: string
+  name: string
+  usage: UsageInfo
+}
+
+interface RelationshipIndexResult {
+  children: Set<string>
+  propSeeds: ForwardedUsageSeed[]
+  eventSeeds: ForwardedUsageSeed[]
+}
+
+interface RelationshipTopology {
+  children: Set<string>
+  forwardedPropChildren: Set<string>
+  forwardedEventChildren: Set<string>
+  declaredProps: Set<string>
+  declaredEvents: Set<string>
+  provideKeys: string[]
+}
+
 function replaceMap<K, V>(target: Map<K, V>, source: Map<K, V>, cloneValue: (value: V) => V = (value) => value): void {
   target.clear()
   for (const [key, value] of source) {
@@ -161,6 +182,7 @@ export class WorkspaceIndex {
     indexGlobalComponentFile: (uri, rebuildScriptUsages) => this.indexGlobalComponentFile(uri, rebuildScriptUsages),
     refreshEventBusRegistrations: (root, token) => this.refreshEventBusRegistrations(root, token).then(() => undefined),
     isInsideWorkspace: (uri) => this.isInsideWorkspace(uri),
+    getIndexedContent: (uri) => this.files.get(uri)?.content,
     withBulkIndexing: async (task) => {
       this.isBulkIndexing = true
       try {
@@ -248,8 +270,7 @@ export class WorkspaceIndex {
   }
 
   hasIndexedDocumentContext(uri: string): boolean {
-    return Boolean(this.getFile(uri))
-      || this.scriptComponentUsageFiles.has(uri)
+    return Boolean(this.getIndexedDocumentFile(uri))
       || this.hasSourceRelations(uri)
       || this.hasVue3Source(uri)
   }
@@ -285,6 +306,10 @@ export class WorkspaceIndex {
 
   getFile(uri: string): VueFileIndex | undefined {
     return this.files.get(uri) ?? this.externalRefComponentUris.get(uri)
+  }
+
+  getIndexedDocumentFile(uri: string): VueFileIndex | undefined {
+    return this.getFile(uri) ?? this.scriptComponentUsageFiles.get(uri)?.file
   }
 
   getAllFiles(): VueFileIndex[] {
@@ -355,8 +380,12 @@ export class WorkspaceIndex {
 
   indexContent(uri: string, content: string): VueFileIndex {
     const previous = this.files.get(uri)
-    const previousRelationshipChildren = previous ? this.relationshipChildren(previous) : new Set<string>()
-    const wasMixinSource = this.vue2Runtime.hasMixinSource(uri)
+    const previousTopology = previous ? this.relationshipTopology(previous) : emptyRelationshipTopology()
+    const affectedInjectConsumerUris = previous ? this.injectConsumerUris(previous) : []
+    const vue2MixinConsumerUris = this.vue2Runtime.getMixinConsumerUris(uri)
+    const vue3SourceConsumerUris = this.vue3SourceConsumerUris(uri)
+    const hasDependentConsumers = vue2MixinConsumerUris.some((consumerUri) => consumerUri !== uri && this.files.get(consumerUri)?.vueVersion === 2)
+      || vue3SourceConsumerUris.some((consumerUri) => this.files.get(consumerUri)?.vueVersion === 3)
     this.vue2Runtime.clearMixinCacheForFile(uri)
     if (previous) {
       this.removeReverseIndex(previous)
@@ -364,12 +393,15 @@ export class WorkspaceIndex {
 
     const sfc = this.parseIndexableContent(uri, content)
     const vueVersion = this.vueVersionForUri(uri, sfc)
-    const refreshVue3SourceConsumers = this.shouldRefreshVue3SourceConsumers(uri, vueVersion, previous)
-    if (refreshVue3SourceConsumers) {
+    if (vueVersion === 3 || previous?.vueVersion === 3 || vue3SourceConsumerUris.length > 0) {
       this.vue3Runtime.invalidate(uri)
     }
     const file = this.runtimeFor(vueVersion).indexContent(uri, sfc)
     this.files.set(uri, file)
+    if (vueVersion === 3 && vue3SourceConsumerUris.length > 0) {
+      // 外部消费者必须读取本次同步内容，不能回退到磁盘上的旧版本。
+      this.vue3Runtime.syncSourceContent(uri, content)
+    }
     const scriptUsageFile = this.scriptComponentUsageFiles.get(uri)
     if (vueVersion === 3 && scriptUsageFile && scriptUsageFile.file !== file) {
       // standalone 脚本已经拥有完整索引时复用同一个文件对象，避免常驻两套源码与行号数据。
@@ -383,27 +415,23 @@ export class WorkspaceIndex {
     this.addSourceRelations(file)
     this.addVue3ScriptImportConsumers(file)
     this.addProvideDefinitions(file)
-    const relationshipChildren = this.addRelationshipUsages(file)
+    const relationships = this.addRelationshipUsages(file)
     this.addEventBusUsages(file)
     this.addInjectUsages(file)
-    if (
-      file.scriptIndex.provides.length > 0
-      || (previous?.scriptIndex.provides.length ?? 0) > 0
-      || !sameStringSet(previousRelationshipChildren, relationshipChildren)
-      || hasForwardedListeners(file)
-      || (previous ? hasForwardedListeners(previous) : false)
-      || ((hasTemplateEventAttrs(file) || (previous ? hasTemplateEventAttrs(previous) : false)) && this.hasAnyForwardedListeners(file.vueVersion))
-      || hasForwardedAttrs(file)
-      || (previous ? hasForwardedAttrs(previous) : false)
-      || ((hasTemplatePropAttrs(file) || (previous ? hasTemplatePropAttrs(previous) : false)) && this.hasAnyForwardedAttrs(file.vueVersion))
-    ) {
+    const currentTopology = this.relationshipTopology(file)
+    const topologyChanged = relationshipTopologyChanged(previousTopology, currentTopology)
+    if (topologyChanged && !hasDependentConsumers) {
       this.rebuildReverseIndexes(file.vueVersion)
+    } else if (!topologyChanged) {
+      this.addForwardedAttrPropUsages(relationships.propSeeds)
+      this.addForwardedAttrEventUsages(relationships.eventSeeds)
+      this.refreshInjectUsages(affectedInjectConsumerUris)
     }
-    if (wasMixinSource) {
-      this.rebuildIndexedFilesByVersion(2)
+    if (vue2MixinConsumerUris.length > 0) {
+      this.rebuildVue2MixinConsumers(uri, vue2MixinConsumerUris)
     }
-    if (refreshVue3SourceConsumers) {
-      this.rebuildVue3SourceConsumers(uri)
+    if (vue3SourceConsumerUris.length > 0) {
+      this.rebuildVue3SourceConsumers(vue3SourceConsumerUris)
     }
     return file
   }
@@ -440,49 +468,32 @@ export class WorkspaceIndex {
     return this.indexContent(uri, content)
   }
 
-  syncDocumentContent(uri: string, content: string, version?: number): VueFileIndex | undefined {
-    if (!isScriptFile(uri)) {
-      return undefined
-    }
-    if (!this.isInsideIndexedWorkspace(uri)) {
-      return undefined
-    }
-
-    const vueVersion = this.vueVersionForUri(uri)
-    if (vueVersion === 3 && this.hasVue3Source(uri)) {
-      const sourceChanged = this.vue3Runtime.syncSourceContent(uri, content, version)
-      if (sourceChanged) {
-        this.rebuildVue3SourceConsumers(uri)
-      }
-    }
-
-    const shouldIndex = Boolean(this.files.get(uri))
-      || (vueVersion === 3 && this.vue3Runtime.shouldIndexScriptContent(content))
-    return shouldIndex ? this.syncContent(uri, content) : undefined
-  }
-
   remove(uri: string): void {
-    const wasMixinSource = this.vue2Runtime.hasMixinSource(uri)
-    const refreshVue3SourceConsumers = this.shouldRefreshVue3SourceConsumers(uri, undefined, this.files.get(uri))
-    if (refreshVue3SourceConsumers) {
+    const vue2MixinConsumerUris = this.vue2Runtime.getMixinConsumerUris(uri)
+    const vue3SourceConsumerUris = this.vue3SourceConsumerUris(uri)
+    const hasVue2MixinConsumers = vue2MixinConsumerUris.some((consumerUri) => consumerUri !== uri && this.files.get(consumerUri)?.vueVersion === 2)
+    const hasVue3SourceConsumers = vue3SourceConsumerUris.some((consumerUri) => this.files.get(consumerUri)?.vueVersion === 3)
+    if (vue3SourceConsumerUris.length > 0 || this.files.get(uri)?.vueVersion === 3) {
       this.vue3Runtime.invalidate(uri)
     }
     this.vue2Runtime.clearMixinCacheForFile(uri)
+    this.vue2Runtime.removeConsumer(uri)
     const file = this.files.get(uri)
-    const hadRelationships = (file?.templateIndex.components.length ?? 0) > 0
+    const requiresReverseIndexRebuild = (file?.templateIndex.components.length ?? 0) > 0
+      || (file?.scriptIndex.provides.length ?? 0) > 0
     if (file) {
       this.removeReverseIndex(file)
       this.files.delete(uri)
       this.parentComponents.delete(uri)
     }
-    if (hadRelationships) {
+    if (hasVue2MixinConsumers) {
+      this.rebuildVue2MixinConsumers(uri, vue2MixinConsumerUris)
+    }
+    if (hasVue3SourceConsumers) {
+      this.rebuildVue3SourceConsumers(vue3SourceConsumerUris)
+    }
+    if (requiresReverseIndexRebuild && !hasVue2MixinConsumers && !hasVue3SourceConsumers) {
       this.rebuildReverseIndexes(file?.vueVersion)
-    }
-    if (wasMixinSource) {
-      this.rebuildIndexedFilesByVersion(2)
-    }
-    if (refreshVue3SourceConsumers) {
-      this.rebuildVue3SourceConsumers(uri)
     }
   }
 
@@ -531,41 +542,51 @@ export class WorkspaceIndex {
   }
 
   async syncGlobalComponentFile(uri: string): Promise<void> {
-    const vueVersion = this.vueVersionForUri(uri)
-    const hasVue3ImportConsumers = vueVersion === 3 && this.vue3ScriptImportConsumers.has(uri)
-    if (vueVersion === 3) {
-      this.vue3Runtime.invalidate(uri)
-    }
     const content = await readTextIfExists(uri)
     if (content !== undefined) {
-      this.indexScriptComponentUsageContent(uri, content, vueVersion === 3 ? !hasVue3ImportConsumers : true)
-      if (vueVersion === 3 && this.vue3Runtime.shouldIndexScriptContent(content)) {
-        this.indexContent(uri, content)
-      } else if (vueVersion === 3) {
-        this.remove(uri)
-      }
-    } else if (vueVersion === 3) {
+      await this.syncGlobalComponentContent(uri, content)
+      return
+    }
+
+    if (this.vueVersionForUri(uri) === 3) {
       this.removeScriptComponentUsageFile(uri)
       this.remove(uri)
     }
+  }
+
+  async syncGlobalComponentContent(uri: string, content: string): Promise<void> {
+    const vueVersion = this.vueVersionForUri(uri)
+    const hasVue3ImportConsumers = vueVersion === 3 && this.vue3ScriptImportConsumers.has(uri)
+    this.syncScriptComponentUsageContent(uri, content, vueVersion === 3 ? !hasVue3ImportConsumers : true)
+
     if (vueVersion === 3) {
+      if (this.vue3Runtime.shouldIndexScriptContent(content)) {
+        this.syncContent(uri, content)
+        return
+      }
+      if (this.files.has(uri)) {
+        this.remove(uri)
+        return
+      }
+
+      const consumerUris = this.vue3SourceConsumerUris(uri)
+      if (consumerUris.length > 0 && this.vue3Runtime.syncSourceContent(uri, content)) {
+        this.rebuildVue3SourceConsumers(consumerUris)
+      }
       return
     }
-    const wasMixinSource = this.vue2Runtime.hasMixinSource(uri)
+
+    const mixinConsumerUris = this.vue2Runtime.getMixinConsumerUris(uri)
     const beforeGlobals = this.globalComponentsSignature()
     const beforeEventBusNames = this.eventBusNamesSignature()
     this.vue2Runtime.clearMixinCacheForFile(uri)
-    if (content !== undefined) {
-      await this.indexGlobalComponentContent(uri, content)
-    }
+    await this.indexGlobalComponentContent(uri, content)
     await this.refreshEventBusRegistrations()
     const eventBusChanged = beforeEventBusNames !== this.eventBusNamesSignature()
-    if (
-      wasMixinSource
-      || eventBusChanged
-      || beforeGlobals !== this.globalComponentsSignature()
-    ) {
+    if (eventBusChanged || beforeGlobals !== this.globalComponentsSignature()) {
       this.rebuildIndexedFilesByVersion(2)
+    } else if (mixinConsumerUris.length > 0) {
+      this.rebuildVue2MixinConsumers(uri, mixinConsumerUris)
     }
   }
 
@@ -579,19 +600,17 @@ export class WorkspaceIndex {
       if (wasCommandModule) this.rebuildReverseIndexes(version)
       return
     }
-    const wasMixinSource = this.vue2Runtime.hasMixinSource(uri)
+    const mixinConsumerUris = this.vue2Runtime.getMixinConsumerUris(uri)
     const beforeGlobals = this.globalComponentsSignature()
     const beforeEventBusNames = this.eventBusNamesSignature()
     this.vue2Runtime.clearMixinCacheForFile(uri)
     this.removeGlobalRegistrationsFromFile(uri)
     await this.refreshEventBusRegistrations()
     const eventBusChanged = beforeEventBusNames !== this.eventBusNamesSignature()
-    if (
-      wasMixinSource
-      || eventBusChanged
-      || beforeGlobals !== this.globalComponentsSignature()
-    ) {
+    if (eventBusChanged || beforeGlobals !== this.globalComponentsSignature()) {
       this.rebuildIndexedFilesByVersion(2)
+    } else if (mixinConsumerUris.length > 0) {
+      this.rebuildVue2MixinConsumers(uri, mixinConsumerUris)
     } else if (wasCommandModule) {
       this.rebuildReverseIndexes(version)
     }
@@ -811,11 +830,13 @@ export class WorkspaceIndex {
     return this.hasMixinSource(uri) || this.sourceRelationFiles.has(uri)
   }
 
-  private shouldRefreshVue3SourceConsumers(uri: string, vueVersion: VueMajorVersion | undefined, previous: VueFileIndex | undefined): boolean {
-    return vueVersion === 3
-      || previous?.vueVersion === 3
-      || this.hasVue3Source(uri)
-      || this.vue3ScriptImportConsumers.has(uri)
+  private vue3SourceConsumerUris(sourceUri: string): string[] {
+    return [...new Set([
+      ...(this.sourceRelationFiles.get(sourceUri) ?? []),
+      ...(this.vue3ScriptImportConsumers.get(sourceUri) ?? []),
+    ])]
+      .filter((uri) => uri !== sourceUri)
+      .filter((uri) => this.files.get(uri)?.vueVersion === 3)
   }
 
   async refreshEventBusRegistrations(root?: string, token?: IndexCancellationToken): Promise<boolean> {
@@ -1476,6 +1497,27 @@ export class WorkspaceIndex {
     this.injectUsageKeysByProvider.set(provider, keys)
   }
 
+  private injectConsumerUris(provider: VueFileIndex): string[] {
+    const consumerUris = new Set<string>()
+    for (const key of this.injectUsageKeysByProvider.get(provider) ?? []) {
+      for (const usage of this.injectUsages.get(key) ?? []) {
+        consumerUris.add(usage.file.uri)
+      }
+    }
+    return [...consumerUris]
+  }
+
+  private refreshInjectUsages(consumerUris: string[]): void {
+    for (const uri of consumerUris) {
+      const consumer = this.files.get(uri)
+      if (!consumer) {
+        continue
+      }
+      this.removeTrackedFileUsagesFromMap(consumer, this.injectUsages)
+      this.addInjectUsages(consumer)
+    }
+  }
+
   private addParentLink(parent: VueFileIndex, childUri: string): void {
     addParent(this.parentComponents, childUri, parent.uri)
     const children = this.parentLinksByFile.get(parent) ?? new Set<string>()
@@ -1492,9 +1534,42 @@ export class WorkspaceIndex {
     for (const [map, keys] of usageMaps) {
       for (const key of keys) {
         removeFileUsageAtKey(map, key, file)
+        if (map === this.injectUsages && !map.has(key)) {
+          this.removeInjectProviderTracking(key)
+        }
       }
     }
     this.usageKeysByFile.delete(file)
+  }
+
+  private removeTrackedFileUsagesFromMap<T extends UsageInfo>(file: VueFileIndex, map: Map<string, T[]>): void {
+    const usageMaps = this.usageKeysByFile.get(file)
+    const trackedMap = map as unknown as TrackedUsageMap
+    const keys = usageMaps?.get(trackedMap)
+    if (!keys) {
+      return
+    }
+
+    for (const key of keys) {
+      removeFileUsageAtKey(map, key, file)
+      if (map === this.injectUsages && !map.has(key)) {
+        this.removeInjectProviderTracking(key)
+      }
+    }
+    usageMaps?.delete(trackedMap)
+    if (usageMaps?.size === 0) {
+      this.usageKeysByFile.delete(file)
+    }
+  }
+
+  private removeInjectProviderTracking(key: string): void {
+    const separator = key.lastIndexOf('\0')
+    const provider = separator === -1 ? undefined : this.files.get(key.slice(0, separator))
+    const providerKeys = provider ? this.injectUsageKeysByProvider.get(provider) : undefined
+    providerKeys?.delete(key)
+    if (provider && providerKeys?.size === 0) {
+      this.injectUsageKeysByProvider.delete(provider)
+    }
   }
 
   private removeFileSourceRelations(file: VueFileIndex): void {
@@ -1609,8 +1684,12 @@ export class WorkspaceIndex {
     }
   }
 
-  private addRelationshipUsages(file: VueFileIndex): Set<string> {
-    const relationshipChildren = new Set<string>()
+  private addRelationshipUsages(file: VueFileIndex): RelationshipIndexResult {
+    const result: RelationshipIndexResult = {
+      children: new Set<string>(),
+      propSeeds: [],
+      eventSeeds: [],
+    }
     for (const component of file.templateIndex.components) {
       const childUris = this.resolveTemplateComponentUris(file, component)
       if (childUris.length === 0) {
@@ -1619,33 +1698,40 @@ export class WorkspaceIndex {
       for (const childUri of childUris) {
         this.addParentLink(file, childUri)
         this.addUsage(this.componentUsages, childUri, { file, span: component.span })
-        relationshipChildren.add(childUri)
+        result.children.add(childUri)
       }
 
       for (const attr of component.attrs) {
+        const usage = { file, span: attr.span }
         for (const childUri of childUris) {
           if (attr.kind === 'prop') {
-            this.addUsage(this.propUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
+            this.addUsage(this.propUsages, usageKey(childUri, attr.normalizedName), usage)
+            result.propSeeds.push({ targetUri: childUri, name: attr.normalizedName, usage })
           } else if (attr.kind === 'event') {
-            this.addUsage(this.eventUsages, usageKey(childUri, attr.normalizedName), { file, span: attr.span })
+            this.addUsage(this.eventUsages, usageKey(childUri, attr.normalizedName), usage)
+            result.eventSeeds.push({ targetUri: childUri, name: attr.normalizedName, usage })
           }
         }
       }
 
       for (const bind of component.binds) {
         const resolved = resolveTemplateBindExpression(file, bind.expression)
+        const usage = { file, span: bind.span }
         for (const propName of resolved.propNames) {
           for (const childUri of childUris) {
-            this.addUsage(this.propUsages, usageKey(childUri, propName), { file, span: bind.span })
+            this.addUsage(this.propUsages, usageKey(childUri, propName), usage)
+            result.propSeeds.push({ targetUri: childUri, name: propName, usage })
           }
         }
       }
 
       for (const on of component.ons ?? []) {
         const resolved = resolveTemplateOnExpression(file, on.expression)
+        const usage = { file, span: on.span }
         for (const eventName of resolved.eventNames) {
           for (const childUri of childUris) {
-            this.addUsage(this.eventUsages, usageKey(childUri, eventName), { file, span: on.span })
+            this.addUsage(this.eventUsages, usageKey(childUri, eventName), usage)
+            result.eventSeeds.push({ targetUri: childUri, name: eventName, usage })
           }
         }
       }
@@ -1677,65 +1763,52 @@ export class WorkspaceIndex {
 
     this.addCommandComponentUsageRelations(file, this.parseCommandUsages(file.uri, file.content))
 
-    return relationshipChildren
+    return result
   }
 
-  private addForwardedAttrEventUsages(version?: VueMajorVersion): void {
-    let changed = true
-    while (changed) {
-      changed = false
-      const incomingEvents = this.collectIncomingTemplateEventUsages()
-      for (const file of this.files.values()) {
-        if (version !== undefined && file.vueVersion !== version) {
+  private addForwardedAttrEventUsages(seeds: ForwardedUsageSeed[]): void {
+    // 只沿新增 usage 做广度传播；addUsageIfMissing 同时负责去重和终止循环透传。
+    const queue = [...seeds]
+    for (let index = 0; index < queue.length; index += 1) {
+      const seed = queue[index]
+      const wrapper = this.files.get(seed.targetUri)
+      if (!wrapper || wrapper.vueVersion !== seed.usage.file.vueVersion) {
+        continue
+      }
+      if (wrapper.vueVersion === 3 && hasDeclaredEmit(wrapper, seed.name)) {
+        continue
+      }
+
+      for (const component of wrapper.templateIndex.components) {
+        if (!componentForwardsListeners(wrapper, component)) {
           continue
         }
-        const fileIncomingEvents = incomingEvents.get(file.uri)
-        if (!fileIncomingEvents?.length) {
-          continue
-        }
-        for (const component of file.templateIndex.components) {
-          if (!componentForwardsListeners(file, component)) {
-            continue
-          }
-          const childUris = this.resolveTemplateComponentUris(file, component)
-          for (const { eventName, usage } of fileIncomingEvents) {
-            if (file.vueVersion === 3 && hasDeclaredEmit(file, eventName)) {
-              continue
-            }
-            for (const childUri of childUris) {
-              changed = this.addUsageIfMissing(this.eventUsages, usageKey(childUri, eventName), usage) || changed
-            }
+        for (const childUri of this.resolveTemplateComponentUris(wrapper, component)) {
+          if (this.addUsageIfMissing(this.eventUsages, usageKey(childUri, seed.name), seed.usage)) {
+            queue.push({ ...seed, targetUri: childUri })
           }
         }
       }
     }
   }
 
-  private addForwardedAttrPropUsages(version?: VueMajorVersion): void {
-    let changed = true
-    while (changed) {
-      changed = false
-      const incomingProps = this.collectIncomingTemplatePropUsages()
-      for (const file of this.files.values()) {
-        if (version !== undefined && file.vueVersion !== version) {
+  private addForwardedAttrPropUsages(seeds: ForwardedUsageSeed[]): void {
+    // usage.file 始终保留最外层来源文件，来源重建时即可一次清掉整条透传链。
+    const queue = [...seeds]
+    for (let index = 0; index < queue.length; index += 1) {
+      const seed = queue[index]
+      const wrapper = this.files.get(seed.targetUri)
+      if (!wrapper || wrapper.vueVersion !== seed.usage.file.vueVersion || hasDeclaredProp(wrapper, seed.name)) {
+        continue
+      }
+
+      for (const component of wrapper.templateIndex.components) {
+        if (!componentForwardsAttrs(wrapper, component)) {
           continue
         }
-        const fileIncomingProps = incomingProps.get(file.uri)
-        if (!fileIncomingProps?.length) {
-          continue
-        }
-        for (const component of file.templateIndex.components) {
-          if (!componentForwardsAttrs(file, component)) {
-            continue
-          }
-          const childUris = this.resolveTemplateComponentUris(file, component)
-          for (const { propName, usage } of fileIncomingProps) {
-            if (hasDeclaredProp(file, propName)) {
-              continue
-            }
-            for (const childUri of childUris) {
-              changed = this.addUsageIfMissing(this.propUsages, usageKey(childUri, propName), usage) || changed
-            }
+        for (const childUri of this.resolveTemplateComponentUris(wrapper, component)) {
+          if (this.addUsageIfMissing(this.propUsages, usageKey(childUri, seed.name), seed.usage)) {
+            queue.push({ ...seed, targetUri: childUri })
           }
         }
       }
@@ -1857,46 +1930,6 @@ export class WorkspaceIndex {
     }
 
     return definitions
-  }
-
-  private hasAnyForwardedListeners(version?: VueMajorVersion): boolean {
-    return [...this.files.values()].some((file) => (version === undefined || file.vueVersion === version) && hasForwardedListeners(file))
-  }
-
-  private hasAnyForwardedAttrs(version?: VueMajorVersion): boolean {
-    return [...this.files.values()].some((file) => (version === undefined || file.vueVersion === version) && hasForwardedAttrs(file))
-  }
-
-  private collectIncomingTemplateEventUsages(): Map<string, Array<{ eventName: string, usage: UsageInfo }>> {
-    const results = new Map<string, Array<{ eventName: string, usage: UsageInfo }>>()
-    for (const [key, usages] of this.eventUsages) {
-      const separator = key.lastIndexOf('\0')
-      if (separator === -1) {
-        continue
-      }
-      const childUri = key.slice(0, separator)
-      const eventName = key.slice(separator + 1)
-      const current = results.get(childUri) ?? []
-      current.push(...usages.map((usage) => ({ eventName, usage })))
-      results.set(childUri, current)
-    }
-    return results
-  }
-
-  private collectIncomingTemplatePropUsages(): Map<string, Array<{ propName: string, usage: UsageInfo }>> {
-    const results = new Map<string, Array<{ propName: string, usage: UsageInfo }>>()
-    for (const [key, usages] of this.propUsages) {
-      const separator = key.lastIndexOf('\0')
-      if (separator === -1) {
-        continue
-      }
-      const childUri = key.slice(0, separator)
-      const propName = key.slice(separator + 1)
-      const current = results.get(childUri) ?? []
-      current.push(...usages.map((usage) => ({ propName, usage })))
-      results.set(childUri, current)
-    }
-    return results
   }
 
   private addEventBusUsages(file: VueFileIndex): void {
@@ -2067,14 +2100,32 @@ export class WorkspaceIndex {
     }
   }
 
-  private rebuildVue3SourceConsumers(sourceUri: string): void {
-    const consumerUris = new Set([
-      ...(this.sourceRelationFiles.get(sourceUri) ?? []),
-      ...(this.vue3ScriptImportConsumers.get(sourceUri) ?? []),
-    ])
-    const indexedFiles = [...consumerUris]
+  private rebuildVue2MixinConsumers(sourceUri: string, consumerUris: string[]): void {
+    // mixin 内容只影响真实消费它的组件；批量重解析后统一重建一次反向关系。
+    const indexedFiles = consumerUris
+      .filter((uri) => uri !== sourceUri)
       .map((uri) => this.files.get(uri))
-      .filter((file): file is VueFileIndex => Boolean(file))
+      .filter((file): file is VueFileIndex => file?.vueVersion === 2)
+      .map((file) => ({ uri: file.uri, content: file.content }))
+    if (indexedFiles.length === 0) {
+      return
+    }
+
+    this.isBulkIndexing = true
+    try {
+      for (const file of indexedFiles) {
+        this.indexContent(file.uri, file.content)
+      }
+    } finally {
+      this.isBulkIndexing = false
+      this.rebuildReverseIndexes(2)
+    }
+  }
+
+  private rebuildVue3SourceConsumers(consumerUris: string[]): void {
+    const indexedFiles = consumerUris
+      .map((uri) => this.files.get(uri))
+      .filter((file): file is VueFileIndex => file?.vueVersion === 3)
       .map((file) => ({ uri: file.uri, content: file.content }))
     if (indexedFiles.length === 0) {
       return
@@ -2112,13 +2163,17 @@ export class WorkspaceIndex {
       this.addVue3ScriptImportConsumers(file)
       this.addProvideDefinitions(file)
     }
+    const propSeeds: ForwardedUsageSeed[] = []
+    const eventSeeds: ForwardedUsageSeed[] = []
     for (const file of files) {
-      this.addRelationshipUsages(file)
+      const relationships = this.addRelationshipUsages(file)
+      propSeeds.push(...relationships.propSeeds)
+      eventSeeds.push(...relationships.eventSeeds)
       this.addEventBusUsages(file)
     }
     this.addScriptComponentUsages(version)
-    this.addForwardedAttrPropUsages(version)
-    this.addForwardedAttrEventUsages(version)
+    this.addForwardedAttrPropUsages(propSeeds)
+    this.addForwardedAttrEventUsages(eventSeeds)
     for (const file of files) {
       this.addInjectUsages(file)
     }
@@ -2278,15 +2333,27 @@ export class WorkspaceIndex {
     this.removeTrackedParentLinks(file)
   }
 
-  private relationshipChildren(file: VueFileIndex): Set<string> {
-    const children = new Set<string>()
+  private relationshipTopology(file: VueFileIndex): RelationshipTopology {
+    const topology: RelationshipTopology = {
+      children: new Set<string>(),
+      forwardedPropChildren: new Set<string>(),
+      forwardedEventChildren: new Set<string>(),
+      declaredProps: new Set(file.scriptIndex.props.map((prop) => toKebabCase(prop.name))),
+      declaredEvents: new Set(file.vueVersion === 3 ? file.scriptIndex.emits.map((emit) => toKebabCase(emit.eventName)) : []),
+      provideKeys: file.scriptIndex.provides.map((provide) => provide.key).sort(),
+    }
     for (const component of file.templateIndex.components) {
-      const childUri = this.resolveComponent(file, component.tag)
-      if (childUri) {
-        children.add(childUri)
+      for (const childUri of this.resolveTemplateComponentUris(file, component)) {
+        topology.children.add(childUri)
+        if (componentForwardsAttrs(file, component)) {
+          topology.forwardedPropChildren.add(childUri)
+        }
+        if (componentForwardsListeners(file, component)) {
+          topology.forwardedEventChildren.add(childUri)
+        }
       }
     }
-    return children
+    return topology
   }
 
   private propKeys(childUri: string, propName: string): string[] {
@@ -2923,25 +2990,6 @@ function removeSourceRelationItem<T extends { file: VueFileIndex }>(map: SourceR
   } else if (kept.length !== items.length) {
     map.set(key, kept)
   }
-}
-
-function hasForwardedListeners(file: VueFileIndex): boolean {
-  return file.templateIndex.components.some((component) => componentForwardsListeners(file, component))
-}
-
-function hasForwardedAttrs(file: VueFileIndex): boolean {
-  return file.templateIndex.components.some((component) => componentForwardsAttrs(file, component))
-}
-
-function hasTemplateEventAttrs(file: VueFileIndex): boolean {
-  return file.templateIndex.components.some((component) => component.attrs.some((attr) => attr.kind === 'event'))
-}
-
-function hasTemplatePropAttrs(file: VueFileIndex): boolean {
-  return file.templateIndex.components.some((component) => {
-    return component.attrs.some((attr) => attr.kind === 'prop')
-      || component.binds.some((bind) => resolveTemplateBindExpression(file, bind.expression).propNames.length > 0)
-  })
 }
 
 function hasDeclaredProp(file: VueFileIndex, propName: string): boolean {
@@ -3841,6 +3889,31 @@ function sameStringSet(left: Set<string>, right: Set<string>): boolean {
     }
   }
   return true
+}
+
+function emptyRelationshipTopology(): RelationshipTopology {
+  return {
+    children: new Set(),
+    forwardedPropChildren: new Set(),
+    forwardedEventChildren: new Set(),
+    declaredProps: new Set(),
+    declaredEvents: new Set(),
+    provideKeys: [],
+  }
+}
+
+function relationshipTopologyChanged(left: RelationshipTopology, right: RelationshipTopology): boolean {
+  const propBoundaryChanged = (left.forwardedPropChildren.size > 0 || right.forwardedPropChildren.size > 0)
+    && !sameStringSet(left.declaredProps, right.declaredProps)
+  const eventBoundaryChanged = (left.forwardedEventChildren.size > 0 || right.forwardedEventChildren.size > 0)
+    && !sameStringSet(left.declaredEvents, right.declaredEvents)
+  return !sameStringSet(left.children, right.children)
+    || !sameStringSet(left.forwardedPropChildren, right.forwardedPropChildren)
+    || !sameStringSet(left.forwardedEventChildren, right.forwardedEventChildren)
+    || propBoundaryChanged
+    || eventBoundaryChanged
+    || left.provideKeys.length !== right.provideKeys.length
+    || left.provideKeys.some((key, index) => key !== right.provideKeys[index])
 }
 
 function isScriptFile(file: string): boolean {

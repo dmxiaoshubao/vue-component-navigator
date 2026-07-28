@@ -29,6 +29,14 @@ type UsageCommandArgs =
 type PackageDependencies = Record<string, string | undefined> | undefined
 type EntryConfig = string | readonly string[] | undefined
 type CancellationLike = { readonly isCancellationRequested: boolean }
+type IndexStatus = 'idle' | 'indexing' | 'ready' | 'failed' | 'cancelled'
+
+export interface VueComponentNavigatorExtensionApi {
+  waitForInitialIndex: () => Promise<void>
+  getIndexStatus: () => IndexStatus
+  getIndexedFileCount: () => number
+  isIndexedContentCurrent: (filePath: string, content: string) => boolean
+}
 
 const PACKAGE_SCAN_LIMIT = 200
 const packageScanIgnoredDirs = new Set([
@@ -88,7 +96,7 @@ async function openUsage(usage: UsageInfo): Promise<void> {
   await vscode.window.showTextDocument(vscode.Uri.file(usage.sourceLocation?.uri ?? usage.file.uri), { selection: range, preview: true })
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+export function activate(context: vscode.ExtensionContext): VueComponentNavigatorExtensionApi {
   const index = new WorkspaceIndex()
   const selector: vscode.DocumentSelector = [
     { language: 'vue', scheme: 'file' },
@@ -97,33 +105,14 @@ export function activate(context: vscode.ExtensionContext): void {
     { language: 'javascriptreact', scheme: 'file' },
     { language: 'typescriptreact', scheme: 'file' },
   ]
-  const pendingSyncTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const featureDisposables: vscode.Disposable[] = []
   let supportedVueWorkspace: boolean | undefined
   let featuresRegistered = false
-  let indexStatus: 'idle' | 'indexing' | 'ready' | 'failed' | 'cancelled' = 'idle'
-
-  function clearPendingSync(filePath: string): void {
-    const timer = pendingSyncTimers.get(filePath)
-    if (timer) {
-      clearTimeout(timer)
-      pendingSyncTimers.delete(filePath)
-    }
-  }
-
-  function scheduleSync(filePath: string, content: string): void {
-    clearPendingSync(filePath)
-    // 输入过程中做短暂防抖，避免每次按键都重建整份文件索引。
-    const timer = setTimeout(() => {
-      pendingSyncTimers.delete(filePath)
-      index.syncContent(filePath, content)
-    }, 120)
-    pendingSyncTimers.set(filePath, timer)
-  }
+  let indexStatus: IndexStatus = 'idle'
+  let codeLensProvider: VueCodeLensProvider | undefined
 
   async function indexVueFile(filePath: string): Promise<void> {
     try {
-      clearPendingSync(filePath)
       await index.indexFile(filePath)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -131,9 +120,13 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
-  async function syncGlobalComponentFile(filePath: string): Promise<void> {
+  async function syncGlobalComponentFile(filePath: string, content?: string): Promise<void> {
     try {
-      await index.syncGlobalComponentFile(filePath)
+      if (content === undefined) {
+        await index.syncGlobalComponentFile(filePath)
+      } else {
+        await index.syncGlobalComponentContent(filePath, content)
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       void vscode.window.showWarningMessage(`Vue Component Navigator failed to index ${filePath}: ${message}`)
@@ -212,6 +205,10 @@ export function activate(context: vscode.ExtensionContext): void {
       })
 
       indexStatus = indexed ? 'ready' : 'cancelled'
+      if (indexed) {
+        // 全量索引已整体替换，主动通知已打开编辑器重新请求 CodeLens。
+        codeLensProvider?.refresh()
+      }
       if (showSuccess && indexed) {
         void vscode.window.showInformationMessage(`Vue Component Navigator reindexed ${index.getFileCount()} Vue files.`)
       }
@@ -282,34 +279,31 @@ export function activate(context: vscode.ExtensionContext): void {
       return
     }
     featuresRegistered = true
+    const nextCodeLensProvider = new VueCodeLensProvider(index)
+    codeLensProvider = nextCodeLensProvider
     featureDisposables.push(
       vscode.languages.registerDefinitionProvider(selector, new VueDefinitionProvider(index)),
       vscode.languages.registerCompletionItemProvider(selector, new VueCompletionProvider(index), '.', '?', '\'', '"', ':'),
       vscode.languages.registerHoverProvider(selector, new VueHoverProvider(index)),
       vscode.languages.registerReferenceProvider(selector, new VueReferenceProvider(index)),
-      vscode.languages.registerCodeLensProvider(selector, new VueCodeLensProvider(index)),
+      vscode.languages.registerCodeLensProvider(selector, nextCodeLensProvider),
+      nextCodeLensProvider,
       vscode.workspace.onDidSaveTextDocument((document) => {
         if (document.languageId === 'vue' && document.uri.scheme === 'file') {
-          clearPendingSync(document.uri.fsPath)
+          // 编辑期间保持已保存快照不变，统一在保存事件中更新索引。
           index.syncContent(document.uri.fsPath, document.getText())
-          void refreshGlobalComponentsForVueFile(document.uri.fsPath)
+          return refreshGlobalComponentsForVueFile(document.uri.fsPath)
+            .finally(() => nextCodeLensProvider.refresh())
         } else if (isScriptFile(document.uri.fsPath) && document.uri.scheme === 'file') {
-          void syncGlobalComponentFile(document.uri.fsPath)
+          return syncGlobalComponentFile(document.uri.fsPath, document.getText()).finally(() => nextCodeLensProvider.refresh())
         } else if (isAliasConfigFile(document.uri.fsPath) && document.uri.scheme === 'file') {
           return refreshForAliasConfigChange(document.uri.fsPath)
-        }
-      }),
-      vscode.workspace.onDidChangeTextDocument((event) => {
-        const document = event.document
-        if (document.languageId === 'vue' && document.uri.scheme === 'file') {
-          scheduleSync(document.uri.fsPath, document.getText())
         }
       }),
       vscode.workspace.onDidDeleteFiles(async (event) => {
         await refreshForAliasConfigChanges(event.files.map((file) => file.fsPath))
         for (const file of event.files) {
           if (file.fsPath.endsWith('.vue')) {
-            clearPendingSync(file.fsPath)
             index.remove(file.fsPath)
             void refreshGlobalComponentsForVueFile(file.fsPath)
           } else if (isScriptFile(file.fsPath)) {
@@ -333,14 +327,12 @@ export function activate(context: vscode.ExtensionContext): void {
         await refreshForAliasConfigChanges(event.files.flatMap((file) => [file.oldUri.fsPath, file.newUri.fsPath]))
         for (const file of event.files) {
           if (file.oldUri.fsPath.endsWith('.vue')) {
-            clearPendingSync(file.oldUri.fsPath)
             index.remove(file.oldUri.fsPath)
             await refreshGlobalComponentsForVueFile(file.oldUri.fsPath)
           } else if (isScriptFile(file.oldUri.fsPath)) {
             await index.removeGlobalComponentFile(file.oldUri.fsPath)
           }
           if (file.newUri.fsPath.endsWith('.vue')) {
-            clearPendingSync(file.newUri.fsPath)
             await indexVueFile(file.newUri.fsPath)
             await refreshGlobalComponentsFromVueFiles()
           } else if (isScriptFile(file.newUri.fsPath)) {
@@ -368,11 +360,8 @@ export function activate(context: vscode.ExtensionContext): void {
     for (const disposable of featureDisposables.splice(0)) {
       disposable.dispose()
     }
+    codeLensProvider = undefined
     featuresRegistered = false
-    for (const timer of pendingSyncTimers.values()) {
-      clearTimeout(timer)
-    }
-    pendingSyncTimers.clear()
     index.replaceWith(new WorkspaceIndex())
   }
 
@@ -579,11 +568,18 @@ export function activate(context: vscode.ExtensionContext): void {
     },
   )
 
-  void ensureSupportedVueWorkspace(false).then((enabled) => {
+  const initialIndexPromise = ensureSupportedVueWorkspace(false).then(async (enabled) => {
     if (enabled) {
-      void indexWorkspaceFolders('Indexing Vue files...', false)
+      await indexWorkspaceFolders('Indexing Vue files...', false)
     }
   })
+
+  return {
+    waitForInitialIndex: () => initialIndexPromise,
+    getIndexStatus: () => indexStatus,
+    getIndexedFileCount: () => index.getFileCount(),
+    isIndexedContentCurrent: (filePath, content) => index.getFile(filePath)?.content === content,
+  }
 }
 
 export function deactivate(): void {}

@@ -16,6 +16,7 @@ interface Vue2RuntimeHost {
   indexGlobalComponentFile: (uri: string, rebuildScriptUsages?: boolean) => Promise<void>
   refreshEventBusRegistrations: (root: string, token?: IndexCancellationToken) => Promise<void>
   isInsideWorkspace: (uri: string) => boolean
+  getIndexedContent: (uri: string) => string | undefined
   withBulkIndexing: (task: () => Promise<void>) => Promise<void>
 }
 
@@ -66,22 +67,33 @@ export class Vue2Runtime implements VueRuntimeEngine {
   readonly version = 2
 
   private readonly mixinIndexCache = new Map<string, MixinIndexResult | undefined>()
-  private readonly mixinSourceUris = new Set<string>()
+  private readonly mixinConsumers = new Map<string, Set<string>>()
+  private readonly mixinSourcesByConsumer = new Map<string, Set<string>>()
 
   constructor(private readonly host: Vue2RuntimeHost) {}
 
   clear(): void {
     this.mixinIndexCache.clear()
-    this.mixinSourceUris.clear()
+    this.mixinConsumers.clear()
+    this.mixinSourcesByConsumer.clear()
   }
 
   replaceWith(other: Vue2Runtime): void {
     replaceMap(this.mixinIndexCache, other.mixinIndexCache)
-    replaceSet(this.mixinSourceUris, other.mixinSourceUris)
+    replaceSetMap(this.mixinConsumers, other.mixinConsumers)
+    replaceSetMap(this.mixinSourcesByConsumer, other.mixinSourcesByConsumer)
   }
 
   hasMixinSource(uri: string): boolean {
-    return this.mixinSourceUris.has(uri) || this.hasMixinCacheForFile(uri)
+    return this.mixinConsumers.has(uri) || this.hasMixinCacheForFile(uri)
+  }
+
+  getMixinConsumerUris(uri: string): string[] {
+    return [...(this.mixinConsumers.get(uri) ?? [])]
+  }
+
+  removeConsumer(uri: string): void {
+    this.removeMixinConsumer(uri)
   }
 
   clearMixinCacheForFile(uri: string): void {
@@ -93,9 +105,32 @@ export class Vue2Runtime implements VueRuntimeEngine {
   }
 
   clearWorkspaceRoot(inRoot: (uri: string) => boolean): void {
-    for (const uri of [...this.mixinSourceUris]) {
-      if (inRoot(uri)) {
-        this.mixinSourceUris.delete(uri)
+    for (const [sourceUri, consumers] of [...this.mixinConsumers]) {
+      if (inRoot(sourceUri)) {
+        this.mixinConsumers.delete(sourceUri)
+        continue
+      }
+      for (const consumerUri of [...consumers]) {
+        if (inRoot(consumerUri)) {
+          consumers.delete(consumerUri)
+        }
+      }
+      if (consumers.size === 0) {
+        this.mixinConsumers.delete(sourceUri)
+      }
+    }
+    for (const [consumerUri, sources] of [...this.mixinSourcesByConsumer]) {
+      if (inRoot(consumerUri)) {
+        this.mixinSourcesByConsumer.delete(consumerUri)
+        continue
+      }
+      for (const sourceUri of [...sources]) {
+        if (inRoot(sourceUri)) {
+          sources.delete(sourceUri)
+        }
+      }
+      if (sources.size === 0) {
+        this.mixinSourcesByConsumer.delete(consumerUri)
       }
     }
     for (const key of [...this.mixinIndexCache.keys()]) {
@@ -115,6 +150,7 @@ export class Vue2Runtime implements VueRuntimeEngine {
   }
 
   indexContent(uri: string, sfc: ParsedSfc): VueFileIndex {
+    this.removeMixinConsumer(uri)
     const eventBusNames = this.host.eventBusNames()
     const ownScriptIndex = sfc.script
       ? parseScript(uri, sfc.script.content, sfc.script.start, this.host.workspaceRoots(), 'default', eventBusNames)
@@ -175,7 +211,7 @@ export class Vue2Runtime implements VueRuntimeEngine {
   }
 
   private mergeStaticMixins(uri: string, own: ScriptIndex): { scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] } {
-    const collected = this.collectMixinIndexes(mixinLikeReferences(own), new Set([`${uri}\0default`]), 0)
+    const collected = this.collectMixinIndexes(uri, mixinLikeReferences(own), new Set([`${uri}\0default`]), 0)
     if (collected.length === 0) {
       return { scriptIndex: own, refMethodCalls: [] }
     }
@@ -197,7 +233,7 @@ export class Vue2Runtime implements VueRuntimeEngine {
     }
   }
 
-  private collectMixinIndexes(mixins: MixinReference[], visited: Set<string>, depth: number): Array<{ scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] }> {
+  private collectMixinIndexes(consumerUri: string, mixins: MixinReference[], visited: Set<string>, depth: number): Array<{ scriptIndex: ScriptIndex, refMethodCalls: RefMethodAccess[] }> {
     if (depth >= 4) {
       return []
     }
@@ -208,7 +244,7 @@ export class Vue2Runtime implements VueRuntimeEngine {
       if (!mixin.targetUri || visited.has(key) || !this.host.isInsideWorkspace(mixin.targetUri) || isInsideNodeModules(mixin.targetUri)) {
         continue
       }
-      this.mixinSourceUris.add(mixin.targetUri)
+      this.addMixinConsumer(mixin.targetUri, consumerUri)
 
       const parsed = this.parseMixin(mixin)
       if (!parsed) {
@@ -217,11 +253,36 @@ export class Vue2Runtime implements VueRuntimeEngine {
 
       results.push(parsed)
       visited.add(key)
-      results.push(...this.collectMixinIndexes(mixinLikeReferences(parsed.scriptIndex), visited, depth + 1))
+      results.push(...this.collectMixinIndexes(consumerUri, mixinLikeReferences(parsed.scriptIndex), visited, depth + 1))
       visited.delete(key)
     }
 
     return results
+  }
+
+  private addMixinConsumer(sourceUri: string, consumerUri: string): void {
+    const consumers = this.mixinConsumers.get(sourceUri) ?? new Set<string>()
+    consumers.add(consumerUri)
+    this.mixinConsumers.set(sourceUri, consumers)
+
+    const sources = this.mixinSourcesByConsumer.get(consumerUri) ?? new Set<string>()
+    sources.add(sourceUri)
+    this.mixinSourcesByConsumer.set(consumerUri, sources)
+  }
+
+  private removeMixinConsumer(consumerUri: string): void {
+    const sources = this.mixinSourcesByConsumer.get(consumerUri)
+    if (!sources) {
+      return
+    }
+    for (const sourceUri of sources) {
+      const consumers = this.mixinConsumers.get(sourceUri)
+      consumers?.delete(consumerUri)
+      if (consumers?.size === 0) {
+        this.mixinConsumers.delete(sourceUri)
+      }
+    }
+    this.mixinSourcesByConsumer.delete(consumerUri)
   }
 
   private parseMixin(mixin: MixinReference): MixinIndexResult | undefined {
@@ -251,7 +312,7 @@ export class Vue2Runtime implements VueRuntimeEngine {
 
   private readMixinIndex(uri: string, exportName: string): MixinIndexResult | undefined {
     try {
-      const content = fsSync.readFileSync(uri, 'utf8')
+      const content = this.host.getIndexedContent(uri) ?? fsSync.readFileSync(uri, 'utf8')
       const lineStarts = createLineStarts(content)
       const source = (span: TextSpan): SourceLocation => ({ uri, lineStarts, span })
 
@@ -291,10 +352,10 @@ function replaceMap<K, V>(target: Map<K, V>, source: Map<K, V>): void {
   }
 }
 
-function replaceSet<T>(target: Set<T>, source: Set<T>): void {
+function replaceSetMap<K, V>(target: Map<K, Set<V>>, source: Map<K, Set<V>>): void {
   target.clear()
-  for (const value of source) {
-    target.add(value)
+  for (const [key, values] of source) {
+    target.set(key, new Set(values))
   }
 }
 

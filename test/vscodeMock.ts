@@ -1,5 +1,24 @@
 type Disposable = { dispose(): void }
 
+export class EventEmitter<T> {
+  private readonly listeners = new Set<(event: T) => any>()
+
+  readonly event = (listener: (event: T) => any): Disposable => {
+    this.listeners.add(listener)
+    return { dispose: () => this.listeners.delete(listener) }
+  }
+
+  fire(event: T): void {
+    for (const listener of [...this.listeners]) {
+      listener(event)
+    }
+  }
+
+  dispose(): void {
+    this.listeners.clear()
+  }
+}
+
 export class Position {
   constructor(public line: number, public character: number) {}
 }

@@ -407,6 +407,10 @@ export class VueHoverProvider implements vscode.HoverProvider {
     if (document.uri.scheme !== 'file') {
       return undefined
     }
+    // 索引只对应已保存内容；脏文档的偏移可能已经变化，避免展示错误信息。
+    if (document.isDirty) {
+      return undefined
+    }
     if (vueDocument && !this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
       return undefined
     }
@@ -415,9 +419,7 @@ export class VueHoverProvider implements vscode.HoverProvider {
     }
 
     const content = document.getText()
-    const file = vueDocument
-      ? this.index.syncContent(document.uri.fsPath, content)
-      : this.index.syncDocumentContent(document.uri.fsPath, content, document.version) ?? this.index.getFile(document.uri.fsPath)
+    const file = this.index.getIndexedDocumentFile(document.uri.fsPath)
     const offset = vueDocument
       ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
       : positionToOffset(createLineStarts(content), { line: position.line, character: position.character })
@@ -431,7 +433,6 @@ export class VueHoverProvider implements vscode.HoverProvider {
       return sourceHover
     }
     if (!vueDocument) {
-      this.index.syncScriptComponentUsageContent(document.uri.fsPath, content, false)
       const commandMethod = this.index.findCommandComponentMethodAtOffset(document.uri.fsPath, offset)
       if (commandMethod) {
         const usages = this.index.findCommandComponentMethodUsages(document.uri.fsPath, commandMethod.method.name)

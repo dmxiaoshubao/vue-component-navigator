@@ -8,6 +8,7 @@ vi.mock('vscode', () => import('./vscodeMock'))
 class TestDocument {
   uri: { fsPath: string, scheme: string }
   languageId = 'vue'
+  isDirty = false
 
   constructor(public filePath: string, private readonly content: string) {
     this.uri = { fsPath: filePath, scheme: 'file' }
@@ -96,7 +97,7 @@ module.exports = {
     expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: no')
   })
 
-  it('rename 和未保存 change 会同步索引', async () => {
+  it('rename 后仍只在保存时同步新文件索引', async () => {
     const vscode = await import('vscode') as any
     vscode.resetMockState()
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-events-'))
@@ -108,7 +109,7 @@ module.exports = {
     vscode.workspace.workspaceFolders = []
 
     const { activate } = await import('../src/extension')
-    activate({ subscriptions: [] } as any)
+    const api = activate({ subscriptions: [] } as any)
     await flushPromises()
     vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
     await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
@@ -118,11 +119,141 @@ module.exports = {
     await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
     expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: no')
 
-    const changed = fs.readFileSync(newFile, 'utf8').replace('New', 'Changed')
-    vscode.changeTextListeners[0]({ document: new TestDocument(newFile, changed) })
-    vscode.window.activeTextEditor = { document: new TestDocument(newFile, changed) }
-    await vscode.registeredCommands.get('vueComponentNavigator.showStatus')?.()
-    expect(vscode.informationMessages.at(-1)).toContain('Current file indexed: yes')
+    const saved = fs.readFileSync(newFile, 'utf8')
+    const changed = saved.replace('New', 'Changed')
+    expect(vscode.changeTextListeners).toHaveLength(0)
+    expect(api.isIndexedContentCurrent(newFile, saved)).toBe(true)
+
+    writeText(newFile, changed)
+    await fireListeners(vscode.saveListeners, new TestDocument(newFile, changed))
+
+    expect(api.isIndexedContentCurrent(newFile, changed)).toBe(true)
+  })
+
+  it('插入和删除期间不读取全文，保存后各同步一次', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-save-driven-document-sync-'))
+    const file = path.join(root, 'Editor.vue')
+    writePackageJson(root)
+    writeVue(file, 'Editor')
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+
+    const { activate } = await import('../src/extension')
+    const api = activate({ subscriptions: [] } as any)
+    await api.waitForInitialIndex()
+
+    const original = fs.readFileSync(file, 'utf8')
+    const inserted = original.replace('<div />', '<div>新增文案</div>')
+    const dirtyInsert = new TestDocument(file, inserted)
+    dirtyInsert.isDirty = true
+    const dirtyGetText = vi.spyOn(dirtyInsert, 'getText')
+    let codeLensRefreshCount = 0
+    const codeLensRefreshDisposable = vscode.codeLensProviders[0].onDidChangeCodeLenses(() => {
+      codeLensRefreshCount += 1
+    })
+
+    expect(vscode.changeTextListeners).toHaveLength(0)
+    await fireListeners(vscode.changeTextListeners, { document: dirtyInsert })
+    expect(dirtyGetText).not.toHaveBeenCalled()
+    expect(api.isIndexedContentCurrent(file, original)).toBe(true)
+
+    writeText(file, inserted)
+    const insertedSave = new TestDocument(file, inserted)
+    const insertedGetText = vi.spyOn(insertedSave, 'getText')
+    await fireListeners(vscode.saveListeners, insertedSave)
+    expect(insertedGetText).toHaveBeenCalledTimes(1)
+    expect(api.isIndexedContentCurrent(file, inserted)).toBe(true)
+    expect(codeLensRefreshCount).toBe(1)
+
+    writeText(file, original)
+    const deletedSave = new TestDocument(file, original)
+    const deletedGetText = vi.spyOn(deletedSave, 'getText')
+    await fireListeners(vscode.saveListeners, deletedSave)
+    expect(deletedGetText).toHaveBeenCalledTimes(1)
+    expect(api.isIndexedContentCurrent(file, original)).toBe(true)
+    expect(codeLensRefreshCount).toBe(2)
+    codeLensRefreshDisposable.dispose()
+  })
+
+  it('外部写盘后手动 reindex 会重建新文件关系并刷新 CodeLens', async () => {
+    const vscode = await import('vscode') as any
+    vscode.resetMockState()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vcn-manual-reindex-external-write-'))
+    const existingFile = path.join(root, 'Existing.vue')
+    const generatedFile = path.join(root, 'Generated.vue')
+    const parentFile = path.join(root, 'Parent.vue')
+    const existingContent = '<template><div /></template><script>export default { name: \'Existing\' }</script>'
+    const originalParentContent = `
+<template><Existing /></template>
+<script>
+import Existing from './Existing.vue'
+export default { components: { Existing } }
+</script>
+`
+    const generatedContent = `
+<template><div>{{ externalLabel }}</div></template>
+<script>
+export default {
+  props: {
+    externalLabel: String,
+  },
+}
+</script>
+`
+    const changedParentContent = `
+<template>
+  <Existing />
+  <Generated :external-label="label" />
+</template>
+<script>
+import Existing from './Existing.vue'
+import Generated from './Generated.vue'
+export default {
+  components: { Existing, Generated },
+  data: () => ({ label: 'AI generated' }),
+}
+</script>
+`
+    writePackageJson(root)
+    writeText(existingFile, existingContent)
+    writeText(parentFile, originalParentContent)
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(root) }]
+
+    const { activate } = await import('../src/extension')
+    const api = activate({ subscriptions: [] } as any)
+    await api.waitForInitialIndex()
+    let codeLensRefreshCount = 0
+    const codeLensProvider = vscode.codeLensProviders[0]
+    const refreshDisposable = codeLensProvider.onDidChangeCodeLenses(() => {
+      codeLensRefreshCount += 1
+    })
+
+    // 模拟 AI/CLI 直接修改磁盘；没有保存事件时旧索引保持不变。
+    writeText(generatedFile, generatedContent)
+    writeText(parentFile, changedParentContent)
+    expect(api.isIndexedContentCurrent(parentFile, originalParentContent)).toBe(true)
+    expect(api.isIndexedContentCurrent(generatedFile, generatedContent)).toBe(false)
+
+    await vscode.registeredCommands.get('vueComponentNavigator.reindexWorkspace')?.()
+
+    expect(api.isIndexedContentCurrent(parentFile, changedParentContent)).toBe(true)
+    expect(api.isIndexedContentCurrent(generatedFile, generatedContent)).toBe(true)
+    expect(api.getIndexedFileCount()).toBe(3)
+    expect(codeLensRefreshCount).toBe(1)
+
+    const lenses = codeLensProvider.provideCodeLenses(new TestDocument(generatedFile, generatedContent)) as any[]
+    expect(lenses).toHaveLength(1)
+    expect(lenses[0].command.title).toBe('Used by 1 usage')
+
+    await vscode.registeredCommands.get('vueComponentNavigator.showUsages')?.({
+      kind: 'prop-usages',
+      childUri: generatedFile,
+      propName: 'externalLabel',
+    })
+    expect(vscode.quickPickCalls.at(-1)?.items[0].label).toContain('Parent.vue')
+    expect(vscode.shownDocuments.at(-1)?.uri.fsPath).toBe(parentFile)
+    refreshDisposable.dispose()
   })
 
   it('Show usages 命令可以打开 prop 使用位置', async () => {

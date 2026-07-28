@@ -2,7 +2,7 @@
   "name": "vue-component-navigator",
   "displayName": "Vue Component Navigator",
   "description": "Vue 2 and Vue 3 navigation, references, hover, and completions for static component relationships.",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "publisher": "dmxiaoshubao",
   "author": "dmxiaoshubao",
   "license": "MIT",
@@ -84,8 +84,10 @@
   "scripts": {
     "typecheck": "tsc -p . --noEmit",
     "compile": "node esbuild.config.mjs",
+    "compile:host": "node esbuild.host.config.mjs",
     "watch": "tsc -watch -p .",
     "test": "vitest run",
+    "test:host": "npm run typecheck && npm run compile && npm run compile:host && node .test-host-dist/runTest.js",
     "test:watch": "vitest",
     "vscode:prepublish": "npm run typecheck && npm run compile",
     "package:vsix": "vsce package --baseImagesUrl https://raw.githubusercontent.com/dmxiaoshubao/vue-component-navigator/main"

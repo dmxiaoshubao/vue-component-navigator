@@ -106,7 +106,7 @@ Event Bus 名称需要能从入口文件里的 Vue prototype 注册中识别。
 | 命令                                         | 说明                                                    |
 | -------------------------------------------- | ------------------------------------------------------- |
 | `Vue Component Navigator: Show Status`       | 查看索引状态，以及当前文件是否已被索引。                |
-| `Vue Component Navigator: Reindex Workspace` | 手动重建 workspace 索引。大型重构或配置变更后可以使用。 |
+| `Vue Component Navigator: Reindex Workspace` | 从磁盘重建全部已保存文件及其关系。AI 或其他外部工具修改文件、大型重构或配置变更后可以使用。 |
 
 ## 命令式组件
 

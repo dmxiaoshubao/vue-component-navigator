@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.1.1 - 2026-07-29
+
+### English
+
+#### Fixed
+
+- Fixed VS Code typing lag in large Vue workspaces by keeping the index on the last saved snapshot and no longer reparsing documents or rebuilding relationships for every unsaved edit.
+- Fixed incremental relationship tracking that could retain stale or duplicate forwarded prop/listener and provide/inject usages after repeated updates.
+- Fixed manual workspace reindex leaving existing CodeLens views stale after the rebuilt index had been installed.
+
+#### Changed
+
+- Navigation, references, hover, completion, and CodeLens now pause for a dirty document and refresh from the new snapshot after save, preventing stale offsets while editing.
+- Save-time indexing now updates only affected Vue 2 mixin, Vue 3 source, forwarded attribute/listener, and provide/inject consumers unless the relationship topology actually changes, reducing CPU work and allocation churn.
+- Files written directly by AI or other external tools are intentionally not watched. Run `Vue Component Navigator: Reindex Workspace` to rebuild all saved files and relationships from disk; CodeLens now refreshes immediately when the rebuild completes.
+
+### 中文
+
+#### 修复
+
+- 修复大型 Vue workspace 中的 VS Code 输入卡顿：索引保持在最近一次保存的快照，未保存编辑期间不再重复解析文档或重建关系。
+- 修复反复增量更新后，透传 prop/listener 与 provide/inject usage 可能残留或重复的问题。
+- 修复手动重新索引完成后，已打开编辑器中的 CodeLens 仍可能停留在旧结果的问题。
+
+#### 变更
+
+- 文档未保存时，本插件的跳转、引用、hover、补全和 CodeLens 暂停工作；保存后基于新快照恢复并刷新，避免编辑偏移变化导致错误结果。
+- 保存时的索引更新只处理受影响的 Vue 2 mixin、Vue 3 source、透传 attribute/listener 和 provide/inject 消费者；仅在关系拓扑真实变化时才扩大重建范围，减少 CPU 工作与临时内存分配。
+- AI 或其他外部工具直接写入的文件不会被自动监听。执行 `Vue Component Navigator: Reindex Workspace` 可从磁盘重建全部已保存文件及其关系；重建完成后 CodeLens 现在会立即刷新。
+
 ## 2.1.0 - 2026-07-11
 
 ### English

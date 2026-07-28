@@ -121,6 +121,10 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
     if (document.uri.scheme !== 'file') {
       return undefined
     }
+    // 补全可能在每次按键后触发；未保存时直接退出，不读取全文也不更新索引。
+    if (document.isDirty) {
+      return undefined
+    }
     if (vueDocument && !this.index.isInsideIndexedWorkspace(document.uri.fsPath)) {
       return undefined
     }
@@ -130,11 +134,8 @@ export class VueCompletionProvider implements vscode.CompletionItemProvider {
     if (!vueDocument && !shouldInspectNonVueCompletion(document, position, this.index)) {
       return undefined
     }
-
     const content = document.getText()
-    const file = vueDocument
-      ? this.index.syncContent(document.uri.fsPath, content)
-      : this.index.syncDocumentContent(document.uri.fsPath, content, document.version) ?? this.index.getFile(document.uri.fsPath)
+    const file = this.index.getIndexedDocumentFile(document.uri.fsPath)
     const offset = vueDocument
       ? this.index.offsetAt(document.uri.fsPath, position.line, position.character)
       : offsetInContent(content, position)
